@@ -13,8 +13,11 @@ node_modules/
 .next/
 dist/
 build/
+out/
+coverage/
 
 # Logs
 *.log
 
-
+# TypeScript build cache
+*.tsbuildinfo
