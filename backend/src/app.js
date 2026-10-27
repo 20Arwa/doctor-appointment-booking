@@ -6,6 +6,7 @@ const healthRoutes = require("./routes/healthRoutes");
 const userRoutes = require("./routes/userRoutes");
 const patientRoutes = require("./routes/patientRoutes");
 const doctorRoutes = require("./routes/doctorRoutes");
+const appointmentRoutes = require("./routes/appointmentRoutes");
 const { getClerkProfile } = require("./middleware/auth");
 
 function createApp({ database, frontendOrigin, applicationTimezone, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
@@ -28,6 +29,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, clerkAuthMid
   app.use("/api/v1/users", userRoutes);
   app.use("/api/v1/patients", patientRoutes);
   app.use("/api/v1/doctors", doctorRoutes);
+  app.use("/api/v1/appointments", appointmentRoutes);
   app.use(notFoundHandler);
   app.use(errorHandler);
 

@@ -1,20 +1,4 @@
-function localDateTime(timeZone, instant = new Date()) {
-  if (!timeZone) return null;
-  try {
-    const values = Object.fromEntries(new Intl.DateTimeFormat("en-GB", {
-      timeZone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hourCycle: "h23",
-    }).formatToParts(instant).filter((part) => part.type !== "literal").map(({ type, value }) => [type, value]));
-    return { date: `${values.year}-${values.month}-${values.day}`, time: `${values.hour}:${values.minute}` };
-  } catch (_error) {
-    return null;
-  }
-}
+const { localDateTime, slotStartsInFuture } = require("../utils/schedulingTime");
 
 function requireTimezone(response) {
   const now = localDateTime(response.locals.applicationTimezone);
@@ -27,10 +11,6 @@ function requireTimezone(response) {
 
 function timeToMinutes(value) {
   return Number(value.slice(0, 2)) * 60 + Number(value.slice(3, 5));
-}
-
-function slotStartsInFuture(slot, now) {
-  return slot.date > now.date || (slot.date === now.date && slot.start_time > now.time);
 }
 
 async function getDoctorSlots(_request, response, next) {
@@ -52,7 +32,14 @@ async function getDoctorSlots(_request, response, next) {
   try {
     // Phase 3 can add a NOT EXISTS predicate here for non-cancelled appointments referencing a slot.
     const result = await response.locals.database.query(
-      `SELECT id, doctor_id, date::text AS date, start_time::text AS start_time, end_time::text AS end_time, created_at, updated_at FROM availability WHERE ${filters.join(" AND ")} ORDER BY date, start_time`,
+      `SELECT id, doctor_id, date::text AS date, start_time::text AS start_time, end_time::text AS end_time, created_at, updated_at
+       FROM availability
+       WHERE ${filters.join(" AND ")}
+         AND NOT EXISTS (
+           SELECT 1 FROM appointments appointment
+           WHERE appointment.availability_id = availability.id AND appointment.status <> 'cancelled'
+         )
+       ORDER BY date, start_time`,
       values,
     );
     return response.json(result.rows);

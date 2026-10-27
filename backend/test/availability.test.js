@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { describe, it } = require("node:test");
 const { createApp } = require("../src/app");
-const { localDateTime, slotStartsInFuture } = require("../src/controllers/availabilityController");
+const { localDateTime, slotStartsInFuture } = require("../src/utils/schedulingTime");
 const { slotsBodySchema, slotQuerySchema } = require("../src/validators/availabilitySchemas");
 
 const userId = "11111111-1111-4111-8111-111111111111";
@@ -34,12 +34,14 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], current
   const database = {
     slots,
     lockQueries: [],
+    availabilityQueries: [],
     async query(sql, values = []) {
       if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [currentUser] };
       if (sql === "SELECT id FROM doctors WHERE user_id = $1") {
         return { rows: values[0] === currentUser.id && currentUser.role === "doctor" ? [{ id: doctorId }] : [] };
       }
       if (sql.startsWith("SELECT id, doctor_id, date::text AS date")) {
+        database.availabilityQueries.push(sql);
         const [requestedDoctorId, currentDate, currentTime, from, to] = values;
         return { rows: slots.filter((slot) => slot.doctor_id === requestedDoctorId
           && (slot.date > currentDate || (slot.date === currentDate && slot.start_time > currentTime))
@@ -174,7 +176,9 @@ describe("availability validation", () => {
 
   it("confirms the new migration follows Phase 1", () => {
     const migrationFiles = fs.readdirSync(path.join(__dirname, "..", "migrations")).filter((file) => file.endsWith(".sql")).sort();
-    assert.deepEqual(migrationFiles, ["001_users_patients_doctors.sql", "002_doctor_availability.sql"]);
+    assert.deepEqual(migrationFiles.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
+    assert.equal(migrationFiles.length, 4);
+    assert.match(migrationFiles[3], /^004_.*\.sql$/);
     const sql = fs.readFileSync(path.join(__dirname, "..", "migrations", "002_doctor_availability.sql"), "utf8");
     assert.match(sql, /CREATE TABLE availability/i);
     assert.match(sql, /doctor_id UUID NOT NULL REFERENCES doctors\(id\) ON DELETE RESTRICT/i);
@@ -200,6 +204,7 @@ describe("availability endpoints", () => {
       const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`);
       assert.equal(response.status, 200);
       assert.equal((await response.json()).length, 2);
+      assert.match(database.availabilityQueries[0], /NOT EXISTS[\s\S]*FROM appointments/);
     });
   });
 
