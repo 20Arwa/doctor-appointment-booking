@@ -241,7 +241,7 @@ Project-specific decisions not yet confirmed:
 -   Package manager: \[\_\_\_\_\_\_\_\_\_\_\]
 -   Frontend directory: \[\_\_\_\_\_\_\_\_\_\_\]
 -   Backend directory: \[\_\_\_\_\_\_\_\_\_\_\]
--   Application timezone: \[\_\_\_\_\_\_\_\_\_\_\]
+-   Application timezone: `Asia/Kolkata` (India Standard Time, IANA timezone). All appointment scheduling and time-related business rules use this timezone.
 -   Doctor account provisioning policy: During initial Clerk-authenticated onboarding, users may select `patient` or `doctor`; doctor selection requires a specialty and grants no administrative privileges. Role is immutable through profile updates.
 -   Patient listing and administrative access policy:
     Until an administrative policy is approved, patients may access only their own profile; doctors and other patients cannot access patient records. No administrative role is implemented.

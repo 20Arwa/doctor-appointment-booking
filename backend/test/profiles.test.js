@@ -24,6 +24,7 @@ function testApp({ user = sampleUser, authenticated = true, databaseQuery, datab
       return { rows: [] };
     }) },
     frontendOrigin: "http://localhost:3000",
+    applicationTimezone: "UTC",
     clerkAuthMiddleware: (request, _response, next) => {
       request.auth = authenticated ? { isAuthenticated: true, userId: "user_verified_123" } : { isAuthenticated: false };
       next();

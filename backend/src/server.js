@@ -2,7 +2,7 @@ const env = require("./config/env");
 const pool = require("./config/database");
 const { createApp } = require("./app");
 
-const app = createApp({ database: pool, frontendOrigin: env.FRONTEND_ORIGIN });
+const app = createApp({ database: pool, frontendOrigin: env.FRONTEND_ORIGIN, applicationTimezone: env.APPLICATION_TIMEZONE });
 const server = app.listen(env.PORT, () => {
   console.log(`Express API listening on port ${env.PORT}`);
 });

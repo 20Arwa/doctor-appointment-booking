@@ -8,7 +8,7 @@ const patientRoutes = require("./routes/patientRoutes");
 const doctorRoutes = require("./routes/doctorRoutes");
 const { getClerkProfile } = require("./middleware/auth");
 
-function createApp({ database, frontendOrigin, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
+function createApp({ database, frontendOrigin, applicationTimezone, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("A PostgreSQL database pool is required");
   }
@@ -21,6 +21,7 @@ function createApp({ database, frontendOrigin, clerkAuthMiddleware = clerkMiddle
   app.use((_request, response, next) => {
     response.locals.database = database;
     response.locals.clerkProfileResolver = clerkProfileResolver;
+    response.locals.applicationTimezone = applicationTimezone;
     next();
   });
   app.use("/api/v1", healthRoutes);
