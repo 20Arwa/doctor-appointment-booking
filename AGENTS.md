@@ -242,9 +242,9 @@ Project-specific decisions not yet confirmed:
 -   Frontend directory: \[\_\_\_\_\_\_\_\_\_\_\]
 -   Backend directory: \[\_\_\_\_\_\_\_\_\_\_\]
 -   Application timezone: \[\_\_\_\_\_\_\_\_\_\_\]
--   Doctor account provisioning policy: \[\_\_\_\_\_\_\_\_\_\_\]
+-   Doctor account provisioning policy: During initial Clerk-authenticated onboarding, users may select `patient` or `doctor`; doctor selection requires a specialty and grants no administrative privileges. Role is immutable through profile updates.
 -   Patient listing and administrative access policy:
-    \[\_\_\_\_\_\_\_\_\_\_\]
+    Until an administrative policy is approved, patients may access only their own profile; doctors and other patients cannot access patient records. No administrative role is implemented.
 -   Appointment cancellation/rescheduling policy:
     \[\_\_\_\_\_\_\_\_\_\_\]
 -   Queue check-in time window: \[\_\_\_\_\_\_\_\_\_\_\]

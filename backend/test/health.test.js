@@ -2,6 +2,8 @@ const assert = require("node:assert/strict");
 const { after, before, describe, it } = require("node:test");
 const { createApp } = require("../src/app");
 
+const testClerkMiddleware = (_request, _response, next) => next();
+
 describe("GET /api/v1/health", () => {
   let server;
   let baseUrl;
@@ -18,6 +20,7 @@ describe("GET /api/v1/health", () => {
     const app = createApp({
       database: { query: (...args) => query(...args) },
       frontendOrigin: "http://localhost:3000",
+      clerkAuthMiddleware: testClerkMiddleware,
     });
     server = app.listen(0);
     await new Promise((resolve) => server.once("listening", resolve));
@@ -63,6 +66,7 @@ describe("error handling", () => {
     const app = createApp({
       database: { query: async () => ({ rows: [] }) },
       frontendOrigin: "http://localhost:3000",
+      clerkAuthMiddleware: testClerkMiddleware,
     });
     const server = app.listen(0);
     await new Promise((resolve) => server.once("listening", resolve));
