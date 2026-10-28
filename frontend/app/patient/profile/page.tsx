@@ -1,5 +1,5 @@
-import { SectionPlaceholder } from "@/components/section-placeholder";
+import { ProfilePage } from "@/components/profile-page";
 
 export default function PatientProfilePage() {
-  return <SectionPlaceholder role="patient" title="Profile" description="Patient profile viewing and editing will be available in a later phase." />;
+  return <ProfilePage />;
 }

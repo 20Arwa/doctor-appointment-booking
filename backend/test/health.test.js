@@ -61,6 +61,44 @@ describe("GET /api/v1/health", () => {
   });
 });
 
+describe("CORS preflight", () => {
+  it("allows credentialed frontend API requests before Clerk authentication", async () => {
+    let clerkCalled = false;
+    const app = createApp({
+      database: { query: async () => ({ rows: [] }) },
+      frontendOrigin: "http://localhost:3000",
+      clerkAuthMiddleware: (_request, _response, next) => {
+        clerkCalled = true;
+        next();
+      },
+    });
+    const server = app.listen(0);
+    await new Promise((resolve) => server.once("listening", resolve));
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/api/v1/appointments`, {
+        method: "OPTIONS",
+        headers: {
+          Origin: "http://localhost:3000",
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "authorization,content-type",
+        },
+      });
+
+      assert.equal(response.status, 204);
+      assert.equal(response.headers.get("access-control-allow-origin"), "http://localhost:3000");
+      assert.equal(response.headers.get("access-control-allow-credentials"), "true");
+      assert.match(response.headers.get("access-control-allow-methods") || "", /POST/);
+      assert.match(response.headers.get("access-control-allow-headers") || "", /authorization/i);
+      assert.equal(clerkCalled, false);
+    } finally {
+      await new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+});
+
 describe("error handling", () => {
   it("returns a safe validation error for malformed JSON", async () => {
     const app = createApp({

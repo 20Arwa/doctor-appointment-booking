@@ -5,6 +5,7 @@ import {
   CalendarDays,
   CalendarPlus,
   CalendarRange,
+  HeartPulse,
   LayoutDashboard,
   Menu,
   Stethoscope,
@@ -39,11 +40,18 @@ const doctorNavigation: AppNavigationItem[] = [
 ];
 
 const ProfileContext = createContext<LocalProfile | null>(null);
+const UpdateProfileContext = createContext<((profile: LocalProfile) => void) | null>(null);
 
 export function useDashboardProfile() {
   const profile = useContext(ProfileContext);
   if (!profile) throw new Error("useDashboardProfile must be used inside the authenticated app shell");
   return profile;
+}
+
+export function useUpdateDashboardProfile() {
+  const updateProfile = useContext(UpdateProfileContext);
+  if (!updateProfile) throw new Error("useUpdateDashboardProfile must be used inside the authenticated app shell");
+  return updateProfile;
 }
 
 export function RoleApplicationShell({ requiredRole, children }: { requiredRole: AppRole; children: ReactNode }) {
@@ -116,11 +124,13 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
 
   return (
     <ProfileContext.Provider value={profile}>
+      <UpdateProfileContext.Provider value={setProfile}>
       <div className="min-h-screen bg-background text-foreground md:flex">
         <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r border-sidebar-border bg-sidebar px-4 py-6 text-sidebar-foreground md:flex">
           <Link href={dashboardPath(requiredRole)} aria-label="Medrella dashboard" className="flex items-center gap-2 px-3 text-xl font-semibold tracking-tight focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sidebar-ring">
-            <span className="flex size-9 items-center justify-center rounded-xl bg-sidebar-primary text-sidebar-primary-foreground"><Stethoscope aria-hidden="true" className="size-5" /></span>
-            Medrella<span className="text-sidebar-primary">.</span>
+            <span className="flex size-9 items-center justify-center rounded-full bg-sidebar-primary text-sidebar-primary-foreground"><HeartPulse aria-hidden="true" className="size-5" /></span>
+            Medrella
+            {/* <span className="text-sidebar-primary">.</span> */}
           </Link>
           <p className="mt-8 px-3 text-xs font-semibold uppercase tracking-[0.14em] text-sidebar-foreground/65">{roleLabel}</p>
           <NavigationLinks items={navigation} pathname={pathname} />
@@ -159,6 +169,7 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
           <main className="mx-auto w-full max-w-7xl px-5 py-7 sm:px-7 sm:py-9 lg:px-10 lg:py-11">{children}</main>
         </div>
       </div>
+      </UpdateProfileContext.Provider>
     </ProfileContext.Provider>
   );
 }

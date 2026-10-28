@@ -229,6 +229,17 @@ export async function createLocalProfile(token: string, body: {
   return parsed.data;
 }
 
+export async function updateUserDetails(token: string, body: {
+  first_name: string;
+  last_name: string;
+  phone: string | null;
+}) {
+  await request<unknown>(token, "/users/me", {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
 export async function updateUserPhone(token: string, phone: string) {
   await request<unknown>(token, "/users/me", {
     method: "PATCH",
@@ -236,7 +247,7 @@ export async function updateUserPhone(token: string, phone: string) {
   });
 }
 
-export async function updateRoleProfile(token: string, profile: LocalProfile, body: Record<string, string>) {
+export async function updateRoleProfile(token: string, profile: LocalProfile, body: Record<string, string | null>) {
   const collection = profile.role === "doctor" ? "doctors" : "patients";
   await request<unknown>(token, `/${collection}/${profile.profile.id}`, {
     method: "PUT",

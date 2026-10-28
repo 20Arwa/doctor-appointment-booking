@@ -16,8 +16,8 @@ function createApp({ database, frontendOrigin, applicationTimezone, clerkAuthMid
 
   const app = express();
 
+  app.use(cors({ origin: frontendOrigin, credentials: true }));
   app.use(clerkAuthMiddleware);
-  app.use(cors({ origin: frontendOrigin }));
   app.use(express.json());
   app.use((_request, response, next) => {
     response.locals.database = database;

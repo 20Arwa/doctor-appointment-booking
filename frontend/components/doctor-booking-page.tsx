@@ -3,7 +3,9 @@
 import { useAuth } from "@clerk/nextjs";
 import { ArrowLeft, CalendarClock, CheckCircle2, RefreshCw, Stethoscope } from "lucide-react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { createAppointment, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
@@ -55,6 +57,7 @@ function formatBookingError(error: unknown) {
 
 export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   const { getToken } = useAuth();
+  const pathname = usePathname();
   const [doctor, setDoctor] = useState<DirectoryDoctor | null>(null);
   const [slots, setSlots] = useState<AvailabilitySlot[]>([]);
   const [selectedSlotId, setSelectedSlotId] = useState("");
@@ -67,7 +70,20 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   const [confirmation, setConfirmation] = useState<PatientAppointment | null>(null);
   const submissionInProgress = useRef(false);
 
+  const routeKey = `${pathname}:${doctorId}`;
+  const [previousRouteKey, setPreviousRouteKey] = useState(routeKey);
+  if (previousRouteKey !== routeKey) {
+    setPreviousRouteKey(routeKey);
+    setConfirmation(null);
+    setSelectedSlotId("");
+    setBookingError(null);
+    setReason("");
+    setLoading(true);
+    setLoadError(null);
+  }
+
   useEffect(() => {
+    if (!pathname.startsWith("/patient/doctors/")) return;
     let active = true;
     const load = async () => {
       try {
@@ -91,7 +107,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
     };
     void load();
     return () => { active = false; };
-  }, [doctorId, getToken, retryKey]);
+  }, [doctorId, getToken, pathname, retryKey]);
 
   async function handleBooking(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -106,6 +122,18 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
       const created = await createAppointment(token, selectedSlotId, reason.trim() || undefined);
       setConfirmation(created);
       setSelectedSlotId("");
+      setSlots((current) => current.filter((slot) => slot.id !== created.availability_id));
+      setBookingError(null);
+      const { from, to } = getSlotRange();
+      try {
+        const refreshedSlots = await getDoctorSlots(token, doctorId, from, to);
+        setSlots(refreshedSlots.filter((slot) => {
+          const instant = slotInstant(slot);
+          return slot.id !== created.availability_id && instant !== null && instant.getTime() > Date.now();
+        }));
+      } catch {
+        // The successful booking remains confirmed; the booked slot was already removed locally.
+      }
     } catch (error) {
       setBookingError(formatBookingError(error));
     } finally {
@@ -171,7 +199,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
               <CalendarClock aria-hidden="true" className="size-5 text-primary" />
               <h2 id="available-times-title" className="text-xl font-semibold text-card-foreground">Available appointment times</h2>
             </div>
-            <p className="mt-2 text-sm text-muted-foreground">Showing available times over the next 30 days in India Standard Time.</p>
+            <p className="mt-2 text-sm text-muted-foreground">Showing available times over the next 30 days.</p>
 
             {slots.length === 0 ? <p className="mt-5 rounded-xl bg-muted p-4 text-sm leading-6 text-muted-foreground">No future times are currently available. Please check again later.</p> : (
               <form className="mt-5 space-y-5" onSubmit={handleBooking}>
@@ -203,9 +231,9 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
                   </div>
                 ) : null}
 
-                <button type="submit" disabled={!selectedSlotId || booking} className="inline-flex min-h-12 items-center justify-center gap-2 rounded-lg bg-primary px-5 py-3 font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-60">
+                <Button type="submit" size="lg" disabled={!selectedSlotId || booking}>
                   {booking ? "Booking…" : "Confirm appointment"}
-                </button>
+                </Button>
               </form>
             )}
           </section>

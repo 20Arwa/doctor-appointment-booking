@@ -4,8 +4,19 @@ import { useAuth } from "@clerk/nextjs";
 import { CalendarPlus, Clock3, RefreshCw, Trash2 } from "lucide-react";
 import { useDashboardProfile } from "@/components/role-application-shell";
 import { useEffect, useRef, useState } from "react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { z } from "zod";
 import { createDoctorSlot, deleteDoctorSlot, getDoctorSlots, ProfileApiError, type AvailabilitySlot } from "@/lib/profile-api";
+import { notifyError, notifySuccess } from "@/lib/notifications";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
 
@@ -62,8 +73,9 @@ export function DoctorAvailabilityPage() {
   const [endTime, setEndTime] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [activeSlotId, setActiveSlotId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<AvailabilitySlot | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const mutationLock = useRef(false);
 
@@ -86,11 +98,10 @@ export function DoctorAvailabilityPage() {
     return () => { active = false; };
   }, [doctorId, getToken, refreshKey]);
 
-  function refreshSlots(successMessage?: string) {
+  function refreshSlots() {
     setLoading(true);
     setLoadError(null);
     setActionError(null);
-    setNotice(successMessage ?? null);
     setRefreshKey((key) => key + 1);
   }
 
@@ -99,7 +110,6 @@ export function DoctorAvailabilityPage() {
     if (mutationLock.current) return;
     setFormError(null);
     setActionError(null);
-    setNotice(null);
 
     const parsed = slotFormSchema.safeParse({ date, start_time: startTime, end_time: endTime });
     if (!parsed.success) {
@@ -107,7 +117,7 @@ export function DoctorAvailabilityPage() {
       return;
     }
     if (!isFutureSlot(parsed.data.date, parsed.data.start_time)) {
-      setFormError("The slot must start in the future in India Standard Time.");
+      setFormError("The slot must start in the future.");
       return;
     }
 
@@ -120,9 +130,15 @@ export function DoctorAvailabilityPage() {
       setDate("");
       setStartTime("");
       setEndTime("");
-      refreshSlots("Availability slot created.");
+      refreshSlots();
+      notifySuccess("Availability slot created.", `availability-create-${doctorId}`);
     } catch (error) {
-      setActionError(apiErrorMessage(error, "We couldn't create this slot. Please try again."));
+      const message = apiErrorMessage(error, "We couldn't create this slot. Please try again.");
+      if (error instanceof ProfileApiError && error.status === 409) {
+        setActionError(message);
+      } else {
+        notifyError(message, `availability-create-${doctorId}`);
+      }
     } finally {
       setCreating(false);
       mutationLock.current = false;
@@ -130,23 +146,23 @@ export function DoctorAvailabilityPage() {
   }
 
   async function handleDelete(slot: AvailabilitySlot) {
-    if (mutationLock.current || !window.confirm(`Delete the slot on ${formatDate(slot.date)} at ${formatTime(slot.start_time)} IST?`)) return;
+    if (mutationLock.current) return;
     mutationLock.current = true;
     setActiveSlotId(slot.id);
-    setActionError(null);
-    setNotice(null);
+    setDeleteError(null);
     try {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
       await deleteDoctorSlot(token, doctorId, slot.id);
-      refreshSlots("Availability slot deleted.");
+      setDeleteTarget(null);
+      refreshSlots();
+      notifySuccess("Availability slot deleted.", `availability-delete-${slot.id}`);
     } catch (error) {
       if (error instanceof ProfileApiError && error.status === 409) {
-        setActionError("This slot is now linked to appointment history and cannot be deleted. The list has been refreshed.");
         refreshSlots();
-        setActionError("This slot is now linked to appointment history and cannot be deleted.");
+        setDeleteError("This slot is now linked to appointment history and cannot be deleted. The list has been refreshed.");
       } else {
-        setActionError(apiErrorMessage(error, "We couldn't delete this slot. Please try again."));
+        setDeleteError(apiErrorMessage(error, "We couldn't delete this slot. Please try again."));
       }
     } finally {
       setActiveSlotId(null);
@@ -159,7 +175,7 @@ export function DoctorAvailabilityPage() {
       <header>
         <p className="text-sm font-semibold uppercase tracking-[0.14em] text-primary">Doctor workspace</p>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">Manage availability</h1>
-        <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">Add individual future appointment slots. All dates and times use India Standard Time.</p>
+        <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">Add individual future appointment slots.</p>
       </header>
 
       <section className="rounded-3xl border border-border bg-card p-6 shadow-sm sm:p-8" aria-labelledby="create-slot-title">
@@ -203,8 +219,6 @@ export function DoctorAvailabilityPage() {
           <button type="button" onClick={() => refreshSlots()} disabled={loading} className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-60"><RefreshCw aria-hidden="true" className="size-4" /> Refresh</button>
         </div>
 
-        {notice ? <p className="mt-4 rounded-xl border border-status-confirmed/40 bg-status-confirmed-bg p-4 text-sm text-foreground" role="status">{notice}</p> : null}
-        {actionError ? <p className="mt-4 rounded-xl border border-destructive/40 bg-destructive/5 p-4 text-sm text-foreground" role="alert">{actionError}</p> : null}
         {loading ? <p className="mt-4 rounded-xl bg-muted p-5 text-sm text-muted-foreground" role="status">Loading availability…</p> : null}
         {!loading && loadError ? (
           <div className="mt-4 rounded-xl border border-destructive/40 bg-destructive/5 p-5" role="alert">
@@ -224,7 +238,7 @@ export function DoctorAvailabilityPage() {
                     <p className="mt-1 text-sm text-muted-foreground">{formatTime(slot.start_time)}–{formatTime(slot.end_time)} IST</p>
                   </div>
                 </div>
-                <button type="button" aria-label={`Delete slot on ${formatDate(slot.date)} at ${formatTime(slot.start_time)}`} onClick={() => void handleDelete(slot)} disabled={activeSlotId !== null || creating} className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50">
+                <button type="button" aria-label={`Delete slot on ${formatDate(slot.date)} at ${formatTime(slot.start_time)}`} onClick={() => { setDeleteError(null); setDeleteTarget(slot); }} disabled={activeSlotId !== null || creating} className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50">
                   {activeSlotId === slot.id ? <RefreshCw aria-hidden="true" className="size-4 animate-spin" /> : <Trash2 aria-hidden="true" className="size-4" />}
                 </button>
               </li>
@@ -232,6 +246,29 @@ export function DoctorAvailabilityPage() {
           </ul>
         ) : null}
       </section>
+      <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => {
+        if (!open && activeSlotId === null) {
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }
+      }}>
+        <AlertDialogContent className="max-w-md rounded-2xl border border-border bg-card p-6 text-card-foreground shadow-xl ring-0 sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete availability slot?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleteTarget ? `Delete the slot on ${formatDate(deleteTarget.date)} at ${formatTime(deleteTarget.start_time)} IST? This slot will no longer be available for booking.` : "This availability slot will be removed."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {deleteError ? <p className="rounded-lg bg-destructive/5 p-3 text-sm text-foreground" role="alert">{deleteError}</p> : null}
+          <AlertDialogFooter className="m-0 flex-row justify-end gap-3 border-0 bg-transparent p-0">
+            <AlertDialogCancel disabled={activeSlotId !== null}>Keep slot</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" disabled={activeSlotId !== null} onClick={(event) => {
+              event.preventDefault();
+              if (deleteTarget) void handleDelete(deleteTarget);
+            }}>{activeSlotId !== null ? "Deleting slot…" : "Delete slot"}</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

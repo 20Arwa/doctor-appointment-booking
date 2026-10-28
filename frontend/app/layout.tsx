@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ClerkProvider } from "@clerk/nextjs";
+import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -23,10 +24,35 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased scroll-smooth`}
     >
       <body className="min-h-full flex flex-col">
-        <ClerkProvider>{children}</ClerkProvider>
+        
+{/* import { ClerkProvider } from "@clerk/nextjs"; */}
+
+<ClerkProvider
+  appearance={{
+    variables: {
+      colorPrimary: "var(--primary)",
+      colorBackground: "var(--card)",
+      colorForeground: "var(--card-foreground)",
+      colorMutedForeground: "var(--muted-foreground)",
+      colorInput: "var(--card)",
+      colorInputForeground: "var(--card-foreground)",
+      // colorBorder: "var(--border)",
+      colorRing: "var(--ring)",
+      colorDanger: "var(--destructive)",
+      colorSuccess: "var(--status-confirmed)",
+      colorWarning: "var(--status-pending)",
+      borderRadius: "var(--radius)",
+      fontFamily: "Arial, Helvetica, sans-serif",
+    },
+  }}
+>
+  {children}
+  <Toaster position="top-right" />
+</ClerkProvider>
+
       </body>
     </html>
   );

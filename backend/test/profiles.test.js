@@ -26,7 +26,12 @@ function testApp({ user = sampleUser, authenticated = true, databaseQuery, datab
     frontendOrigin: "http://localhost:3000",
     applicationTimezone: "UTC",
     clerkAuthMiddleware: (request, _response, next) => {
-      request.auth = authenticated ? { isAuthenticated: true, userId: "user_verified_123" } : { isAuthenticated: false };
+      request.auth = Object.assign(
+        () => authenticated
+          ? { isAuthenticated: true, userId: "user_verified_123", tokenType: "session_token" }
+          : { isAuthenticated: false, userId: null, tokenType: "session_token" },
+        { [Symbol.for("@clerk/express.auth")]: true },
+      );
       next();
     },
     clerkProfileResolver,
@@ -75,6 +80,24 @@ describe("Phase 1 database migration", () => {
 });
 
 describe("profile authorization", () => {
+  it("reads Clerk's function-valued request auth before serving the current profile", async () => {
+    const patientProfile = { id: "22222222-2222-4222-8222-222222222222", date_of_birth: null, gender: null };
+    const app = testApp({ databaseQuery: async (sql) => {
+      if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [sampleUser] };
+      if (sql.includes("FROM patients WHERE user_id")) return { rows: [patientProfile] };
+      return { rows: [] };
+    } });
+
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/users/me`);
+      const body = await response.json();
+
+      assert.equal(response.status, 200);
+      assert.equal(body.id, sampleUser.id);
+      assert.equal(body.profile.id, patientProfile.id);
+    });
+  });
+
   it("rejects requests without a verified Clerk identity", async () => {
     await withServer(testApp({ authenticated: false }), async (url) => {
       const response = await fetch(`${url}/api/v1/users/me`);

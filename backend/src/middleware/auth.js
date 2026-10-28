@@ -1,7 +1,7 @@
 const { getAuth, clerkClient } = require("@clerk/express");
 
 function requireClerkIdentity(request, response, next) {
-  const auth = request.auth || getAuth(request);
+  const auth = getAuth(request);
   if (!auth.isAuthenticated || !auth.userId) {
     return response.status(401).json({ error: { code: "UNAUTHENTICATED", message: "Authentication is required" } });
   }

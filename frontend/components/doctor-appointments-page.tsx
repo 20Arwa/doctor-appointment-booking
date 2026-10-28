@@ -3,7 +3,9 @@
 import { useAuth } from "@clerk/nextjs";
 import { CalendarClock, CheckCircle2, RefreshCw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { completeDoctorAppointment, getAppointments, ProfileApiError, type PatientAppointment } from "@/lib/profile-api";
+import { notifyError, notifySuccess } from "@/lib/notifications";
 
 function appointmentInstant(appointment: Pick<PatientAppointment, "date" | "start_time">) {
   const instant = new Date(`${appointment.date}T${appointment.start_time}+05:30`);
@@ -37,7 +39,6 @@ export function DoctorAppointmentsPage() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [activeAppointment, setActiveAppointment] = useState<string | null>(null);
   const mutationLock = useRef(false);
-  const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -62,19 +63,20 @@ export function DoctorAppointmentsPage() {
   }, [getToken, refreshKey]);
 
   const now = currentTime ?? 0;
-  const scheduled = appointments.filter((appointment) => {
+  const scheduled = appointments.filter((appointment) => appointment.status === "confirmed" && (() => {
     const instant = appointmentInstant(appointment);
     return instant !== null && instant.getTime() > now;
-  }).sort((first, second) => (appointmentInstant(first)?.getTime() ?? 0) - (appointmentInstant(second)?.getTime() ?? 0));
-  const past = appointments.filter((appointment) => {
+  })()).sort((first, second) => (appointmentInstant(first)?.getTime() ?? 0) - (appointmentInstant(second)?.getTime() ?? 0));
+  const past = appointments.filter((appointment) => appointment.status !== "cancelled" && (() => {
     const instant = appointmentInstant(appointment);
-    return instant === null || instant.getTime() <= now;
-  }).sort((first, second) => (appointmentInstant(second)?.getTime() ?? 0) - (appointmentInstant(first)?.getTime() ?? 0));
+    return appointment.status === "completed" || instant !== null && instant.getTime() <= now;
+  })()).sort((first, second) => (appointmentInstant(second)?.getTime() ?? 0) - (appointmentInstant(first)?.getTime() ?? 0));
+  const cancelled = appointments.filter((appointment) => appointment.status === "cancelled")
+    .sort((first, second) => (appointmentInstant(second)?.getTime() ?? 0) - (appointmentInstant(first)?.getTime() ?? 0));
 
   function refreshAppointments() {
     setLoading(true);
     setError(null);
-    setNotice(null);
     setRefreshKey((key) => key + 1);
   }
 
@@ -82,22 +84,21 @@ export function DoctorAppointmentsPage() {
     if (mutationLock.current) return;
     mutationLock.current = true;
     setActiveAppointment(appointment.id);
-    setNotice(null);
     try {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
       const updated = await completeDoctorAppointment(token, appointment.id);
       setAppointments((current) => current.map((item) => item.id === appointment.id ? updated : item));
-      setNotice({ kind: "success", text: "Appointment marked as completed." });
+      notifySuccess("Appointment marked as completed.", `doctor-complete-${appointment.id}`);
     } catch (cause) {
       const conflict = cause instanceof ProfileApiError && cause.status === 409;
       if (conflict) refreshAppointments();
-      setNotice({
-        kind: "error",
-        text: conflict
+      notifyError(
+        conflict
           ? "This appointment is no longer confirmed. The appointment list is being refreshed."
           : cause instanceof Error ? cause.message : "We couldn't update this appointment. Please try again.",
-      });
+        `doctor-complete-${appointment.id}`,
+      );
     } finally {
       setActiveAppointment(null);
       mutationLock.current = false;
@@ -109,10 +110,8 @@ export function DoctorAppointmentsPage() {
       <header>
         <p className="text-sm font-semibold uppercase tracking-[0.14em] text-primary">Doctor workspace</p>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">My appointments</h1>
-        <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">Review your scheduled and past appointments. Appointment times are shown in India Standard Time.</p>
+        <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">Review your scheduled and past appointments.</p>
       </header>
-
-      {notice ? <p className={`rounded-xl border p-4 text-sm ${notice.kind === "success" ? "border-status-confirmed/40 bg-status-confirmed-bg text-foreground" : "border-destructive/40 bg-destructive/5 text-foreground"}`} role={notice.kind === "error" ? "alert" : "status"}>{notice.text}</p> : null}
 
       {loading ? <p className="rounded-2xl bg-muted p-6 text-sm text-muted-foreground" role="status">Loading your appointments…</p> : null}
       {!loading && error ? (
@@ -126,6 +125,7 @@ export function DoctorAppointmentsPage() {
         <>
           <AppointmentGroup title="Scheduled appointments" empty="You have no scheduled appointments." appointments={scheduled} onComplete={markComplete} activeAppointment={activeAppointment} />
           <AppointmentGroup title="Past appointments" empty="Your past appointments will appear here." appointments={past} onComplete={markComplete} activeAppointment={activeAppointment} />
+          <AppointmentGroup title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} onComplete={markComplete} activeAppointment={activeAppointment} />
         </>
       ) : null}
     </div>
@@ -160,10 +160,10 @@ function AppointmentGroup({ title, empty, appointments, onComplete, activeAppoin
               </div>
               {appointment.status === "confirmed" ? (
                 <div className="mt-5 border-t border-border pt-4">
-                  <button type="button" disabled={activeAppointment !== null} onClick={() => onComplete(appointment)} className="inline-flex min-h-10 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-semibold text-primary-foreground hover:bg-primary/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-60">
+                  <Button type="button" size="sm" disabled={activeAppointment !== null} onClick={() => onComplete(appointment)}>
                     <CheckCircle2 aria-hidden="true" className="size-4" />
                     {activeAppointment === appointment.id ? "Updating…" : "Mark as completed"}
-                  </button>
+                  </Button>
                 </div>
               ) : null}
             </li>

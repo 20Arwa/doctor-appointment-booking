@@ -184,7 +184,12 @@ function createTestApp({ currentUser = patientUser, database = createDatabase({ 
       frontendOrigin: "http://localhost:3000",
       applicationTimezone,
       clerkAuthMiddleware: (request, _response, next) => {
-        request.auth = authenticated ? { isAuthenticated: true, userId: "clerk_test_user" } : { isAuthenticated: false };
+        request.auth = Object.assign(
+          () => authenticated
+            ? { isAuthenticated: true, userId: "clerk_test_user", tokenType: "session_token" }
+            : { isAuthenticated: false, userId: null, tokenType: "session_token" },
+          { [Symbol.for("@clerk/express.auth")]: true },
+        );
         next();
       },
     }),

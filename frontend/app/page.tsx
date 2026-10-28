@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { ArrowRight, CalendarCheck2, Clock3, Search } from "lucide-react";
+import { ArrowRight, CalendarCheck2, Clock3, HeartPulse, Search } from "lucide-react";
 import { SiteHeader } from "@/components/site-header";
 
 const steps = [
@@ -30,7 +30,7 @@ export default function Home() {
       <main className="flex-1">
         <section className="relative isolate overflow-hidden border-b border-border">
           <div aria-hidden="true" className="pointer-events-none absolute -right-24 -top-32 -z-10 size-[30rem] rounded-full bg-accent/50 blur-3xl" />
-          <div className="mx-auto grid w-full max-w-7xl items-center gap-14 px-6 py-20 sm:px-10 sm:py-28 lg:grid-cols-[1.05fr_0.95fr] lg:gap-20 lg:px-12 lg:py-32">
+          <div className="mx-auto grid w-full max-w-7xl items-center gap-14 px-6 py-20 sm:px-10 sm:py-28 lg:grid-cols-[1.05fr_0.95fr] lg:gap-20 lg:px-12 lg:py-22">
             <div className="max-w-2xl">
               <p className="mb-6 inline-flex items-center gap-2 rounded-full border border-border bg-card/80 px-4 py-2 text-sm font-medium text-secondary-foreground shadow-sm">
                 <span aria-hidden="true" className="size-2 rounded-full bg-primary" />
@@ -109,7 +109,21 @@ export default function Home() {
 
       <footer className="border-t border-border bg-card/60">
         <div className="mx-auto flex w-full max-w-7xl flex-col gap-5 px-6 py-7 sm:flex-row sm:items-center sm:justify-between sm:px-10 lg:px-12">
-          <Link href="/" className="text-lg font-semibold tracking-tight text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">Medrella</Link>
+          {/* <Link href="/" className="text-lg font-semibold tracking-tight text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">Medrella</Link> */}
+                  <Link
+  href="/"
+  aria-label="Medrella home"
+  className="flex items-center gap-2 text-xl font-semibold tracking-tight text-foreground"
+>
+  <span className="flex size-9 items-center justify-center rounded-full bg-primary text-primary-foreground">
+    <HeartPulse className="size-5" aria-hidden="true" />
+  </span>
+
+  <span>
+    Medrella
+    {/* <span className="text-primary">.</span> */}
+  </span>
+</Link>
           <nav aria-label="Footer navigation" className="flex flex-wrap items-center gap-x-6 gap-y-3 text-sm text-muted-foreground">
             <a href="#how-it-works" className="transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">How it works</a>
             <Link href="/sign-in" className="transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">Sign in</Link>

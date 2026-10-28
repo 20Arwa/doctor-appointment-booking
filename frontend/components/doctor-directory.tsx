@@ -33,14 +33,19 @@ export function DoctorDirectory() {
     return () => { active = false; };
   }, [getToken, retryKey]);
 
-  const normalizedSearch = search.trim().toLocaleLowerCase("en");
+  const normalizeName = (value: string) => value
+    .toLocaleLowerCase("en")
+    .replace(/\bdr\.?\s*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const normalizedSearch = normalizeName(search);
   const filteredDoctors = useMemo(() => {
     if (!normalizedSearch) return doctors;
     return doctors.filter((doctor) =>
-      `${doctor.first_name} ${doctor.last_name}`.toLocaleLowerCase("en").includes(normalizedSearch)
-      || doctor.specialty.toLocaleLowerCase("en").includes(normalizedSearch),
+      normalizeName(`${doctor.first_name} ${doctor.last_name}`).includes(normalizedSearch)
+      || doctor.specialty.toLocaleLowerCase("en").includes(search.trim().toLocaleLowerCase("en")),
     );
-  }, [doctors, normalizedSearch]);
+  }, [doctors, normalizedSearch, search]);
 
   return (
     <div className="space-y-6">

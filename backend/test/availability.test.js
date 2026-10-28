@@ -130,7 +130,12 @@ function createTestApp({ database, currentUser = user, authenticated = true, app
       applicationTimezone,
       frontendOrigin: "http://localhost:3000",
       clerkAuthMiddleware: (request, _response, next) => {
-        request.auth = authenticated ? { isAuthenticated: true, userId: "user_clerk_verified" } : { isAuthenticated: false };
+        request.auth = Object.assign(
+          () => authenticated
+            ? { isAuthenticated: true, userId: "user_clerk_verified", tokenType: "session_token" }
+            : { isAuthenticated: false, userId: null, tokenType: "session_token" },
+          { [Symbol.for("@clerk/express.auth")]: true },
+        );
         next();
       },
     }),
