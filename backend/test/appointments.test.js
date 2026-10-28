@@ -1,0 +1,386 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const { describe, it } = require("node:test");
+const { createApp } = require("../src/app");
+const {
+  appointmentQuerySchema,
+  createAppointmentSchema,
+  rescheduleAppointmentSchema,
+} = require("../src/validators/appointmentSchemas");
+
+const patientUserId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const doctorUserId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const otherUserId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const patientId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const doctorId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const firstSlotId = "11111111-1111-4111-8111-111111111111";
+const secondSlotId = "22222222-2222-4222-8222-222222222222";
+const appointmentId = "33333333-3333-4333-8333-333333333333";
+const secondAppointmentId = "44444444-4444-4444-8444-444444444444";
+
+const patientUser = { id: patientUserId, role: "patient", is_active: true, first_name: "Pia", last_name: "Patient" };
+const doctorUser = { id: doctorUserId, role: "doctor", is_active: true, first_name: "Dara", last_name: "Doctor" };
+const otherUser = { id: otherUserId, role: "patient", is_active: true, first_name: "Other", last_name: "Patient" };
+
+function makeSlot(id, start_time = "10:00", date = "2099-04-10") {
+  return { id, doctor_id: doctorId, date, start_time, end_time: "10:30", doctor_active: true };
+}
+
+function makeAppointment({ id = appointmentId, availability_id = firstSlotId, status = "confirmed", reason = "Checkup", cancelled_at = null } = {}) {
+  return { id, patient_id: patientId, availability_id, status, reason, cancelled_at, created_at: "2099-01-01T00:00:00.000Z", updated_at: "2099-01-01T00:00:00.000Z" };
+}
+
+function createDatabase({
+  currentUser = patientUser,
+  slots = [makeSlot(firstSlotId), makeSlot(secondSlotId, "11:00")],
+  appointments = [],
+  appointmentRefs = [],
+} = {}) {
+  const state = { slots: slots.map((slot) => ({ ...slot })), appointments: appointments.map((appointment) => ({ ...appointment })) };
+  const lockTails = new Map();
+
+  function details(appointment) {
+    const slot = state.slots.find((item) => item.id === appointment.availability_id);
+    if (!slot) return undefined;
+    return {
+      ...appointment,
+      date: slot.date,
+      start_time: `${slot.start_time}:00`,
+      end_time: `${slot.end_time}:00`,
+      doctor_id: doctorId,
+      doctor_first_name: doctorUser.first_name,
+      doctor_last_name: doctorUser.last_name,
+      specialty: "General Practice",
+      patient_first_name: "Pia",
+      patient_last_name: "Patient",
+    };
+  }
+
+  const database = {
+    state,
+    async query(sql, values = []) {
+      if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [currentUser] };
+      if (sql === "SELECT id FROM patients WHERE user_id = $1") return { rows: currentUser.id === patientUserId ? [{ id: patientId }] : [] };
+      if (sql === "SELECT id FROM doctors WHERE user_id = $1") return { rows: currentUser.id === doctorUserId ? [{ id: doctorId }] : [] };
+      if (sql.includes("FROM appointments a") && sql.includes("WHERE a.id = $1 AND")) {
+        const [id, ownerId] = values;
+        const appointment = state.appointments.find((row) => row.id === id);
+        const slot = appointment && state.slots.find((item) => item.id === appointment.availability_id);
+        const allowed = currentUser.role === "patient"
+          ? currentUser.id === patientUserId && appointment?.patient_id === patientId && ownerId === currentUser.id
+          : slot?.doctor_id === doctorId && ownerId === currentUser.id;
+        return { rows: allowed ? [details(appointment)] : [] };
+      }
+      if (sql.includes("FROM appointments a") && sql.includes("ORDER BY av.date")) {
+        const [ownerId, status, from, to] = values;
+        const rows = state.appointments.filter((appointment) => {
+          const slot = state.slots.find((item) => item.id === appointment.availability_id);
+          const owned = currentUser.role === "patient" ? ownerId === patientUserId && appointment.patient_id === patientId : ownerId === doctorUserId && slot?.doctor_id === doctorId;
+          return owned && (!status || appointment.status === status) && (!from || slot.date >= from) && (!to || slot.date <= to);
+        }).map(details);
+        return { rows };
+      }
+      throw new Error(`Unexpected database query: ${sql}`);
+    },
+    async connect() {
+      let txAppointments;
+      let pendingLocks = [];
+      let heldLocks = false;
+      const client = {
+        async query(sql, values = []) {
+          if (sql === "BEGIN") {
+            txAppointments = state.appointments.map((appointment) => ({ ...appointment }));
+            return { rows: [] };
+          }
+          if (sql === "SELECT id FROM patients WHERE user_id = $1") {
+            return { rows: values[0] === patientUserId ? [{ id: patientId }] : [] };
+          }
+          if (sql.includes("FROM availability av") && sql.includes("FOR UPDATE OF av")) {
+            const [slotId] = values;
+            const previous = lockTails.get(slotId) || Promise.resolve();
+            let release;
+            lockTails.set(slotId, new Promise((resolve) => { release = resolve; }));
+            await previous;
+            pendingLocks.push(release);
+            heldLocks = true;
+            const slot = state.slots.find((item) => item.id === slotId && item.doctor_active);
+            return { rows: slot ? [{ ...slot }] : [] };
+          }
+          if (sql.startsWith("SELECT id, status") && sql.includes("FROM appointments a JOIN patients")) {
+            const [id, ownerId] = values;
+            const appointment = txAppointments.find((row) => row.id === id && ownerId === patientUserId && row.patient_id === patientId);
+            return { rows: appointment ? [{ ...appointment }] : [] };
+          }
+          if (sql.startsWith("SELECT id, status") && sql.includes("JOIN availability av")) {
+            const [id, ownerDoctorId] = values;
+            const appointment = txAppointments.find((row) => {
+              const slot = state.slots.find((item) => item.id === row.availability_id);
+              return row.id === id && slot?.doctor_id === ownerDoctorId;
+            });
+            return { rows: appointment ? [{ id: appointment.id, status: appointment.status }] : [] };
+          }
+          if (sql.startsWith("SELECT 1 FROM appointments")) {
+            const [slotId] = values;
+            const rows = [...state.appointments, ...txAppointments];
+            return { rows: rows.some((row) => row.availability_id === slotId && row.status !== "cancelled") ? [{ "?column?": 1 }] : [] };
+          }
+          if (sql.startsWith("INSERT INTO appointments")) {
+            let appointment;
+            appointment = makeAppointment({ id: secondAppointmentId, patient_id: values[0], availability_id: values[1], reason: values[2] });
+            if (txAppointments.some((row) => row.availability_id === appointment.availability_id && row.status !== "cancelled")) {
+              const error = new Error("unique slot index conflict");
+              error.code = "23505";
+              throw error;
+            }
+            txAppointments.push(appointment);
+            return { rows: [{ id: appointment.id }] };
+          }
+          if (sql.startsWith("UPDATE appointments SET status = 'cancelled'")) {
+            const appointment = txAppointments.find((row) => row.id === values[0]);
+            if (appointment) Object.assign(appointment, { status: "cancelled", cancelled_at: "2099-02-01T00:00:00.000Z", updated_at: "2099-02-01T00:00:00.000Z" });
+            return { rows: [] };
+          }
+          if (sql.startsWith("UPDATE appointments SET status = 'completed'")) {
+            const appointment = txAppointments.find((row) => row.id === values[0]);
+            if (appointment) Object.assign(appointment, { status: "completed", updated_at: "2099-02-01T00:00:00.000Z" });
+            return { rows: [] };
+          }
+          if (sql.includes("FROM appointments a") && sql.includes("WHERE a.id = $1")) {
+            const appointment = txAppointments.find((row) => row.id === values[0]);
+            return { rows: appointment ? [details(appointment)] : [] };
+          }
+          if (sql === "COMMIT") {
+            state.appointments.splice(0, state.appointments.length, ...txAppointments);
+            releaseLocks();
+            return { rows: [] };
+          }
+          if (sql === "ROLLBACK") {
+            txAppointments = undefined;
+            releaseLocks();
+            return { rows: [] };
+          }
+          throw new Error(`Unexpected transaction query: ${sql}`);
+        },
+        release() { releaseLocks(); },
+      };
+      function releaseLocks() {
+        if (!heldLocks) return;
+        for (const release of pendingLocks) release();
+        pendingLocks = [];
+        heldLocks = false;
+      }
+      return client;
+    },
+  };
+  return database;
+}
+
+function createTestApp({ currentUser = patientUser, database = createDatabase({ currentUser }), authenticated = true, applicationTimezone = "Asia/Kolkata" } = {}) {
+  return {
+    database,
+    app: createApp({
+      database,
+      frontendOrigin: "http://localhost:3000",
+      applicationTimezone,
+      clerkAuthMiddleware: (request, _response, next) => {
+        request.auth = Object.assign(
+          () => authenticated
+            ? { isAuthenticated: true, userId: "clerk_test_user", tokenType: "session_token" }
+            : { isAuthenticated: false, userId: null, tokenType: "session_token" },
+          { [Symbol.for("@clerk/express.auth")]: true },
+        );
+        next();
+      },
+    }),
+  };
+}
+
+async function withServer(app, callback) {
+  const server = app.listen(0);
+  await new Promise((resolve) => server.once("listening", resolve));
+  try { await callback(`http://127.0.0.1:${server.address().port}`); }
+  finally { await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())); }
+}
+
+describe("appointment schemas and migration", () => {
+  it("validates appointment IDs, filters, ranges, slot IDs, and request fields", () => {
+    assert.equal(appointmentQuerySchema.safeParse({ status: "confirmed", from: "2099-04-01", to: "2099-04-02" }).success, true);
+    assert.equal(appointmentQuerySchema.safeParse({ status: "pending" }).success, false);
+    assert.equal(appointmentQuerySchema.safeParse({ from: "2099-04-03", to: "2099-04-02" }).success, false);
+    assert.equal(createAppointmentSchema.safeParse({ availability_id: firstSlotId, reason: "Checkup" }).success, true);
+    assert.equal(createAppointmentSchema.safeParse({ availability_id: "nope", patient_id: patientId }).success, false);
+    assert.equal(rescheduleAppointmentSchema.safeParse({ availability_id: secondSlotId }).success, true);
+    assert.equal(rescheduleAppointmentSchema.safeParse({ availability_id: secondSlotId, patient_id: patientId }).success, false);
+  });
+
+  it("adds the appointment migrations in order with history-preserving constraints", () => {
+    const directory = path.join(__dirname, "..", "migrations");
+    const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
+    assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
+    assert.equal(files.length, 4);
+    assert.match(files[3], /^004_.*\.sql$/);
+    const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
+    assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
+    assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);
+    assert.match(sql, /UNIQUE INDEX appointments_availability_active_unique\s+ON appointments \(availability_id\)\s+WHERE status <> 'cancelled'/i);
+  });
+});
+
+describe("appointment workflows", () => {
+  it("books a future slot and prevents duplicate bookings", async () => {
+    const { app, database } = createTestApp();
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ availability_id: firstSlotId, reason: "Annual checkup" }),
+      });
+      assert.equal(response.status, 201);
+      const appointment = await response.json();
+      assert.equal(appointment.status, "confirmed");
+      assert.equal(appointment.reason, "Annual checkup");
+      assert.equal(appointment.availability_id, firstSlotId);
+      assert.equal(database.state.appointments.length, 1);
+
+      const duplicate = await fetch(`${url}/api/v1/appointments`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ availability_id: firstSlotId }),
+      });
+      assert.equal(duplicate.status, 409);
+    });
+  });
+
+  it("rejects nonexistent, past, and already occupied slots", async () => {
+    const { app } = createTestApp({ database: createDatabase({ slots: [makeSlot(firstSlotId, "10:00", "2000-01-01")] }) });
+    await withServer(app, async (url) => {
+      const post = (availability_id) => fetch(`${url}/api/v1/appointments`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id }),
+      });
+      assert.equal((await post(secondSlotId)).status, 404);
+      assert.equal((await post(firstSlotId)).status, 409);
+    });
+    const occupied = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }) });
+    await withServer(occupied.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: firstSlotId }),
+      });
+      assert.equal(response.status, 409);
+    });
+  });
+
+  it("lists only the caller's appointments and hides unrelated records by ID", async () => {
+    const { app } = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }) });
+    await withServer(app, async (url) => {
+      const list = await fetch(`${url}/api/v1/appointments?status=confirmed&from=2099-04-01`);
+      assert.equal(list.status, 200);
+      assert.equal((await list.json()).length, 1);
+      const inaccessible = await fetch(`${url}/api/v1/appointments/${appointmentId}`);
+      assert.equal(inaccessible.status, 200);
+    });
+    const other = createTestApp({ currentUser: otherUser, database: createDatabase({ currentUser: otherUser, appointments: [makeAppointment()] }) });
+    await withServer(other.app, async (url) => {
+      const inaccessible = await fetch(`${url}/api/v1/appointments/${appointmentId}`);
+      assert.equal(inaccessible.status, 404);
+      assert.equal((await inaccessible.json()).error.code, "APPOINTMENT_NOT_FOUND");
+    });
+    const doctor = createTestApp({ currentUser: doctorUser, database: createDatabase({ currentUser: doctorUser, appointments: [makeAppointment()] }) });
+    await withServer(doctor.app, async (url) => {
+      const list = await fetch(`${url}/api/v1/appointments`);
+      assert.equal(list.status, 200);
+      assert.equal((await list.json()).length, 1);
+    });
+  });
+
+  it("cancels without deleting history and denies doctor cancellation under the unspecified policy", async () => {
+    const { app, database } = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }) });
+    await withServer(app, async (url) => {
+      const cancelled = await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" });
+      assert.equal(cancelled.status, 200);
+      assert.equal((await cancelled.json()).status, "cancelled");
+      assert.equal(database.state.appointments.length, 1);
+      assert.ok(database.state.appointments[0].cancelled_at);
+      const again = await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" });
+      assert.equal(again.status, 409);
+    });
+    const doctor = createTestApp({ currentUser: doctorUser, database: createDatabase({ currentUser: doctorUser, appointments: [makeAppointment()] }) });
+    await withServer(doctor.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" });
+      assert.equal(response.status, 403);
+    });
+  });
+
+  it("reschedules atomically while preserving the cancelled original appointment", async () => {
+    const { app, database } = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }) });
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, {
+        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }),
+      });
+      assert.equal(response.status, 200);
+      const next = await response.json();
+      assert.equal(next.status, "confirmed");
+      assert.equal(next.availability_id, secondSlotId);
+      assert.equal(next.patient_id, patientId);
+      assert.equal(database.state.appointments.length, 2);
+      assert.equal(database.state.appointments[0].availability_id, firstSlotId);
+      assert.equal(database.state.appointments[0].status, "cancelled");
+      assert.ok(database.state.appointments[0].cancelled_at);
+    });
+    const occupiedTarget = createTestApp({ database: createDatabase({ appointments: [
+      makeAppointment(),
+      makeAppointment({ id: secondAppointmentId, availability_id: secondSlotId, reason: "Existing booking" }),
+    ] }) });
+    await withServer(occupiedTarget.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, {
+        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }),
+      });
+      assert.equal(response.status, 409);
+      assert.equal(occupiedTarget.database.state.appointments[0].status, "confirmed");
+      assert.equal(occupiedTarget.database.state.appointments.length, 2);
+    });
+  });
+
+  it("completes only for the owning doctor and rejects invalid state transitions", async () => {
+    const doctor = createTestApp({ currentUser: doctorUser, database: createDatabase({ currentUser: doctorUser, appointments: [makeAppointment()] }) });
+    await withServer(doctor.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/complete`, { method: "PUT" });
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).status, "completed");
+      const second = await fetch(`${url}/api/v1/appointments/${appointmentId}/complete`, { method: "PUT" });
+      assert.equal(second.status, 409);
+    });
+    const cancelled = createTestApp({ currentUser: doctorUser, database: createDatabase({ currentUser: doctorUser, appointments: [makeAppointment({ status: "cancelled", cancelled_at: "2099-01-01T00:00:00.000Z" })] }) });
+    await withServer(cancelled.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/complete`, { method: "PUT" });
+      assert.equal(response.status, 409);
+    });
+  });
+
+  it("serializes concurrent bookings for the same slot", async () => {
+    const { app, database } = createTestApp();
+    await withServer(app, async (url) => {
+      const book = () => fetch(`${url}/api/v1/appointments`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: firstSlotId }),
+      });
+      const responses = await Promise.all([book(), book()]);
+      assert.deepEqual(responses.map((response) => response.status).sort(), [201, 409]);
+      assert.equal(database.state.appointments.length, 1);
+    });
+  });
+
+  it("serializes a reschedule against a concurrent booking of its target slot", async () => {
+    const { app, database } = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }) });
+    await withServer(app, async (url) => {
+      const reschedule = fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, {
+        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }),
+      });
+      const book = fetch(`${url}/api/v1/appointments`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }),
+      });
+      const responses = await Promise.all([reschedule, book]);
+      const statuses = responses.map((response) => response.status);
+      assert.ok(JSON.stringify(statuses.sort()) === JSON.stringify([200, 409]) || JSON.stringify(statuses.sort()) === JSON.stringify([201, 409]));
+      assert.equal(database.state.appointments.filter((appointment) => appointment.availability_id === secondSlotId && appointment.status !== "cancelled").length, 1);
+      assert.equal(database.state.appointments.length, 2);
+    });
+  });
+});
