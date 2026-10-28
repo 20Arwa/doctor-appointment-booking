@@ -1,23 +1,223 @@
 @import "tailwindcss";
 
+
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Brand */
+  --primary: #67465F;
+  --primary-foreground: #FFFFFF;
+
+  --secondary: #F0E4ED;
+  --secondary-foreground: #67465F;
+
+  --accent: #E8C9D8;
+  --accent-foreground: #452E40;
+
+  /* Backgrounds */
+  --background: #FAF5F8;
+  --foreground: #452E40;
+
+  --card: #FFFFFF;
+  --card-foreground: #452E40;
+
+  --popover: #FFFFFF;
+  --popover-foreground: #452E40;
+
+  /* Muted elements */
+  --muted: #F2EAF0;
+  --muted-foreground: #7A6B7F;
+
+  /* Borders and focus */
+  --border: #E6DCE3;
+  --input: #E6DCE3;
+  --ring: #99758F;
+
+  /* Destructive actions */
+  --destructive: #B83D50;
+  --destructive-foreground: #FFFFFF;
+
+  /* Charts */
+  --chart-1: #67465F;
+  --chart-2: #99758F;
+  --chart-3: #C49AB5;
+  --chart-4: #47856D;
+  --chart-5: #D49A57;
+
+  /* Sidebar */
+  --sidebar: #452E40;
+  --sidebar-foreground: #FAF5F8;
+  --sidebar-primary: #C49AB5;
+  --sidebar-primary-foreground: #452E40;
+  --sidebar-accent: #67465F;
+  --sidebar-accent-foreground: #FFFFFF;
+  --sidebar-border: #654D60;
+  --sidebar-ring: #D8B4CC;
+
+  /* Appointment statuses */
+  --status-confirmed: #23734D;
+  --status-confirmed-bg: #E0F3E7;
+
+  --status-pending: #925B14;
+  --status-pending-bg: #FFF0D1;
+
+  --status-cancelled: #B42336;
+  --status-cancelled-bg: #FCE5E8;
+
+  --status-completed: #2858A6;
+  --status-completed-bg: #E3EDFF;
+
+  --status-rescheduled: #7042A0;
+  --status-rescheduled-bg: #F0E6FA;
+
+  --status-no-show: #596579;
+  --status-no-show-bg: #E8ECF2;
+
+  /* Shape */
+  --radius: 0.75rem;
 }
+
+/* Future dark mode */
+.dark {
+  /* Brand */
+  --primary: #D8B4CC;
+  --primary-foreground: #342333;
+
+  --secondary: #493447;
+  --secondary-foreground: #F4E7F0;
+
+  --accent: #523B50;
+  --accent-foreground: #F4E7F0;
+
+  /* Backgrounds */
+  --background: #201922;
+  --foreground: #F4EAF2;
+
+  --card: #2B222D;
+  --card-foreground: #F4EAF2;
+
+  --popover: #302432;
+  --popover-foreground: #F4EAF2;
+
+  /* Muted elements */
+  --muted: #382C3A;
+  --muted-foreground: #C0ADBE;
+
+  /* Borders and focus */
+  --border: #4B3B4B;
+  --input: #514052;
+  --ring: #C49AB5;
+
+  /* Destructive actions */
+  --destructive: #F28B98;
+  --destructive-foreground: #35171D;
+
+  /* Charts */
+  --chart-1: #D8B4CC;
+  --chart-2: #B991C0;
+  --chart-3: #8F729C;
+  --chart-4: #7DC5A0;
+  --chart-5: #E8B86D;
+
+  /* Sidebar */
+  --sidebar: #19131D;
+  --sidebar-foreground: #F4EAF2;
+  --sidebar-primary: #D8B4CC;
+  --sidebar-primary-foreground: #342333;
+  --sidebar-accent: #382C3A;
+  --sidebar-accent-foreground: #F4EAF2;
+  --sidebar-border: #403242;
+  --sidebar-ring: #C49AB5;
+
+  /* Appointment statuses */
+  --status-confirmed: #8BD6A9;
+  --status-confirmed-bg: #203D30;
+
+  --status-pending: #F2CA7C;
+  --status-pending-bg: #44351F;
+
+  --status-cancelled: #FF9AA6;
+  --status-cancelled-bg: #49262D;
+
+  --status-completed: #A6C5FF;
+  --status-completed-bg: #253653;
+
+  --status-rescheduled: #D0A8F5;
+  --status-rescheduled-bg: #3C2B4D;
+
+  --status-no-show: #C0CAD8;
+  --status-no-show-bg: #343D4A;
+}
+
+
+
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Sidebar */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* Appointment statuses */
+  --color-status-confirmed: var(--status-confirmed);
+  --color-status-confirmed-bg: var(--status-confirmed-bg);
+  --color-status-pending: var(--status-pending);
+  --color-status-pending-bg: var(--status-pending-bg);
+  --color-status-cancelled: var(--status-cancelled);
+  --color-status-cancelled-bg: var(--status-cancelled-bg);
+  --color-status-completed: var(--status-completed);
+  --color-status-completed-bg: var(--status-completed-bg);
+  --color-status-rescheduled: var(--status-rescheduled);
+  --color-status-rescheduled-bg: var(--status-rescheduled-bg);
+  --color-status-no-show: var(--status-no-show);
+  --color-status-no-show-bg: var(--status-no-show-bg);
+
+  /* Charts */
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* Radius scale */
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
 
 body {
   background: var(--background);
