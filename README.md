@@ -1,37 +1,85 @@
-# Schedule Project
+# Doctor Appointment Booking
 
-The project has an independently run Next.js frontend and Express.js API. Both use npm and can be started from the repository root or their own folders.
+The project consists of an independently run Next.js frontend and an Express.js API backend. Both use npm and can be started from the repository root or from their respective directories.
 
 ## Requirements
 
-- Node.js LTS and npm
+- Node.js LTS
+- npm
 
-## Install
+## Installation
+
+Install the frontend and backend dependencies:
 
 ```bash
 cd frontend
 npm install
+
 cd ../backend
 npm install
 ```
 
-## Run in development
+## Run in Development
 
-Start each process in a separate terminal, from the repository root:
+Start the frontend and backend in separate terminals from the repository root:
 
 ```bash
 npm run dev:frontend
+```
+
+```bash
 npm run dev:backend
 ```
 
-Or run `npm run dev` inside `frontend` and `npm run dev` inside `backend`. The frontend is available at [http://localhost:3000](http://localhost:3000); the API health endpoint is [http://localhost:3001/health](http://localhost:3001/health).
+Alternatively, start each application from its own directory:
 
-The API defaults to port `3001` and allows browser requests from `http://localhost:3000`. Copy `backend/.env.example` to `backend/.env` to customize `PORT` or `FRONTEND_ORIGIN`. Copy `frontend/.env.example` to `frontend/.env.local` to configure `NEXT_PUBLIC_API_URL` for frontend code that calls the API.
+```bash
+# Frontend
+cd frontend
+npm run dev
+```
 
-## Production start
+```bash
+# Backend
+cd backend
+npm run dev
+```
 
-Build the frontend with `npm --prefix frontend run build`, then start it with `npm run start:frontend`. Start the API with `npm run start:backend`. Configure `NEXT_PUBLIC_API_URL` at frontend build time and `PORT`/`FRONTEND_ORIGIN` in the backend environment as needed.
+The frontend runs at [http://localhost:3000](http://localhost:3000).
 
-## ER Diagram
+The API health endpoint is available at [http://localhost:3001/health](http://localhost:3001/health).
 
-![Schedule Project ER Diagram](docs/schedule-project-erd.png)
+### Environment Variables
+
+The API defaults to port `3001` and allows browser requests from `http://localhost:3000`.
+
+To customize the backend configuration, copy `backend/.env.example` to `backend/.env` and update the relevant values:
+
+- `PORT` — the backend port.
+- `FRONTEND_ORIGIN` — the allowed frontend origin.
+
+To configure the frontend API URL, copy `frontend/.env.example` to `frontend/.env.local` and set:
+
+- `NEXT_PUBLIC_API_URL` — the base URL used by frontend code to call the API.
+
+## Production
+
+Build the frontend:
+
+```bash
+npm --prefix frontend run build
+```
+
+Start the frontend:
+
+```bash
+npm run start:frontend
+```
+
+Start the backend API in a separate process:
+
+```bash
+npm run start:backend
+```
+
+Configure `NEXT_PUBLIC_API_URL` at frontend build time. Configure `PORT` and `FRONTEND_ORIGIN` in the backend environment as needed for your deployment environment.
