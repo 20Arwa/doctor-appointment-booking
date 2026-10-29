@@ -6,6 +6,8 @@ import { RefreshCw, Search, Stethoscope } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { getDoctors, type DirectoryDoctor } from "@/lib/profile-api";
 
+const inrFormatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
+
 export function DoctorDirectory() {
   const { getToken } = useAuth();
   const [doctors, setDoctors] = useState<DirectoryDoctor[]>([]);
@@ -103,6 +105,7 @@ export function DoctorDirectory() {
                   <div className="min-w-0">
                     <h2 className="text-lg font-semibold text-card-foreground">Dr. {name}</h2>
                     <p className="mt-1 text-sm font-medium text-primary">{doctor.specialty}</p>
+                    <p className="mt-2 text-sm font-semibold text-foreground">Consultation fee: {inrFormatter.format(doctor.consultation_fee)}</p>
                   </div>
                 </div>
                 {doctor.bio?.trim() ? <p className="mt-4 whitespace-pre-line text-sm leading-6 text-muted-foreground">{doctor.bio.trim()}</p> : null}

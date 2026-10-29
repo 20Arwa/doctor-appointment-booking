@@ -65,6 +65,33 @@ describe("profile request validation", () => {
     assert.equal(patientUpdateSchema.safeParse({ gender: "unspecified" }).success, true);
     assert.equal(doctorUpdateSchema.safeParse({ specialty: "" }).success, false);
     assert.equal(doctorUpdateSchema.safeParse({ user_id: "another-user" }).success, false);
+    assert.equal(doctorUpdateSchema.safeParse({ consultation_fee: 700 }).success, false);
+  });
+});
+
+describe("doctor consultation fee migration", () => {
+  it("adds a non-negative INR fee with a 500 default without replacing doctor or appointment data", () => {
+    const migration = fs.readFileSync(path.join(__dirname, "..", "migrations", "006_doctor_consultation_fee.sql"), "utf8");
+    assert.match(migration, /ALTER TABLE doctors\s+ADD COLUMN consultation_fee NUMERIC\(10, 2\) NOT NULL DEFAULT 500\.00/i);
+    assert.match(migration, /CHECK \(consultation_fee >= 0\)/i);
+    assert.match(migration, /UPDATE doctors\s+SET consultation_fee = 500\.00/i);
+    assert.doesNotMatch(migration, /DROP\s+TABLE|TRUNCATE|CREATE\s+TABLE/i);
+  });
+
+  it("includes the consultation fee in the public doctor directory response", async () => {
+    let queriedSql = "";
+    const app = testApp({ databaseQuery: async (sql) => {
+      queriedSql = sql;
+      return { rows: [{ id: "33333333-3333-4333-8333-333333333333", first_name: "Sam", last_name: "Doctor", specialty: "Cardiology", bio: null, consultation_fee: 500 }] };
+    } });
+
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/doctors`);
+      const body = await response.json();
+      assert.equal(response.status, 200);
+      assert.equal(body[0].consultation_fee, 500);
+      assert.match(queriedSql, /consultation_fee::float8 AS consultation_fee/i);
+    });
   });
 });
 
@@ -165,7 +192,7 @@ describe("profile authorization", () => {
         if (sql.startsWith("INSERT INTO users")) {
           return { rows: [{ ...sampleUser, role: values[5] }] };
         }
-        if (sql.startsWith("INSERT INTO doctors")) return { rows: [{ id: "33333333-3333-4333-8333-333333333333", specialty: values[1] }] };
+        if (sql.startsWith("INSERT INTO doctors")) return { rows: [{ id: "33333333-3333-4333-8333-333333333333", specialty: values[1], consultation_fee: 500 }] };
         if (sql.startsWith("INSERT INTO patients")) return { rows: [{ id: "44444444-4444-4444-8444-444444444444" }] };
         return { rows: [] };
       },
@@ -185,6 +212,7 @@ describe("profile authorization", () => {
       const body = await response.json();
       assert.equal(body.role, "doctor");
       assert.equal(body.profile.specialty, "Cardiology");
+      assert.equal(body.profile.consultation_fee, 500);
       assert.equal(statements[0], "BEGIN");
       assert.ok(statements.some((sql) => sql.startsWith("INSERT INTO doctors")));
       assert.equal(statements.at(-1), "COMMIT");
