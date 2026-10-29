@@ -22,8 +22,38 @@ function appointmentMessage(action, appointment) {
   return `Your appointment with ${doctor} has been rescheduled from ${previous} to ${current}.`;
 }
 
+function reminderMessage(reminderType, appointment) {
+  const doctor = `Dr. ${[appointment.doctor_first_name, appointment.doctor_last_name].filter(Boolean).join(" ")}`;
+  const current = `${appointment.date} at ${formatTime(appointment.start_time)}`;
+  const lead = reminderType === "24h" ? "24 hours" : "1 hour";
+  return `Reminder: your appointment with ${doctor} is in ${lead}, on ${current}.`;
+}
+
 function createEmailNotificationService({ config, fetchImpl = globalThis.fetch, logger = console }) {
   return {
+    async sendAppointmentReminder(reminderType, appointment) {
+      const apiKey = configuredValue(config.BREVO_API_KEY);
+      const senderEmail = configuredValue(config.BREVO_SENDER_EMAIL);
+      const senderName = configuredValue(config.BREVO_SENDER_NAME);
+      if (!apiKey || !senderEmail || !senderName || !appointment.patient_email) return { sent: false, skipped: true };
+      try {
+        const response = await fetchImpl(BREVO_EMAILS_URL, {
+          method: "POST",
+          headers: { "api-key": apiKey, "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({
+            sender: { email: senderEmail, name: senderName },
+            to: [{ email: appointment.patient_email }],
+            subject: "Appointment reminder",
+            textContent: reminderMessage(reminderType, appointment),
+          }),
+        });
+        if (!response.ok) throw new Error(`Brevo returned HTTP ${response.status}`);
+        return { sent: true };
+      } catch (error) {
+        logger.error("Appointment reminder email delivery failed", { message: error.message });
+        return { sent: false, error: true };
+      }
+    },
     async sendAppointmentNotification(action, appointment) {
       const apiKey = configuredValue(config.BREVO_API_KEY);
       const senderEmail = configuredValue(config.BREVO_SENDER_EMAIL);
