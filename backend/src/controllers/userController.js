@@ -12,7 +12,7 @@ async function getMe(_request, response, next) {
     const user = response.locals.user;
     const table = user.role === "doctor" ? "doctors" : "patients";
     const profileColumns = user.role === "doctor"
-      ? "id, specialty, bio, created_at, updated_at"
+      ? "id, specialty, bio, consultation_fee::float8 AS consultation_fee, created_at, updated_at"
       : "id, date_of_birth, gender, created_at, updated_at";
     const profile = await response.locals.database.query(`SELECT ${profileColumns} FROM ${table} WHERE user_id = $1`, [user.id]);
     return response.json({ ...user, profile: profile.rows[0] || null });
@@ -47,7 +47,7 @@ async function createMe(_request, response, next) {
     const user = created.rows[0];
     let profile;
     if (body.role === "doctor") {
-      profile = (await client.query("INSERT INTO doctors (user_id, specialty) VALUES ($1, $2) RETURNING id, specialty, bio, created_at, updated_at", [user.id, body.specialty])).rows[0];
+      profile = (await client.query("INSERT INTO doctors (user_id, specialty) VALUES ($1, $2) RETURNING id, specialty, bio, consultation_fee::float8 AS consultation_fee, created_at, updated_at", [user.id, body.specialty])).rows[0];
     } else {
       profile = (await client.query("INSERT INTO patients (user_id) VALUES ($1) RETURNING id, date_of_birth, gender, created_at, updated_at", [user.id])).rows[0];
     }

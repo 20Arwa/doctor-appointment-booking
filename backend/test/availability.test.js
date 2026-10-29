@@ -182,8 +182,10 @@ describe("availability validation", () => {
   it("confirms the new migration follows Phase 1", () => {
     const migrationFiles = fs.readdirSync(path.join(__dirname, "..", "migrations")).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(migrationFiles.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(migrationFiles.length, 4);
+    assert.equal(migrationFiles.length, 6);
     assert.match(migrationFiles[3], /^004_.*\.sql$/);
+    assert.equal(migrationFiles[4], "005_appointment_schedule_snapshot.sql");
+    assert.equal(migrationFiles[5], "006_doctor_consultation_fee.sql");
     const sql = fs.readFileSync(path.join(__dirname, "..", "migrations", "002_doctor_availability.sql"), "utf8");
     assert.match(sql, /CREATE TABLE availability/i);
     assert.match(sql, /doctor_id UUID NOT NULL REFERENCES doctors\(id\) ON DELETE RESTRICT/i);

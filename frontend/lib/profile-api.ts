@@ -12,6 +12,7 @@ const localProfileSchema = z.object({
     id: z.string().uuid(),
     specialty: z.string().optional(),
     bio: z.string().nullable().optional(),
+    consultation_fee: z.number().optional(),
     date_of_birth: z.string().nullable().optional(),
     gender: z.string().nullable().optional(),
   }),
@@ -23,6 +24,7 @@ const doctorSchema = z.object({
   last_name: z.string(),
   specialty: z.string(),
   bio: z.string().nullable(),
+  consultation_fee: z.number(),
 });
 
 const appointmentSchema = z.object({

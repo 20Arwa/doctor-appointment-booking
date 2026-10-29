@@ -5,11 +5,22 @@ import { ArrowLeft, CalendarClock, CheckCircle2, RefreshCw, Stethoscope } from "
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { createAppointment, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
 const BOOKING_WINDOW_DAYS = 30;
+const inrFormatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
 
 function dateInApplicationZone(date: Date) {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -67,6 +78,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   const [retryKey, setRetryKey] = useState(0);
   const [booking, setBooking] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
+  const [bookingDialogOpen, setBookingDialogOpen] = useState(false);
   const [confirmation, setConfirmation] = useState<PatientAppointment | null>(null);
   const submissionInProgress = useRef(false);
 
@@ -75,6 +87,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   if (previousRouteKey !== routeKey) {
     setPreviousRouteKey(routeKey);
     setConfirmation(null);
+    setBookingDialogOpen(false);
     setSelectedSlotId("");
     setBookingError(null);
     setReason("");
@@ -111,6 +124,13 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
 
   async function handleBooking(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!selectedSlotId || !slots.some((slot) => slot.id === selectedSlotId) || submissionInProgress.current) return;
+
+    setBookingError(null);
+    setBookingDialogOpen(true);
+  }
+
+  async function confirmBooking() {
     if (!selectedSlotId || submissionInProgress.current) return;
 
     submissionInProgress.current = true;
@@ -121,6 +141,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
       const created = await createAppointment(token, selectedSlotId, reason.trim() || undefined);
       setConfirmation(created);
+      setBookingDialogOpen(false);
       setSelectedSlotId("");
       setSlots((current) => current.filter((slot) => slot.id !== created.availability_id));
       setBookingError(null);
@@ -141,6 +162,8 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
       setBooking(false);
     }
   }
+
+  const selectedSlot = slots.find((slot) => slot.id === selectedSlotId) ?? null;
 
   function retryLoading() {
     setLoading(true);
@@ -177,6 +200,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
                 <p className="text-sm font-semibold uppercase tracking-[0.14em] text-primary">Doctor profile</p>
                 <h1 className="mt-1 text-2xl font-semibold tracking-tight text-card-foreground sm:text-3xl">Dr. {doctor.first_name} {doctor.last_name}</h1>
                 <p className="mt-2 font-medium text-primary">{doctor.specialty}</p>
+                <p className="mt-2 font-semibold text-foreground">Consultation fee: {inrFormatter.format(doctor.consultation_fee)}</p>
               </div>
             </div>
             {doctor.bio?.trim() ? <p className="mt-6 whitespace-pre-line leading-7 text-muted-foreground">{doctor.bio.trim()}</p> : <p className="mt-6 text-sm text-muted-foreground">No biography is available.</p>}
@@ -232,11 +256,49 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
                 ) : null}
 
                 <Button type="submit" size="lg" disabled={!selectedSlotId || booking}>
-                  {booking ? "Booking…" : "Confirm appointment"}
+                  Confirm appointment
                 </Button>
               </form>
             )}
           </section>
+
+          <AlertDialog open={bookingDialogOpen} onOpenChange={(open) => {
+            if (!booking) setBookingDialogOpen(open);
+          }}>
+            <AlertDialogContent className="max-w-md rounded-2xl border border-border bg-card p-6 text-card-foreground shadow-xl ring-0 sm:max-w-md">
+              <AlertDialogHeader>
+                <AlertDialogTitle>Confirm appointment?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  Review your appointment details before confirming.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              {selectedSlot ? (
+                <dl className="space-y-3 rounded-xl bg-muted p-4 text-sm">
+                  <div>
+                    <dt className="text-muted-foreground">Doctor</dt>
+                    <dd className="mt-1 font-medium text-foreground">Dr. {doctor.first_name} {doctor.last_name}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Appointment time</dt>
+                    <dd className="mt-1 font-medium text-foreground">{formatSlotDate(selectedSlot.date)} at {formatSlotTime(selectedSlot.start_time)} IST</dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Consultation fee</dt>
+                    <dd className="mt-1 font-semibold text-foreground">{inrFormatter.format(doctor.consultation_fee)}</dd>
+                  </div>
+                </dl>
+              ) : null}
+              <p className="text-sm text-muted-foreground">Online payment is not enabled yet. No payment will be collected online.</p>
+              {bookingError ? <p className="text-sm text-destructive" role="alert">{bookingError}</p> : null}
+              <AlertDialogFooter className="m-0 flex-row justify-end gap-3 border-0 bg-transparent p-0">
+                <AlertDialogCancel disabled={booking}>Go back</AlertDialogCancel>
+                <AlertDialogAction disabled={!selectedSlot || booking} onClick={(event) => {
+                  event.preventDefault();
+                  void confirmBooking();
+                }}>{booking ? "Booking…" : "Confirm booking"}</AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </>
       ) : null}
     </div>

@@ -201,6 +201,11 @@ export function ProfilePage() {
             </div>
             <div className="grid gap-5 sm:grid-cols-2">
               {textField("specialty", "Specialty")}
+              <div>
+                <p className="text-sm font-medium text-foreground">Consultation fee</p>
+                <p className="mt-2 min-h-11 rounded-lg border border-border bg-muted px-3 py-2 text-foreground" aria-label="Consultation fee">{new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(profile.profile.consultation_fee ?? 500)}</p>
+                <p className="mt-1.5 text-sm text-muted-foreground">Your standard consultation fee.</p>
+              </div>
               {textArea("bio", "About you", "Share a short professional introduction. This may appear in the doctor directory.")}
             </div>
           </section>
