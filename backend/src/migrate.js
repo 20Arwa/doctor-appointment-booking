@@ -4,7 +4,19 @@ const pool = require("./config/database");
 
 async function migrate() {
   const directory = path.join(__dirname, "..", "migrations");
-  const files = (await fs.readdir(directory)).filter((file) => file.endsWith(".sql")).sort();
+  // const files = (await fs.readdir(directory)).filter((file) => file.endsWith(".sql")).sort();
+  const allFiles = (await fs.readdir(directory))
+    .filter((file) => file.endsWith(".sql"))
+    .sort();
+
+  const requestedFile = process.argv[2];
+
+  if (requestedFile && !allFiles.includes(requestedFile)) {
+    throw new Error(`Migration file not found: ${requestedFile}`);
+  }
+
+  const files = requestedFile ? [requestedFile] : allFiles;
+
   const client = await pool.connect();
   try {
     await client.query("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");

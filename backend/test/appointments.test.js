@@ -45,9 +45,9 @@ function createDatabase({
     if (!slot) return undefined;
     return {
       ...appointment,
-      date: slot.date,
-      start_time: `${slot.start_time}:00`,
-      end_time: `${slot.end_time}:00`,
+      date: appointment.scheduled_date ?? slot.date,
+      start_time: `${appointment.scheduled_start_time ?? slot.start_time}:00`,
+      end_time: `${appointment.scheduled_end_time ?? slot.end_time}:00`,
       doctor_id: doctorId,
       doctor_first_name: doctorUser.first_name,
       doctor_last_name: doctorUser.last_name,
@@ -96,6 +96,12 @@ function createDatabase({
           if (sql === "SELECT id FROM patients WHERE user_id = $1") {
             return { rows: values[0] === patientUserId ? [{ id: patientId }] : [] };
           }
+          if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
+          if (sql.startsWith("SELECT id FROM availability")) {
+            const [ownerDoctorId, date, start, end] = values;
+            const slot = state.slots.find((item) => item.doctor_id === ownerDoctorId && item.date === date && item.start_time === start && item.end_time === end);
+            return { rows: slot ? [{ id: slot.id }] : [] };
+          }
           if (sql.includes("FROM availability av") && sql.includes("FOR UPDATE OF av")) {
             const [slotId] = values;
             const previous = lockTails.get(slotId) || Promise.resolve();
@@ -119,6 +125,29 @@ function createDatabase({
               return row.id === id && slot?.doctor_id === ownerDoctorId;
             });
             return { rows: appointment ? [{ id: appointment.id, status: appointment.status }] : [] };
+          }
+          if (sql.includes("FROM appointments a JOIN availability av") && sql.includes("FOR UPDATE OF a")) {
+            const [id, ownerDoctorId] = values;
+            const appointment = txAppointments.find((row) => row.id === id && state.slots.find((slot) => slot.id === row.availability_id)?.doctor_id === ownerDoctorId);
+            return { rows: appointment ? [{ ...appointment, date: appointment.scheduled_date ?? state.slots.find((slot) => slot.id === appointment.availability_id).date, start_time: appointment.scheduled_start_time ?? "10:00", end_time: appointment.scheduled_end_time ?? "10:30" }] : [] };
+          }
+          if (sql.includes("SELECT 1 FROM appointments other")) {
+            const [ownerDoctorId, date, start, end] = values;
+            const conflict = [...state.appointments, ...txAppointments].some((row) => {
+              if (row.id === values[1] || row.status !== "confirmed") return false;
+              const slot = state.slots.find((item) => item.id === row.availability_id);
+              const rowDate = row.scheduled_date ?? slot?.date;
+              const rowStart = row.scheduled_start_time ?? slot?.start_time;
+              const rowEnd = row.scheduled_end_time ?? slot?.end_time;
+              return slot?.doctor_id === ownerDoctorId && rowDate === date && rowStart < end && rowEnd > start;
+            });
+            return { rows: conflict ? [{ "?column?": 1 }] : [] };
+          }
+          if (sql.startsWith("UPDATE appointments SET availability_id")) {
+            const [id, availabilityId, date, start, end] = values;
+            const appointment = txAppointments.find((row) => row.id === id);
+            if (appointment) Object.assign(appointment, { availability_id: availabilityId, scheduled_date: date, scheduled_start_time: start, scheduled_end_time: end });
+            return { rows: [{ id }] };
           }
           if (sql.startsWith("SELECT 1 FROM appointments")) {
             const [slotId] = values;
@@ -212,18 +241,23 @@ describe("appointment schemas and migration", () => {
     assert.equal(createAppointmentSchema.safeParse({ availability_id: "nope", patient_id: patientId }).success, false);
     assert.equal(rescheduleAppointmentSchema.safeParse({ availability_id: secondSlotId }).success, true);
     assert.equal(rescheduleAppointmentSchema.safeParse({ availability_id: secondSlotId, patient_id: patientId }).success, false);
+    assert.equal(rescheduleAppointmentSchema.safeParse({ date: "2099-04-11", start_time: "11:00", end_time: "11:30" }).success, true);
+    assert.equal(rescheduleAppointmentSchema.safeParse({ date: "2099-04-11", start_time: "12:00", end_time: "11:30" }).success, false);
   });
 
   it("adds the appointment migrations in order with history-preserving constraints", () => {
     const directory = path.join(__dirname, "..", "migrations");
     const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(files.length, 4);
+    assert.equal(files.length, 5);
     assert.match(files[3], /^004_.*\.sql$/);
+    assert.equal(files[4], "005_appointment_schedule_snapshot.sql");
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);
     assert.match(sql, /UNIQUE INDEX appointments_availability_active_unique\s+ON appointments \(availability_id\)\s+WHERE status <> 'cancelled'/i);
+    const snapshot = fs.readFileSync(path.join(directory, "005_appointment_schedule_snapshot.sql"), "utf8");
+    assert.match(snapshot, /DROP INDEX appointments_availability_active_unique/i);
   });
 });
 
@@ -336,6 +370,53 @@ describe("appointment workflows", () => {
       assert.equal(response.status, 409);
       assert.equal(occupiedTarget.database.state.appointments[0].status, "confirmed");
       assert.equal(occupiedTarget.database.state.appointments.length, 2);
+    });
+  });
+
+  it("lets the owning doctor move the same appointment without changing availability", async () => {
+    const slots = [makeSlot(firstSlotId)];
+    const { app, database } = createTestApp({ currentUser: doctorUser, database: createDatabase({ currentUser: doctorUser, slots, appointments: [makeAppointment()] }) });
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ date: "2099-04-11", start_time: "12:00", end_time: "12:30" }),
+      });
+      assert.equal(response.status, 200);
+      const updated = await response.json();
+      assert.equal(updated.id, appointmentId);
+      assert.equal(updated.date, "2099-04-11");
+      assert.equal(updated.start_time, "12:00:00");
+      assert.equal(database.state.appointments.length, 1);
+      assert.equal(database.state.slots[0].date, "2099-04-10");
+      assert.equal(database.state.appointments[0].availability_id, firstSlotId);
+    });
+    const patient = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }) });
+    await withServer(patient.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ date: "2099-04-11", start_time: "12:00", end_time: "12:30" }),
+      });
+      assert.equal(response.status, 403);
+    });
+  });
+
+  it("associates a direct doctor reschedule with a matching available slot and releases the old slot", async () => {
+    const newSlotId = "55555555-5555-4555-8555-555555555555";
+    const slots = [makeSlot(firstSlotId), { ...makeSlot(newSlotId, "12:00", "2099-04-11"), end_time: "12:30" }];
+    const { app, database } = createTestApp({ currentUser: doctorUser, database: createDatabase({ currentUser: doctorUser, slots, appointments: [makeAppointment()] }) });
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ date: "2099-04-11", start_time: "12:00", end_time: "12:30" }),
+      });
+      assert.equal(response.status, 200);
+      const updated = await response.json();
+      assert.equal(updated.id, appointmentId);
+      assert.equal(updated.availability_id, newSlotId);
+      assert.equal(updated.status, "confirmed");
+      assert.equal(database.state.appointments.length, 1);
+      assert.equal(database.state.appointments[0].availability_id, newSlotId);
+      assert.equal(database.state.slots[0].date, "2099-04-10");
     });
   });
 

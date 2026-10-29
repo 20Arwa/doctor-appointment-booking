@@ -3,7 +3,7 @@ const { localDateTime, slotStartsInFuture } = require("../utils/schedulingTime")
 const APPOINTMENT_DETAILS = `
   SELECT a.id, a.status, a.reason, a.cancelled_at,
          a.created_at, a.updated_at, av.id AS availability_id,
-         av.date::text AS date, av.start_time::text AS start_time, av.end_time::text AS end_time,
+         a.scheduled_date::text AS date, a.scheduled_start_time::text AS start_time, a.scheduled_end_time::text AS end_time,
          d.id AS doctor_id, du.first_name AS doctor_first_name, du.last_name AS doctor_last_name,
          d.specialty, p.id AS patient_id, pu.first_name AS patient_first_name,
          pu.last_name AS patient_last_name
@@ -83,14 +83,6 @@ async function lockBookableSlot(client, availabilityId, now) {
   return slot;
 }
 
-async function requireSlotAvailable(client, availabilityId) {
-  const result = await client.query(
-    "SELECT 1 FROM appointments WHERE availability_id = $1 AND status <> 'cancelled' LIMIT 1",
-    [availabilityId],
-  );
-  if (result.rows[0]) fail(409, "SLOT_UNAVAILABLE", "Availability slot is already booked");
-}
-
 async function readDetails(client, appointmentId) {
   const result = await client.query(`${APPOINTMENT_DETAILS} WHERE a.id = $1`, [appointmentId]);
   return result.rows[0];
@@ -133,11 +125,19 @@ async function createAppointment(database, user, timeZone, input) {
   const now = timeContext(timeZone);
   return withTransaction(database, async (client) => {
     const patientId = await requirePatientId(client, user.id);
-    await lockBookableSlot(client, input.availability_id, now);
-    await requireSlotAvailable(client, input.availability_id);
+    const slot = await lockBookableSlot(client, input.availability_id, now);
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [slot.doctor_id]);
+    const overlap = await client.query(
+      `SELECT 1 FROM appointments other JOIN availability other_av ON other_av.id = other.availability_id
+       WHERE other_av.doctor_id = $1 AND other.status = 'confirmed' AND other_av.date = $2::date
+         AND other_av.start_time < $4::time AND other_av.end_time > $3::time LIMIT 1`,
+      [slot.doctor_id, slot.date, slot.start_time, slot.end_time],
+    );
+    if (overlap.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time overlaps another confirmed appointment");
     const created = await client.query(
-      "INSERT INTO appointments (patient_id, availability_id, status, reason) VALUES ($1, $2, 'confirmed', $3) RETURNING id",
-      [patientId, input.availability_id, input.reason ?? null],
+      `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time)
+       VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time) RETURNING id`,
+      [patientId, input.availability_id, input.reason ?? null, slot.date, slot.start_time, slot.end_time],
     );
     return readDetails(client, created.rows[0].id);
   });
@@ -179,17 +179,72 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
     if (original.status !== "confirmed") fail(409, "APPOINTMENT_STATE_CONFLICT", "Only confirmed appointments can be rescheduled");
     if (original.availability_id === newAvailabilityId) fail(409, "SLOT_UNAVAILABLE", "Choose a different availability slot");
 
-    await lockBookableSlot(client, newAvailabilityId, now);
-    await requireSlotAvailable(client, newAvailabilityId);
+    const slot = await lockBookableSlot(client, newAvailabilityId, now);
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [slot.doctor_id]);
+    const conflict = await client.query(
+      `SELECT 1 FROM appointments other JOIN availability other_av ON other_av.id = other.availability_id
+       WHERE other_av.doctor_id = $1 AND other.status = 'confirmed' AND other_av.date = $2::date
+         AND other_av.start_time < $4::time AND other_av.end_time > $3::time LIMIT 1`,
+      [slot.doctor_id, slot.date, slot.start_time, slot.end_time],
+    );
+    if (conflict.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time overlaps another confirmed appointment");
     await client.query(
       "UPDATE appointments SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW() WHERE id = $1",
       [appointmentId],
     );
     const created = await client.query(
-      "INSERT INTO appointments (patient_id, availability_id, status, reason) VALUES ($1, $2, 'confirmed', $3) RETURNING id",
-      [original.patient_id, newAvailabilityId, original.reason],
+      `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time)
+       VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time) RETURNING id`,
+      [original.patient_id, newAvailabilityId, original.reason, slot.date, slot.start_time, slot.end_time],
     );
     return readDetails(client, created.rows[0].id);
+  });
+}
+
+async function doctorRescheduleAppointment(database, user, timeZone, appointmentId, input) {
+  const doctorId = await requireOwnDoctorId(database, user);
+  const now = timeContext(timeZone);
+  if (!slotStartsInFuture({ date: input.date, start_time: input.start_time }, now)) {
+    fail(409, "APPOINTMENT_TIME_NOT_FUTURE", "The new appointment time must be in the future");
+  }
+  return withTransaction(database, async (client) => {
+    const owned = await client.query(
+      `SELECT a.id, a.status, a.availability_id, a.scheduled_date::text AS date,
+              a.scheduled_start_time::text AS start_time, a.scheduled_end_time::text AS end_time
+       FROM appointments a JOIN availability av ON av.id = a.availability_id
+       WHERE a.id = $1 AND av.doctor_id = $2 FOR UPDATE OF a`,
+      [appointmentId, doctorId],
+    );
+    const original = owned.rows[0];
+    if (!original) fail(404, "APPOINTMENT_NOT_FOUND", "Appointment not found");
+    if (original.status !== "confirmed") fail(409, "APPOINTMENT_STATE_CONFLICT", "Only confirmed appointments can be rescheduled");
+    if (original.date === input.date && original.start_time.slice(0, 5) === input.start_time) {
+      fail(409, "APPOINTMENT_TIME_UNCHANGED", "Choose a different appointment date or time");
+    }
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [doctorId]);
+    const conflict = await client.query(
+      `SELECT 1 FROM appointments other
+       JOIN availability other_av ON other_av.id = other.availability_id
+       WHERE other_av.doctor_id = $1 AND other.id <> $2 AND other.status = 'confirmed'
+         AND other.scheduled_date = $3::date
+         AND other.scheduled_start_time < $5::time
+         AND other.scheduled_end_time > $4::time LIMIT 1`,
+      [doctorId, appointmentId, input.date, input.start_time, input.end_time],
+    );
+    if (conflict.rows[0]) fail(409, "DOCTOR_TIME_CONFLICT", "The selected time overlaps another confirmed appointment");
+    const targetSlot = await client.query(
+      `SELECT id FROM availability
+       WHERE doctor_id = $1 AND date = $2::date AND start_time = $3::time AND end_time = $4::time`,
+      [doctorId, input.date, input.start_time, input.end_time],
+    );
+    const availabilityId = targetSlot.rows[0]?.id ?? original.availability_id;
+    const updated = await client.query(
+      `UPDATE appointments SET availability_id = $2, scheduled_date = $3::date,
+       scheduled_start_time = $4::time, scheduled_end_time = $5::time,
+       updated_at = NOW() WHERE id = $1 RETURNING id`,
+      [appointmentId, availabilityId, input.date, input.start_time, input.end_time],
+    );
+    return readDetails(client, updated.rows[0].id);
   });
 }
 
@@ -216,6 +271,7 @@ module.exports = {
   cancelAppointment,
   completeAppointment,
   createAppointment,
+  doctorRescheduleAppointment,
   getAppointment,
   listAppointments,
   rescheduleAppointment,

@@ -1,10 +1,10 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
-import { CalendarClock, CheckCircle2, RefreshCw } from "lucide-react";
+import { CalendarClock, CheckCircle2, RefreshCw, CalendarPlus } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { completeDoctorAppointment, getAppointments, ProfileApiError, type PatientAppointment } from "@/lib/profile-api";
+import { completeDoctorAppointment, doctorRescheduleAppointment, getAppointments, ProfileApiError, type PatientAppointment } from "@/lib/profile-api";
 import { notifyError, notifySuccess } from "@/lib/notifications";
 
 function appointmentInstant(appointment: Pick<PatientAppointment, "date" | "start_time">) {
@@ -39,6 +39,10 @@ export function DoctorAppointmentsPage() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [activeAppointment, setActiveAppointment] = useState<string | null>(null);
   const mutationLock = useRef(false);
+  const [rescheduleId, setRescheduleId] = useState<string | null>(null);
+  const [newDate, setNewDate] = useState("");
+  const [newTime, setNewTime] = useState("");
+  const [rescheduleError, setRescheduleError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -105,6 +109,35 @@ export function DoctorAppointmentsPage() {
     }
   }
 
+  async function reschedule(appointment: PatientAppointment) {
+    if (!newDate || !newTime || mutationLock.current) return;
+    setRescheduleError(null);
+    mutationLock.current = true;
+    setActiveAppointment(appointment.id);
+    const [sh, sm] = appointment.start_time.split(":").map(Number);
+    const [eh, em] = appointment.end_time.split(":").map(Number);
+    const duration = eh * 60 + em - (sh * 60 + sm);
+    const start = newTime.split(":").map(Number);
+    const endMinutes = start[0] * 60 + start[1] + duration;
+    const endTime = `${String(Math.floor(endMinutes / 60) % 24).padStart(2, "0")}:${String(endMinutes % 60).padStart(2, "0")}`;
+    try {
+      const token = await getToken();
+      if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+      const updated = await doctorRescheduleAppointment(token, appointment.id, { date: newDate, start_time: newTime, end_time: endTime });
+      setAppointments((current) => current.map((item) => item.id === appointment.id ? updated : item));
+      setRescheduleId(null);
+      setNewDate(""); setNewTime("");
+      setRescheduleError(null);
+      notifySuccess("Appointment rescheduled.", `doctor-reschedule-${appointment.id}`);
+    } catch (cause) {
+      if (cause instanceof ProfileApiError && cause.status === 409) {
+        setRescheduleError(cause.message);
+      } else {
+        setRescheduleError(cause instanceof Error ? cause.message : "We couldn't reschedule this appointment.");
+      }
+    } finally { setActiveAppointment(null); mutationLock.current = false; }
+  }
+
   return (
     <div className="mx-auto max-w-5xl space-y-8">
       <header>
@@ -123,21 +156,26 @@ export function DoctorAppointmentsPage() {
 
       {!loading && !error ? (
         <>
-          <AppointmentGroup title="Scheduled appointments" empty="You have no scheduled appointments." appointments={scheduled} onComplete={markComplete} activeAppointment={activeAppointment} />
-          <AppointmentGroup title="Past appointments" empty="Your past appointments will appear here." appointments={past} onComplete={markComplete} activeAppointment={activeAppointment} />
-          <AppointmentGroup title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} onComplete={markComplete} activeAppointment={activeAppointment} />
+          <AppointmentGroup title="Scheduled appointments" empty="You have no scheduled appointments." appointments={scheduled} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
+          <AppointmentGroup title="Past appointments" empty="Your past appointments will appear here." appointments={past} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
+          <AppointmentGroup title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
         </>
       ) : null}
     </div>
   );
 }
 
-function AppointmentGroup({ title, empty, appointments, onComplete, activeAppointment }: {
+function AppointmentGroup({ title, empty, appointments, onComplete, activeAppointment, rescheduleId, newDate, newTime, rescheduleError, setRescheduleId, setNewDate, setNewTime, setRescheduleError, onReschedule }: {
   title: string;
   empty: string;
   appointments: PatientAppointment[];
   onComplete: (appointment: PatientAppointment) => void;
   activeAppointment: string | null;
+  rescheduleId: string | null; newDate: string; newTime: string;
+  rescheduleError: string | null;
+  setRescheduleId: (id: string | null) => void; setNewDate: (value: string) => void; setNewTime: (value: string) => void;
+  setRescheduleError: (value: string | null) => void;
+  onReschedule: (appointment: PatientAppointment) => void;
 }) {
   return (
     <section aria-label={title}>
@@ -158,14 +196,76 @@ function AppointmentGroup({ title, empty, appointments, onComplete, activeAppoin
                 </div>
                 <span className={`inline-flex w-fit rounded-full px-3 py-1 text-xs font-semibold capitalize ${statusClasses(appointment.status)}`}>{appointment.status}</span>
               </div>
-              {appointment.status === "confirmed" ? (
-                <div className="mt-5 border-t border-border pt-4">
-                  <Button type="button" size="sm" disabled={activeAppointment !== null} onClick={() => onComplete(appointment)}>
+            {appointment.status === "confirmed" ? (
+              <div className="mt-5 border-t border-border pt-4">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={activeAppointment !== null}
+                    onClick={() =>
+                      setRescheduleId(
+                        rescheduleId === appointment.id ? null : appointment.id,
+                      )
+                    }
+                  >
+                    <CalendarPlus aria-hidden="true" className="size-4" />
+                    Reschedule
+                  </Button>
+
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={activeAppointment !== null}
+                    onClick={() => onComplete(appointment)}
+                  >
                     <CheckCircle2 aria-hidden="true" className="size-4" />
-                    {activeAppointment === appointment.id ? "Updating…" : "Mark as completed"}
+                    {activeAppointment === appointment.id
+                      ? "Updating…"
+                      : "Mark as completed"}
                   </Button>
                 </div>
-              ) : null}
+
+                {rescheduleId === appointment.id ? (
+                  <div className="mt-3 flex flex-wrap items-end gap-3">
+                    <label className="grid gap-1 text-sm text-muted-foreground">
+                      New date
+                      <input
+                        aria-label="New appointment date"
+                        type="date"
+                        value={newDate}
+                        onChange={(event) => { setNewDate(event.target.value); setRescheduleError(null); }}
+                        className="rounded-md border border-border bg-background px-3 py-2 text-foreground"
+                      />
+                    </label>
+
+                    <label className="grid gap-1 text-sm text-muted-foreground">
+                      New time
+                      <input
+                        aria-label="New appointment time"
+                        type="time"
+                        value={newTime}
+                        onChange={(event) => { setNewTime(event.target.value); setRescheduleError(null); }}
+                        className="rounded-md border border-border bg-background px-3 py-2 text-foreground"
+                      />
+                    </label>
+
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={!newDate || !newTime || activeAppointment !== null}
+                      onClick={() => onReschedule(appointment)}
+                    >
+                      {activeAppointment === appointment.id
+                        ? "Updating…"
+                        : "Save new time"}
+                    </Button>
+                    {rescheduleError ? <p className="w-full text-sm text-destructive" role="alert">{rescheduleError}</p> : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             </li>
           ))}
         </ul>
