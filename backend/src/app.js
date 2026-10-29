@@ -10,8 +10,10 @@ const appointmentRoutes = require("./routes/appointmentRoutes");
 const { getClerkProfile } = require("./middleware/auth");
 const env = require("./config/env");
 const { createEmailNotificationService } = require("./services/emailNotificationService");
+const { createAppointmentReminderService } = require("./services/appointmentReminderService");
+const reminderRoutes = require("./routes/reminderRoutes");
 
-function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
+function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), reminderService, reminderSecret = env.REMINDER_CRON_SECRET, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("A PostgreSQL database pool is required");
   }
@@ -29,6 +31,10 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     next();
   });
   app.use("/api/v1", healthRoutes);
+  app.use("/api/v1/internal/reminders", reminderRoutes({
+    service: reminderService || createAppointmentReminderService({ database, emailNotificationService, timeZone: applicationTimezone || "Asia/Kolkata" }),
+    secret: reminderSecret,
+  }));
   app.use("/api/v1/users", userRoutes);
   app.use("/api/v1/patients", patientRoutes);
   app.use("/api/v1/doctors", doctorRoutes);

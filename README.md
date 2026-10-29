@@ -83,3 +83,9 @@ npm run start:backend
 ```
 
 Configure `NEXT_PUBLIC_API_URL` at frontend build time. Configure `PORT` and `FRONTEND_ORIGIN` in the backend environment as needed for your deployment environment.
+
+### Appointment email reminders
+
+The backend exposes `POST /api/v1/internal/reminders/run` for an external scheduler. Configure a Render Cron Job to POST to `https://<backend-service-host>/api/v1/internal/reminders/run` every five minutes, with the header `Authorization: Bearer <REMINDER_CRON_SECRET>`. Generate a random secret of at least 32 characters and set the same value as `REMINDER_CRON_SECRET` on the API service and Cron Job. The endpoint returns a count summary and is protected with a constant-time bearer-token comparison.
+
+Apply backend migrations with `npm --prefix backend run migrate` before enabling the Cron Job. `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, and `BREVO_SENDER_NAME` use the existing Brevo configuration. When any of these values or a patient email is missing, the scheduler skips delivery and retries on a later run. Reminders are sent 24 hours and 1 hour before the appointment, using `APPLICATION_TIMEZONE` (configured as `Asia/Kolkata` for this application). PostgreSQL stores unique delivery keys and processing leases so scheduler retries and multiple instances do not issue duplicate reminder sends.

@@ -20,6 +20,7 @@ const envSchema = z.object({
   BREVO_API_KEY: z.string().optional(),
   BREVO_SENDER_EMAIL: z.string().optional(),
   BREVO_SENDER_NAME: z.string().optional(),
+  REMINDER_CRON_SECRET: z.string().min(32).optional(),
   APPLICATION_TIMEZONE: z.preprocess(
     (value) => value === "" ? undefined : value,
     z.string().min(1).refine(isValidTimeZone, "APPLICATION_TIMEZONE must be a valid IANA timezone").optional(),
