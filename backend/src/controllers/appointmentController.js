@@ -1,5 +1,13 @@
 const appointmentService = require("../services/appointmentService");
 
+async function notify(response, action, appointment) {
+  try {
+    await response.locals.emailNotificationService.sendAppointmentNotification(action, appointment);
+  } catch (error) {
+    console.error(`Appointment ${action} email notification failed`, { message: error.message });
+  }
+}
+
 function handle(operation) {
   return async (request, response, next) => {
     try {
@@ -19,15 +27,16 @@ const listAppointments = handle(async (_request, response) => ({
   body: await appointmentService.listAppointments(response.locals.database, response.locals.user, response.locals.query),
 }));
 
-const createAppointment = handle(async (_request, response) => ({
-  status: 201,
-  body: await appointmentService.createAppointment(
+const createAppointment = handle(async (_request, response) => {
+  const appointment = await appointmentService.createAppointment(
     response.locals.database,
     response.locals.user,
     response.locals.applicationTimezone,
     response.locals.body,
-  ),
-}));
+  );
+  await notify(response, "booked", appointment);
+  return { status: 201, body: appointment };
+});
 
 const getAppointment = handle(async (_request, response) => ({
   body: await appointmentService.getAppointment(
@@ -37,16 +46,18 @@ const getAppointment = handle(async (_request, response) => ({
   ),
 }));
 
-const cancelAppointment = handle(async (_request, response) => ({
-  body: await appointmentService.cancelAppointment(
+const cancelAppointment = handle(async (_request, response) => {
+  const appointment = await appointmentService.cancelAppointment(
     response.locals.database,
     response.locals.user,
     response.locals.params.id,
-  ),
-}));
+  );
+  await notify(response, "cancelled", appointment);
+  return { body: appointment };
+});
 
-const rescheduleAppointment = handle(async (_request, response) => ({
-  body: await (response.locals.user.role === "doctor" || !response.locals.body.availability_id
+const rescheduleAppointment = handle(async (_request, response) => {
+  const appointment = await (response.locals.user.role === "doctor" || !response.locals.body.availability_id
     ? appointmentService.doctorRescheduleAppointment(
       response.locals.database,
       response.locals.user,
@@ -60,8 +71,11 @@ const rescheduleAppointment = handle(async (_request, response) => ({
     response.locals.applicationTimezone,
     response.locals.params.id,
     response.locals.body.availability_id,
-    )),
-}));
+    ));
+  await notify(response, "rescheduled", appointment);
+  const { previous_date: _previousDate, previous_start_time: _previousStartTime, ...body } = appointment;
+  return { body };
+});
 
 const completeAppointment = handle(async (_request, response) => ({
   body: await appointmentService.completeAppointment(
