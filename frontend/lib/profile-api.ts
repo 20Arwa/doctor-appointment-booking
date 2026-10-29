@@ -207,6 +207,15 @@ export async function rescheduleAppointment(token: string, appointmentId: string
   return parsed.data;
 }
 
+export async function doctorRescheduleAppointment(token: string, appointmentId: string, schedule: { date: string; start_time: string; end_time: string }): Promise<PatientAppointment> {
+  const payload = await request<unknown>(token, `/appointments/${encodeURIComponent(appointmentId)}/reschedule`, {
+    method: "PUT", body: JSON.stringify(schedule),
+  });
+  const parsed = appointmentSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete rescheduling response.");
+  return parsed.data;
+}
+
 export async function completeDoctorAppointment(token: string, appointmentId: string): Promise<PatientAppointment> {
   const payload = await request<unknown>(token, `/appointments/${encodeURIComponent(appointmentId)}/complete`, { method: "PUT" });
   const parsed = appointmentSchema.safeParse(payload);

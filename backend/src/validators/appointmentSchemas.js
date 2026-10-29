@@ -14,7 +14,11 @@ const createAppointmentSchema = z.object({
   availability_id: z.uuid(),
   reason: z.string().trim().max(2000).nullable().optional(),
 }).strict();
-const rescheduleAppointmentSchema = z.object({ availability_id: z.uuid() }).strict();
+const rescheduleAppointmentSchema = z.union([
+  z.object({ availability_id: z.uuid() }).strict(),
+  z.object({ date: z.iso.date(), start_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Use HH:MM"), end_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Use HH:MM") }).strict()
+    .refine((value) => value.end_time > value.start_time, { path: ["end_time"], message: "End time must be after start time" }),
+]);
 
 module.exports = {
   appointmentIdParamsSchema,

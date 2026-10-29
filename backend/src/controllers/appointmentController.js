@@ -46,13 +46,21 @@ const cancelAppointment = handle(async (_request, response) => ({
 }));
 
 const rescheduleAppointment = handle(async (_request, response) => ({
-  body: await appointmentService.rescheduleAppointment(
+  body: await (response.locals.user.role === "doctor" || !response.locals.body.availability_id
+    ? appointmentService.doctorRescheduleAppointment(
+      response.locals.database,
+      response.locals.user,
+      response.locals.applicationTimezone,
+      response.locals.params.id,
+      response.locals.body,
+    )
+    : appointmentService.rescheduleAppointment(
     response.locals.database,
     response.locals.user,
     response.locals.applicationTimezone,
     response.locals.params.id,
     response.locals.body.availability_id,
-  ),
+    )),
 }));
 
 const completeAppointment = handle(async (_request, response) => ({
