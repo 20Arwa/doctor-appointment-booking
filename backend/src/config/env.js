@@ -17,6 +17,9 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(3001),
   FRONTEND_ORIGIN: z.string().url().default("http://localhost:3000"),
   CLERK_SECRET_KEY: z.string().min(1),
+  BREVO_API_KEY: z.string().optional(),
+  BREVO_SENDER_EMAIL: z.string().optional(),
+  BREVO_SENDER_NAME: z.string().optional(),
   APPLICATION_TIMEZONE: z.preprocess(
     (value) => value === "" ? undefined : value,
     z.string().min(1).refine(isValidTimeZone, "APPLICATION_TIMEZONE must be a valid IANA timezone").optional(),

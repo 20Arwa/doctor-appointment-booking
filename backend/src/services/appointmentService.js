@@ -6,7 +6,7 @@ const APPOINTMENT_DETAILS = `
          a.scheduled_date::text AS date, a.scheduled_start_time::text AS start_time, a.scheduled_end_time::text AS end_time,
          d.id AS doctor_id, du.first_name AS doctor_first_name, du.last_name AS doctor_last_name,
          d.specialty, p.id AS patient_id, pu.first_name AS patient_first_name,
-         pu.last_name AS patient_last_name
+         pu.last_name AS patient_last_name, pu.email AS patient_email
   FROM appointments a
   JOIN availability av ON av.id = a.availability_id
   JOIN doctors d ON d.id = av.doctor_id
@@ -178,6 +178,7 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
     if (!original) fail(404, "APPOINTMENT_NOT_FOUND", "Appointment not found");
     if (original.status !== "confirmed") fail(409, "APPOINTMENT_STATE_CONFLICT", "Only confirmed appointments can be rescheduled");
     if (original.availability_id === newAvailabilityId) fail(409, "SLOT_UNAVAILABLE", "Choose a different availability slot");
+    const previousAppointment = await readDetails(client, appointmentId);
 
     const slot = await lockBookableSlot(client, newAvailabilityId, now);
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [slot.doctor_id]);
@@ -197,7 +198,8 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
        VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time) RETURNING id`,
       [original.patient_id, newAvailabilityId, original.reason, slot.date, slot.start_time, slot.end_time],
     );
-    return readDetails(client, created.rows[0].id);
+    const appointment = await readDetails(client, created.rows[0].id);
+    return { ...appointment, previous_date: previousAppointment.date, previous_start_time: previousAppointment.start_time };
   });
 }
 
@@ -244,7 +246,8 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
        updated_at = NOW() WHERE id = $1 RETURNING id`,
       [appointmentId, availabilityId, input.date, input.start_time, input.end_time],
     );
-    return readDetails(client, updated.rows[0].id);
+    const appointment = await readDetails(client, updated.rows[0].id);
+    return { ...appointment, previous_date: original.date, previous_start_time: original.start_time };
   });
 }
 

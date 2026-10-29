@@ -8,8 +8,10 @@ const patientRoutes = require("./routes/patientRoutes");
 const doctorRoutes = require("./routes/doctorRoutes");
 const appointmentRoutes = require("./routes/appointmentRoutes");
 const { getClerkProfile } = require("./middleware/auth");
+const env = require("./config/env");
+const { createEmailNotificationService } = require("./services/emailNotificationService");
 
-function createApp({ database, frontendOrigin, applicationTimezone, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
+function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("A PostgreSQL database pool is required");
   }
@@ -23,6 +25,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, clerkAuthMid
     response.locals.database = database;
     response.locals.clerkProfileResolver = clerkProfileResolver;
     response.locals.applicationTimezone = applicationTimezone;
+    response.locals.emailNotificationService = emailNotificationService;
     next();
   });
   app.use("/api/v1", healthRoutes);

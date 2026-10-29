@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { describe, it } = require("node:test");
 const { createApp } = require("../src/app");
+const { createEmailNotificationService } = require("../src/services/emailNotificationService");
 const {
   appointmentQuerySchema,
   createAppointmentSchema,
@@ -22,6 +23,7 @@ const secondAppointmentId = "44444444-4444-4444-8444-444444444444";
 const patientUser = { id: patientUserId, role: "patient", is_active: true, first_name: "Pia", last_name: "Patient" };
 const doctorUser = { id: doctorUserId, role: "doctor", is_active: true, first_name: "Dara", last_name: "Doctor" };
 const otherUser = { id: otherUserId, role: "patient", is_active: true, first_name: "Other", last_name: "Patient" };
+const registeredPatientEmail = "pia@example.test";
 
 function makeSlot(id, start_time = "10:00", date = "2099-04-10") {
   return { id, doctor_id: doctorId, date, start_time, end_time: "10:30", doctor_active: true };
@@ -54,6 +56,7 @@ function createDatabase({
       specialty: "General Practice",
       patient_first_name: "Pia",
       patient_last_name: "Patient",
+      patient_email: registeredPatientEmail,
     };
   }
 
@@ -205,13 +208,14 @@ function createDatabase({
   return database;
 }
 
-function createTestApp({ currentUser = patientUser, database = createDatabase({ currentUser }), authenticated = true, applicationTimezone = "Asia/Kolkata" } = {}) {
+function createTestApp({ currentUser = patientUser, database = createDatabase({ currentUser }), authenticated = true, applicationTimezone = "Asia/Kolkata", emailNotificationService = { sendAppointmentNotification: async () => {} } } = {}) {
   return {
     database,
     app: createApp({
       database,
       frontendOrigin: "http://localhost:3000",
       applicationTimezone,
+      emailNotificationService,
       clerkAuthMiddleware: (request, _response, next) => {
         request.auth = Object.assign(
           () => authenticated
@@ -263,6 +267,55 @@ describe("appointment schemas and migration", () => {
 });
 
 describe("appointment workflows", () => {
+  it("sends booking, cancellation, and rescheduling notifications after successful operations", async () => {
+    const notifications = [];
+    const emailNotificationService = { sendAppointmentNotification: async (...args) => notifications.push(args) };
+    const booking = createTestApp({ emailNotificationService });
+    await withServer(booking.app, async (url) => {
+      assert.equal((await fetch(`${url}/api/v1/appointments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: firstSlotId }) })).status, 201);
+    });
+    const cancellation = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), emailNotificationService });
+    await withServer(cancellation.app, async (url) => {
+      assert.equal((await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" })).status, 200);
+    });
+    const reschedule = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), emailNotificationService });
+    await withServer(reschedule.app, async (url) => {
+      assert.equal((await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }) })).status, 200);
+    });
+    assert.deepEqual(notifications.map(([action]) => action), ["booked", "cancelled", "rescheduled"]);
+    assert.equal(notifications[0][1].patient_email, registeredPatientEmail);
+    assert.equal(notifications[2][1].previous_date, "2099-04-10");
+    assert.equal(notifications[2][1].previous_start_time, "10:00:00");
+  });
+
+  it("does not notify when appointment operations fail and keeps successful operations alive on mail errors", async () => {
+    let notificationCount = 0;
+    const emailNotificationService = { sendAppointmentNotification: async () => { notificationCount += 1; throw new Error("provider unavailable"); } };
+    const { app } = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), emailNotificationService });
+    await withServer(app, async (url) => {
+      const failedBooking = await fetch(`${url}/api/v1/appointments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: firstSlotId }) });
+      assert.equal(failedBooking.status, 409);
+      assert.equal(notificationCount, 0);
+      const success = await fetch(`${url}/api/v1/appointments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }) });
+      assert.equal(success.status, 201);
+      assert.equal(notificationCount, 1);
+    });
+  });
+
+  it("skips Brevo when credentials are missing and handles provider failures", async () => {
+    let calls = 0;
+    const appointment = { patient_email: registeredPatientEmail, date: "2099-04-10", start_time: "10:00:00", doctor_first_name: "Dara", doctor_last_name: "Doctor" };
+    const missing = createEmailNotificationService({ config: { BREVO_API_KEY: "replace_with_brevo_api_key", BREVO_SENDER_EMAIL: "sender@example.test", BREVO_SENDER_NAME: "Medrella" }, fetchImpl: async () => { calls += 1; } });
+    await missing.sendAppointmentNotification("booked", appointment);
+    assert.equal(calls, 0);
+    const errors = [];
+    const failing = createEmailNotificationService({ config: { BREVO_API_KEY: "valid-test-key", BREVO_SENDER_EMAIL: "sender@example.test", BREVO_SENDER_NAME: "Medrella" }, fetchImpl: async () => { calls += 1; return { ok: false, status: 401 }; }, logger: { error: (...args) => errors.push(args) } });
+    await failing.sendAppointmentNotification("booked", appointment);
+    assert.equal(calls, 1);
+    assert.equal(errors.length, 1);
+    assert.doesNotMatch(JSON.stringify(errors), /valid-test-key/);
+  });
+
   it("books a future slot and prevents duplicate bookings", async () => {
     const { app, database } = createTestApp();
     await withServer(app, async (url) => {
