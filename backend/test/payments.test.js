@@ -38,6 +38,8 @@ function createStripeClient({ createSession = async (params) => ({
       async retrieve(id) { calls.push({ method: "retrieve", id }); return { id, url: "https://checkout.stripe.com/c/pay/test", status: "open" }; },
       async expire(id) { calls.push({ method: "expire", id }); return { id, status: "expired", payment_status: "unpaid" }; },
     } },
+    refunds: { async create(params, options) { calls.push({ method: "refund", params, options }); return { id: "re_test_123", status: "succeeded" }; } },
+    paymentIntents: { async retrieve(id, params) { calls.push({ method: "retrievePaymentIntent", id, params }); return { id, status: "succeeded" }; } },
     webhooks: { constructEvent(raw, signature, secret) {
       calls.push({ method: "constructEvent", raw, signature, secret });
       if (signature !== "stripe-signature") throw new Error("invalid signature");
@@ -393,6 +395,13 @@ describe("Stripe Test Mode adapter", () => {
     assert.equal(event.id, "evt_test");
     assert.equal(sdk.calls[1].raw, raw);
     assert.equal(sdk.calls[1].secret, "whsec_medrella");
+    await stripe.createRefund({ payment_intent: intentId, amount: 12500 }, "appointment-cancel-key");
+    assert.equal(sdk.calls[2].method, "refund");
+    assert.equal(sdk.calls[2].params.payment_intent, intentId);
+    assert.equal(sdk.calls[2].options.idempotencyKey, "appointment-cancel-key");
+    await stripe.retrievePaymentIntent(intentId);
+    assert.equal(sdk.calls[3].id, intentId);
+    assert.deepEqual(sdk.calls[3].params.expand, ["latest_charge"]);
   });
 
   it("rejects live or missing credentials and invalid webhook signatures", async () => {

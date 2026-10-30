@@ -33,6 +33,12 @@ function createStripeService({ config, stripeClient }) {
     async expireCheckoutSession(sessionId) {
       return getClient().checkout.sessions.expire(sessionId);
     },
+    async createRefund(params, idempotencyKey) {
+      return getClient().refunds.create(params, { idempotencyKey });
+    },
+    async retrievePaymentIntent(paymentIntentId) {
+      return getClient().paymentIntents.retrieve(paymentIntentId, { expand: ["latest_charge"] });
+    },
     constructWebhookEvent(rawBody, signature) {
       const secret = config.STRIPE_WEBHOOK_SECRET;
       if (!secret?.startsWith("whsec_")) {

@@ -1,5 +1,6 @@
 const appointmentService = require("./appointmentService");
 const { StripePaymentError } = require("./stripeService");
+const { createRefundService } = require("./refundService");
 
 const STRIPE_MIN_CHECKOUT_TTL_SECONDS = 30 * 60;
 const CHECKOUT_CREATION_SAFETY_SECONDS = 60;
@@ -128,7 +129,18 @@ function validateSession(payment, session) {
   }
 }
 
+function stripeReceiptUrl(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname === "pay.stripe.com" ? url.toString() : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
 function createPaymentService({ database, stripe, emailNotificationService, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now }) {
+  const refundService = createRefundService({ database, stripe, logger, now });
   async function closePaymentWithoutSession(reservation, status = "failed") {
     await withTransaction(database, async (client) => {
       const closed = await client.query(
@@ -473,6 +485,9 @@ function createPaymentService({ database, stripe, emailNotificationService, fron
       if (error.status === 503 && error.code) fail(error.status, error.code, error.message);
       fail(400, "WEBHOOK_SIGNATURE_INVALID", "Stripe webhook verification failed");
     }
+    if (["refund.created", "refund.updated", "refund.failed", "charge.refund.updated", "charge.refunded"].includes(event.type)) {
+      return refundService.processRefundWebhook(event);
+    }
     if (!["checkout.session.completed", "checkout.session.async_payment_succeeded", "checkout.session.async_payment_failed", "checkout.session.expired"].includes(event.type)) {
       return { ignored: true };
     }
@@ -516,6 +531,92 @@ function createPaymentService({ database, stripe, emailNotificationService, fron
     return { status: payment.status, appointment: appointmentDetails ? appointment : null, reconciliation_id: reconciliation.rows[0]?.id || null };
   }
 
+  async function getPaymentHistory(user) {
+    if (user.role !== "patient") fail(403, "FORBIDDEN", "Only patients can view payment history");
+    const result = await database.query(
+      `SELECT p.id, p.amount::text AS amount, p.currency, p.status, p.provider,
+              p.provider_payment_id, p.created_at, p.captured_at,
+              COALESCE(p.captured_at, p.created_at) AS payment_date,
+              a.id AS appointment_id, a.status AS appointment_status,
+              COALESCE(a.scheduled_date::text, av.date::text) AS appointment_date,
+              COALESCE(a.scheduled_start_time::text, av.start_time::text) AS appointment_start_time,
+              COALESCE(a.scheduled_end_time::text, av.end_time::text) AS appointment_end_time,
+              d.id AS doctor_id, du.first_name AS doctor_first_name,
+              du.last_name AS doctor_last_name, d.specialty
+       FROM payments p
+       LEFT JOIN appointments a ON a.id = p.appointment_id
+       LEFT JOIN appointment_slot_holds h ON h.id = p.slot_hold_id
+       JOIN patients patient_owner ON patient_owner.user_id = $1
+         AND patient_owner.id = COALESCE(a.patient_id, h.patient_id)
+       LEFT JOIN availability av ON av.id = COALESCE(a.availability_id, h.availability_id)
+       LEFT JOIN doctors d ON d.id = av.doctor_id
+       LEFT JOIN users du ON du.id = d.user_id
+       ORDER BY COALESCE(p.captured_at, p.created_at) DESC, p.id`, [user.id],
+    );
+    const paymentIds = result.rows.map((payment) => payment.id);
+    const refundRows = paymentIds.length
+      ? (await database.query(
+        `SELECT id, payment_id, amount::text AS amount, currency, status, reason,
+                created_at, processed_at
+         FROM refunds WHERE payment_id = ANY($1::uuid[]) ORDER BY created_at DESC, id`, [paymentIds],
+      )).rows
+      : [];
+    const refundsByPayment = new Map();
+    for (const refund of refundRows) {
+      const list = refundsByPayment.get(refund.payment_id) || [];
+      list.push(refund);
+      refundsByPayment.set(refund.payment_id, list);
+    }
+    return Promise.all(result.rows.map(async (payment) => {
+      let receiptUrl = null;
+      if (["captured", "partially_refunded", "refunded"].includes(payment.status)
+        && payment.provider === "stripe" && payment.provider_payment_id) {
+        try {
+          const intent = await stripe.retrievePaymentIntent(payment.provider_payment_id);
+          const charge = typeof intent?.latest_charge === "object" ? intent.latest_charge : null;
+          if (intent?.id === payment.provider_payment_id && intent.status === "succeeded") {
+            receiptUrl = stripeReceiptUrl(charge?.receipt_url);
+          }
+        } catch (error) {
+          logger.warn?.("Stripe receipt lookup failed", { paymentId: payment.id, message: error.message });
+        }
+      }
+      const appointment = payment.appointment_id ? {
+        id: payment.appointment_id,
+        status: payment.appointment_status,
+        date: payment.appointment_date,
+        start_time: payment.appointment_start_time,
+        end_time: payment.appointment_end_time,
+        doctor: payment.doctor_id ? {
+          id: payment.doctor_id,
+          first_name: payment.doctor_first_name,
+          last_name: payment.doctor_last_name,
+          specialty: payment.specialty,
+        } : null,
+      } : (payment.appointment_date && payment.doctor_id ? {
+        date: payment.appointment_date,
+        start_time: payment.appointment_start_time,
+        end_time: payment.appointment_end_time,
+        doctor: {
+          id: payment.doctor_id,
+          first_name: payment.doctor_first_name,
+          last_name: payment.doctor_last_name,
+          specialty: payment.specialty,
+        },
+      } : null);
+      return {
+        id: payment.id,
+        amount: payment.amount,
+        currency: payment.currency.trim(),
+        status: payment.status,
+        date: payment.payment_date,
+        receipt_url: receiptUrl,
+        appointment,
+        refunds: refundsByPayment.get(payment.id) || [],
+      };
+    }));
+  }
+
   async function cancelCheckoutSession(user, paymentId) {
     if (user.role !== "patient") fail(403, "FORBIDDEN", "Only patients can cancel appointment payments");
     const payment = await findOwnedPayment(database, paymentId, user.id);
@@ -536,7 +637,15 @@ function createPaymentService({ database, stripe, emailNotificationService, fron
     return markSessionFailure(payment, session, null, "cancelled");
   }
 
-  return { cancelCheckoutSession, createCheckoutSession, getPaymentStatus, processWebhook };
+  return {
+    cancelCheckoutSession,
+    createCheckoutSession,
+    getPaymentHistory,
+    getPaymentStatus,
+    previewCancellationRefund: refundService.previewCancellationRefund,
+    processWebhook,
+    refundCancelledAppointment: refundService.refundCancelledAppointment,
+  };
 }
 
 module.exports = { PaymentError, createPaymentService };

@@ -100,6 +100,8 @@ Paid booking uses Stripe-hosted Checkout in one-time payment mode. The backend c
 
 Before enabling paid booking in any target database, verify that migrations 008, 009, and 010 have been applied. Check the migration ledger first and apply only missing migration files individually, in dependency order. Do not rerun migrations that have already been applied. The development Neon database already has all three migrations applied.
 
+Patient appointment cancellation creates a refund for captured Stripe payments according to the cancellation time in `Asia/Kolkata`: at least 24 hours before the scheduled start returns 100%, 6 to less than 24 hours returns 50%, and less than 6 hours or after the start returns 0%. Refund amounts use the captured payment amount and currency. Cancellation success does not indicate that a refund has completed; the cancellation response reports the refund state separately.
+
 Configure `STRIPE_SECRET_KEY=sk_test_...` and `STRIPE_WEBHOOK_SECRET=whsec_...` on the backend. The backend rejects non-test secret keys. Do not set live Stripe credentials.
 
 For local webhook testing, install and authenticate the [Stripe CLI](https://docs.stripe.com/stripe-cli), then run:
@@ -110,4 +112,4 @@ stripe listen --forward-to localhost:3001/api/v1/payments/webhook
 
 Copy the printed `whsec_...` value into the backend's local environment. Trigger or complete test Checkout payments and keep the CLI listener running.
 
-For deployment, create a Test Mode webhook endpoint at `https://<backend-service-host>/api/v1/payments/webhook` in the Stripe Dashboard and subscribe it to the four Checkout Session events above. Use that endpoint's signing secret as `STRIPE_WEBHOOK_SECRET`. The Dashboard secret differs from the local CLI forwarding secret.
+For deployment, create a Test Mode webhook endpoint at `https://<backend-service-host>/api/v1/payments/webhook` in the Stripe Dashboard and subscribe it to the four Checkout Session events above plus `refund.created`, `refund.updated`, `refund.failed`, `charge.refund.updated`, and `charge.refunded`. Use that endpoint's signing secret as `STRIPE_WEBHOOK_SECRET`. The Dashboard secret differs from the local CLI forwarding secret.

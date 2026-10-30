@@ -37,6 +37,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
   app.use(express.json());
   app.use((_request, response, next) => {
     response.locals.database = database;
+    response.locals.paymentService = payments;
     response.locals.clerkProfileResolver = clerkProfileResolver;
     response.locals.applicationTimezone = applicationTimezone;
     response.locals.emailNotificationService = emailNotificationService;

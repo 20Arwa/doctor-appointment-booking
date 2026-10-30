@@ -15,9 +15,11 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { CancellationRefundEstimate } from "@/components/cancellation-refund-estimate";
 import { notifyError, notifySuccess } from "@/lib/notifications";
 import {
   cancelAppointment,
+  getAppointmentCancellationRefundPreview,
   getAppointments,
   getDoctorSlots,
   ProfileApiError,
@@ -93,6 +95,9 @@ export function PatientAppointmentsPage() {
   const [slotsError, setSlotsError] = useState<string | null>(null);
   const [selectedSlotId, setSelectedSlotId] = useState("");
   const [cancelTarget, setCancelTarget] = useState<PatientAppointment | null>(null);
+  const [refundPreview, setRefundPreview] = useState<Awaited<ReturnType<typeof getAppointmentCancellationRefundPreview>> | null>(null);
+  const [refundPreviewLoading, setRefundPreviewLoading] = useState(false);
+  const [refundPreviewError, setRefundPreviewError] = useState<string | null>(null);
 
   const [previousPathname, setPreviousPathname] = useState(pathname);
   if (previousPathname !== pathname) {
@@ -121,6 +126,22 @@ export function PatientAppointmentsPage() {
       });
     return () => { active = false; };
   }, [getToken, refreshKey]);
+
+  useEffect(() => {
+    if (!cancelTarget) return;
+    let active = true;
+    void getToken()
+      .then((token) => {
+        if (!token) throw new Error("Your session could not be verified. Please try again.");
+        return getAppointmentCancellationRefundPreview(token, cancelTarget.id);
+      })
+      .then((preview) => { if (active) setRefundPreview(preview); })
+      .catch((error: unknown) => {
+        if (active) setRefundPreviewError(error instanceof Error ? error.message : "The refund estimate is unavailable.");
+      })
+      .finally(() => { if (active) setRefundPreviewLoading(false); });
+    return () => { active = false; };
+  }, [cancelTarget, getToken]);
 
   const now = currentTime ?? 0;
   const ordered = [...appointments].sort((first, second) => {
@@ -190,6 +211,13 @@ export function PatientAppointmentsPage() {
     }
   }
 
+  function openCancellationDialog(appointment: PatientAppointment) {
+    setRefundPreview(null);
+    setRefundPreviewError(null);
+    setRefundPreviewLoading(true);
+    setCancelTarget(appointment);
+  }
+
   async function confirmReschedule(appointment: PatientAppointment) {
     if (!selectedSlotId || requestLock.current) return;
     requestLock.current = true;
@@ -237,13 +265,13 @@ export function PatientAppointmentsPage() {
       {!loading && !loadError ? (
         <>
           <AppointmentSection title="Upcoming appointments" empty="You have no upcoming appointments." appointments={upcoming}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => setCancelTarget(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
           <AppointmentSection title="Past appointments" empty="Your past appointments will appear here." appointments={past}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => setCancelTarget(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
           <AppointmentSection title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => setCancelTarget(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
         </>
       ) : null}
@@ -253,6 +281,7 @@ export function PatientAppointmentsPage() {
             <AlertDialogTitle>Cancel appointment?</AlertDialogTitle>
             <AlertDialogDescription>This will cancel your confirmed appointment. You can review cancelled appointments in the history below.</AlertDialogDescription>
           </AlertDialogHeader>
+          <CancellationRefundEstimate preview={refundPreview} loading={refundPreviewLoading} error={refundPreviewError} />
           <AlertDialogFooter className="m-0 flex-row justify-end gap-3 border-0 bg-transparent p-0">
             <AlertDialogCancel disabled={activeRequest?.startsWith("cancel:")}>Keep appointment</AlertDialogCancel>
             <AlertDialogAction variant="destructive" disabled={activeRequest?.startsWith("cancel:")} onClick={(event) => {

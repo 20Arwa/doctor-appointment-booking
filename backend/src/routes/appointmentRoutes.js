@@ -5,6 +5,7 @@ const {
   createAppointment,
   getAppointment,
   listAppointments,
+  previewCancellationRefund,
   rescheduleAppointment,
 } = require("../controllers/appointmentController");
 const { requireClerkIdentity, requireLocalUser } = require("../middleware/auth");
@@ -21,6 +22,7 @@ router.use(requireClerkIdentity, requireLocalUser);
 router.get("/", validate(appointmentQuerySchema, "query"), listAppointments);
 router.post("/", validate(createAppointmentSchema, "body"), createAppointment);
 router.get("/:id", validate(appointmentIdParamsSchema, "params"), getAppointment);
+router.get("/:id/cancellation-preview", validate(appointmentIdParamsSchema, "params"), previewCancellationRefund);
 router.put("/:id/cancel", validate(appointmentIdParamsSchema, "params"), cancelAppointment);
 router.put("/:id/reschedule", validate(appointmentIdParamsSchema, "params"), validate(rescheduleAppointmentSchema, "body"), rescheduleAppointment);
 router.put("/:id/complete", validate(appointmentIdParamsSchema, "params"), completeAppointment);

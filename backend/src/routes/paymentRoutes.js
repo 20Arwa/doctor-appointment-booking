@@ -12,6 +12,7 @@ function createPaymentRoutes({ service, webhook = false }) {
     return router;
   }
   router.use(requireClerkIdentity, requireLocalUser);
+  router.get("/history", controller.history);
   router.post("/orders", validate(createPaymentOrderSchema, "body"), controller.createOrder);
   router.get("/:id/status", validate(paymentIdParamsSchema, "params"), controller.status);
   router.post("/:id/cancel", validate(paymentIdParamsSchema, "params"), controller.cancel);

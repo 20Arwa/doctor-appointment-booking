@@ -1,6 +1,6 @@
 "use client";
 
-import { CalendarDays, CalendarRange, Clock3, UserRound } from "lucide-react";
+import { CalendarDays, CalendarRange, Clock3, ReceiptText, UserRound } from "lucide-react";
 import Link from "next/link";
 import { useAuth } from "@clerk/nextjs";
 import { useEffect, useMemo, useState } from "react";
@@ -47,6 +47,7 @@ export function PatientDashboardPage() {
         <h2 id="patient-shortcuts-title" className="text-lg font-semibold text-foreground">Quick links</h2>
         <div className="mt-4 grid gap-4 sm:grid-cols-2">
           <ShortcutCard href="/patient/appointments" title="My Appointments" description="View your appointment workspace." icon={CalendarDays} />
+          <ShortcutCard href="/patient/payments" title="Payment History" description="Review appointment payments and refunds." icon={ReceiptText} />
           <ShortcutCard href="/patient/profile" title="Profile" description="View your profile section." icon={UserRound} />
         </div>
       </section>

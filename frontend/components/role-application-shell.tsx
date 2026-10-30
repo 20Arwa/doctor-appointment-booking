@@ -8,6 +8,7 @@ import {
   HeartPulse,
   LayoutDashboard,
   Menu,
+  ReceiptText,
   Stethoscope,
   UserRound,
   X,
@@ -29,6 +30,7 @@ const patientNavigation: AppNavigationItem[] = [
   { label: "Dashboard", href: "/patient/dashboard", icon: LayoutDashboard },
   { label: "Book Appointment", href: "/patient/book-appointment", icon: CalendarPlus },
   { label: "My Appointments", href: "/patient/appointments", icon: CalendarDays },
+  { label: "Payment History", href: "/patient/payments", icon: ReceiptText },
   { label: "Profile", href: "/patient/profile", icon: UserRound },
 ];
 
