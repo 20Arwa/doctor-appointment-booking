@@ -53,12 +53,6 @@ async function withTransaction(database, callback) {
   }
 }
 
-async function requirePatientId(client, userId) {
-  const result = await client.query("SELECT id FROM patients WHERE user_id = $1", [userId]);
-  if (!result.rows[0]) fail(403, "PATIENT_PROFILE_REQUIRED", "An existing patient profile is required to book appointments");
-  return result.rows[0].id;
-}
-
 async function requireOwnDoctorId(database, user) {
   if (user.role !== "doctor") fail(403, "FORBIDDEN", "Only the associated doctor may complete this appointment");
   const result = await database.query("SELECT id FROM doctors WHERE user_id = $1", [user.id]);
@@ -81,6 +75,41 @@ async function lockBookableSlot(client, availabilityId, now) {
   if (!slot) fail(404, "SLOT_NOT_FOUND", "Availability slot not found");
   if (!slotStartsInFuture(slot, now)) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer bookable");
   return slot;
+}
+
+async function ensureNoActivePaymentHold(client, doctorId, date, startTime, endTime, excludedHoldId = null) {
+  const held = await client.query(
+    `SELECT 1 FROM appointment_slot_holds h
+     JOIN availability av ON av.id = h.availability_id
+     WHERE av.doctor_id = $1 AND av.date = $2::date
+       AND av.start_time < $4::time AND av.end_time > $3::time
+       AND h.status = 'active' AND h.expires_at > NOW()
+       AND ($5::uuid IS NULL OR h.id <> $5) LIMIT 1`,
+    [doctorId, date, startTime, endTime, excludedHoldId],
+  );
+  if (held.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time is temporarily reserved for payment");
+}
+
+async function createPaymentAppointment(client, { availabilityId, patientId, reason, holdId, timeZone }) {
+  const slot = await lockBookableSlot(client, availabilityId, timeContext(timeZone));
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [slot.doctor_id]);
+  await ensureNoActivePaymentHold(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time, holdId);
+  const conflict = await client.query(
+    `SELECT 1 FROM appointments other
+     JOIN availability other_av ON other_av.id = other.availability_id
+     WHERE other_av.doctor_id = $1 AND other.status = 'confirmed'
+       AND other.scheduled_date = $2::date
+       AND other.scheduled_start_time < $4::time
+       AND other.scheduled_end_time > $3::time LIMIT 1`,
+    [slot.doctor_id, slot.date, slot.start_time, slot.end_time],
+  );
+  if (conflict.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time overlaps another confirmed appointment");
+  const created = await client.query(
+    `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time)
+     VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time) RETURNING id`,
+    [patientId, availabilityId, reason, slot.date, slot.start_time, slot.end_time],
+  );
+  return readDetails(client, created.rows[0].id);
 }
 
 async function readDetails(client, appointmentId) {
@@ -118,29 +147,6 @@ async function getAppointment(database, user, appointmentId) {
   const result = await database.query(`${APPOINTMENT_DETAILS} WHERE a.id = $1 AND ${ownership}`, [appointmentId, user.id]);
   if (!result.rows[0]) fail(404, "APPOINTMENT_NOT_FOUND", "Appointment not found");
   return result.rows[0];
-}
-
-async function createAppointment(database, user, timeZone, input) {
-  if (user.role !== "patient") fail(403, "FORBIDDEN", "Only patients can book appointments");
-  const now = timeContext(timeZone);
-  return withTransaction(database, async (client) => {
-    const patientId = await requirePatientId(client, user.id);
-    const slot = await lockBookableSlot(client, input.availability_id, now);
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [slot.doctor_id]);
-    const overlap = await client.query(
-      `SELECT 1 FROM appointments other JOIN availability other_av ON other_av.id = other.availability_id
-       WHERE other_av.doctor_id = $1 AND other.status = 'confirmed' AND other_av.date = $2::date
-         AND other_av.start_time < $4::time AND other_av.end_time > $3::time LIMIT 1`,
-      [slot.doctor_id, slot.date, slot.start_time, slot.end_time],
-    );
-    if (overlap.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time overlaps another confirmed appointment");
-    const created = await client.query(
-      `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time)
-       VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time) RETURNING id`,
-      [patientId, input.availability_id, input.reason ?? null, slot.date, slot.start_time, slot.end_time],
-    );
-    return readDetails(client, created.rows[0].id);
-  });
 }
 
 async function cancelAppointment(database, user, appointmentId) {
@@ -182,6 +188,7 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
 
     const slot = await lockBookableSlot(client, newAvailabilityId, now);
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [slot.doctor_id]);
+    await ensureNoActivePaymentHold(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time);
     const conflict = await client.query(
       `SELECT 1 FROM appointments other JOIN availability other_av ON other_av.id = other.availability_id
        WHERE other_av.doctor_id = $1 AND other.status = 'confirmed' AND other_av.date = $2::date
@@ -224,6 +231,7 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
       fail(409, "APPOINTMENT_TIME_UNCHANGED", "Choose a different appointment date or time");
     }
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [doctorId]);
+    await ensureNoActivePaymentHold(client, doctorId, input.date, input.start_time, input.end_time);
     const conflict = await client.query(
       `SELECT 1 FROM appointments other
        JOIN availability other_av ON other_av.id = other.availability_id
@@ -273,9 +281,10 @@ module.exports = {
   AppointmentError,
   cancelAppointment,
   completeAppointment,
-  createAppointment,
+  createPaymentAppointment,
   doctorRescheduleAppointment,
   getAppointment,
   listAppointments,
+  readAppointmentDetails: readDetails,
   rescheduleAppointment,
 };

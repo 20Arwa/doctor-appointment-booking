@@ -52,10 +52,25 @@ const availabilitySlotSchema = z.object({
   end_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
 });
 
+const paymentOrderSchema = z.object({
+  payment_id: z.string().uuid(),
+  session_id: z.string().startsWith("cs_test_"),
+  checkout_url: z.string().url(),
+  expires_at: z.string(),
+});
+
+const paymentStatusSchema = z.object({
+  status: z.enum(["created", "pending", "authorized", "captured", "failed", "cancelled", "expired"]),
+  appointment: appointmentSchema.nullable(),
+  reconciliation_id: z.string().uuid().nullable().optional(),
+});
+
 export type LocalProfile = z.infer<typeof localProfileSchema>;
 export type DirectoryDoctor = z.infer<typeof doctorSchema>;
 export type PatientAppointment = z.infer<typeof appointmentSchema>;
 export type AvailabilitySlot = z.infer<typeof availabilitySlotSchema>;
+export type PaymentOrder = z.infer<typeof paymentOrderSchema>;
+export type PaymentStatus = z.infer<typeof paymentStatusSchema>;
 
 type ValidationDetail = { path: string; message: string };
 
@@ -175,14 +190,25 @@ export async function deleteDoctorSlot(token: string, doctorId: string, slotId: 
   });
 }
 
-export async function createAppointment(token: string, availabilityId: string, reason?: string): Promise<PatientAppointment> {
-  const payload = await request<unknown>(token, "/appointments", {
+export async function createAppointmentPaymentOrder(token: string, availabilityId: string, reason: string | undefined, idempotencyKey: string): Promise<PaymentOrder> {
+  const payload = await request<unknown>(token, "/payments/orders", {
     method: "POST",
-    body: JSON.stringify({ availability_id: availabilityId, ...(reason ? { reason } : {}) }),
+    body: JSON.stringify({ availability_id: availabilityId, idempotency_key: idempotencyKey, ...(reason ? { reason } : {}) }),
   });
-  const parsed = appointmentSchema.safeParse(payload);
-  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete booking confirmation.");
+  const parsed = paymentOrderSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete payment order.");
   return parsed.data;
+}
+
+export async function getAppointmentPaymentStatus(token: string, paymentId: string): Promise<PaymentStatus> {
+  const payload = await request<unknown>(token, `/payments/${encodeURIComponent(paymentId)}/status`);
+  const parsed = paymentStatusSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete payment status response.");
+  return parsed.data;
+}
+
+export async function cancelAppointmentPaymentOrder(token: string, paymentId: string): Promise<void> {
+  await request<unknown>(token, `/payments/${encodeURIComponent(paymentId)}/cancel`, { method: "POST" });
 }
 
 export async function getAppointments(token: string): Promise<PatientAppointment[]> {

@@ -4,7 +4,7 @@ import { useAuth } from "@clerk/nextjs";
 import { ArrowLeft, CalendarClock, CheckCircle2, RefreshCw, Stethoscope } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useTransition } from "react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -16,7 +16,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { createAppointment, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
+import { cancelAppointmentPaymentOrder, createAppointmentPaymentOrder, getAppointmentPaymentStatus, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
 const BOOKING_WINDOW_DAYS = 30;
@@ -60,6 +60,7 @@ function formatSlotTime(time: string) {
 }
 
 function formatBookingError(error: unknown) {
+  if (error instanceof ProfileApiError && error.code === "CHECKOUT_WINDOW_UNAVAILABLE") return error.message;
   if (error instanceof ProfileApiError && error.status === 409) {
     return "That slot is no longer available. Refresh availability and choose another time.";
   }
@@ -80,6 +81,9 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   const [bookingError, setBookingError] = useState<string | null>(null);
   const [bookingDialogOpen, setBookingDialogOpen] = useState(false);
   const [confirmation, setConfirmation] = useState<PatientAppointment | null>(null);
+  const [paymentPendingId, setPaymentPendingId] = useState<string | null>(null);
+  const [checkingPayment, setCheckingPayment] = useState(false);
+  const [, startTransition] = useTransition();
   const submissionInProgress = useRef(false);
 
   const routeKey = `${pathname}:${doctorId}`;
@@ -122,6 +126,21 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
     return () => { active = false; };
   }, [doctorId, getToken, pathname, retryKey]);
 
+  useEffect(() => {
+    const query = new URLSearchParams(window.location.search);
+    const returnedPaymentId = query.get("payment_id");
+    if (!returnedPaymentId) return;
+    startTransition(() => setPaymentPendingId(returnedPaymentId));
+    if (query.get("checkout") === "cancelled") {
+      startTransition(() => setBookingError("Closing the Checkout Session and checking its payment status…"));
+      void getToken().then(async (token) => {
+        if (token) await cancelAppointmentPaymentOrder(token, returnedPaymentId);
+      }).catch(() => {});
+    } else if (query.has("session_id")) {
+      startTransition(() => setBookingError("Checkout returned to Medrella. Verify the payment status below; the redirect itself does not confirm an appointment."));
+    }
+  }, [doctorId, getToken, pathname, startTransition]);
+
   async function handleBooking(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedSlotId || !slots.some((slot) => slot.id === selectedSlotId) || submissionInProgress.current) return;
@@ -139,27 +158,44 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
     try {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
-      const created = await createAppointment(token, selectedSlotId, reason.trim() || undefined);
-      setConfirmation(created);
+      const order = await createAppointmentPaymentOrder(token, selectedSlotId, reason.trim() || undefined, crypto.randomUUID());
       setBookingDialogOpen(false);
-      setSelectedSlotId("");
-      setSlots((current) => current.filter((slot) => slot.id !== created.availability_id));
-      setBookingError(null);
-      const { from, to } = getSlotRange();
-      try {
-        const refreshedSlots = await getDoctorSlots(token, doctorId, from, to);
-        setSlots(refreshedSlots.filter((slot) => {
-          const instant = slotInstant(slot);
-          return slot.id !== created.availability_id && instant !== null && instant.getTime() > Date.now();
-        }));
-      } catch {
-        // The successful booking remains confirmed; the booked slot was already removed locally.
-      }
+      setPaymentPendingId(order.payment_id);
+      window.location.assign(order.checkout_url);
     } catch (error) {
       setBookingError(formatBookingError(error));
     } finally {
       submissionInProgress.current = false;
       setBooking(false);
+    }
+  }
+
+  async function checkPaymentStatus() {
+    if (!paymentPendingId || checkingPayment) return;
+    setCheckingPayment(true);
+    try {
+      const token = await getToken();
+      if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+      const status = await getAppointmentPaymentStatus(token, paymentPendingId);
+      if (status.appointment) {
+        setConfirmation(status.appointment);
+        setPaymentPendingId(null);
+        setSlots((current) => current.filter((slot) => slot.id !== status.appointment?.availability_id));
+        setBookingError(null);
+      } else if (status.status === "failed" || status.status === "cancelled" || status.status === "expired") {
+        setPaymentPendingId(null);
+        setBookingError("This payment attempt did not complete. Select the appointment time again to retry.");
+        setRetryKey((key) => key + 1);
+      } else if (status.status === "captured") {
+        setPaymentPendingId(null);
+        setBookingError(`Your payment was received, but the appointment could not be confirmed. Contact Medrella support${status.reconciliation_id ? ` with reference ${status.reconciliation_id}` : ""}.`);
+      } else {
+        setBookingError("Payment is still being verified. Check again in a few seconds.");
+      }
+    } catch (error) {
+      setBookingError(formatBookingError(error));
+    } finally {
+      setCheckingPayment(false);
     }
   }
 
@@ -215,6 +251,16 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
               <p className="mt-4 text-foreground">Dr. {confirmation.doctor_first_name} {confirmation.doctor_last_name} · {confirmation.specialty}</p>
               <p className="mt-1 text-sm text-muted-foreground">{formatSlotDate(confirmation.date)} at {formatSlotTime(confirmation.start_time)} IST</p>
               <p className="mt-3 text-sm text-muted-foreground">Confirmation ID: {confirmation.id}</p>
+            </section>
+          ) : null}
+
+          {paymentPendingId ? (
+            <section className="rounded-2xl border border-border bg-card p-5" aria-live="polite">
+              <h2 className="font-semibold text-card-foreground">Payment verification pending</h2>
+              <p className="mt-2 text-sm text-muted-foreground">We’re waiting for Stripe to confirm the payment. The return redirect does not confirm the appointment; Stripe payment status is checked server-side.</p>
+              <Button type="button" className="mt-4" disabled={checkingPayment} onClick={() => void checkPaymentStatus()}>
+                {checkingPayment ? "Checking…" : "Check payment status"}
+              </Button>
             </section>
           ) : null}
 
@@ -288,14 +334,14 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
                   </div>
                 </dl>
               ) : null}
-              <p className="text-sm text-muted-foreground">Online payment is not enabled yet. No payment will be collected online.</p>
+              <p className="text-sm text-muted-foreground">Pay in Stripe Test Mode. Your selected slot is held for up to 40 minutes while Checkout is in progress.</p>
               {bookingError ? <p className="text-sm text-destructive" role="alert">{bookingError}</p> : null}
               <AlertDialogFooter className="m-0 flex-row justify-end gap-3 border-0 bg-transparent p-0">
                 <AlertDialogCancel disabled={booking}>Go back</AlertDialogCancel>
                 <AlertDialogAction disabled={!selectedSlot || booking} onClick={(event) => {
                   event.preventDefault();
                   void confirmBooking();
-                }}>{booking ? "Booking…" : "Confirm booking"}</AlertDialogAction>
+                }}>{booking ? "Opening checkout…" : `Pay ${inrFormatter.format(doctor.consultation_fee)}`}</AlertDialogAction>
               </AlertDialogFooter>
             </AlertDialogContent>
           </AlertDialog>

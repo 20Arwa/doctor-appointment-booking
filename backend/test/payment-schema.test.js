@@ -4,6 +4,8 @@ const path = require("node:path");
 const { describe, it } = require("node:test");
 
 const migration = fs.readFileSync(path.join(__dirname, "..", "migrations", "008_payment_refund_schema.sql"), "utf8");
+const reconciliationMigration = fs.readFileSync(path.join(__dirname, "..", "migrations", "010_payment_capture_reconciliation.sql"), "utf8");
+const stripeBookingMigration = fs.readFileSync(path.join(__dirname, "..", "migrations", "009_payment_booking_reason.sql"), "utf8");
 
 describe("payment and refund database migration", () => {
   it("adds payment, refund, event, and slot-hold records without changing appointment status", () => {
@@ -53,5 +55,20 @@ describe("payment and refund database migration", () => {
     assert.match(activePaymentIndex, /'captured'/i);
     assert.doesNotMatch(activePaymentIndex, /'failed'|'expired'|'cancelled'/i);
     assert.match(migration, /payments_expired_timestamp_required/);
+  });
+
+  it("records additional captures separately without overwriting the primary payment reference", () => {
+    assert.match(reconciliationMigration, /CREATE TABLE payment_capture_reconciliation/i);
+    assert.match(reconciliationMigration, /payment_id UUID NOT NULL REFERENCES payments\(id\) ON DELETE RESTRICT/i);
+    assert.match(reconciliationMigration, /provider_payment_id TEXT NOT NULL/i);
+    assert.match(reconciliationMigration, /payment_capture_reconciliation_provider_payment_unique/i);
+    assert.match(reconciliationMigration, /status IN \('unresolved', 'resolved'\)/i);
+    assert.match(reconciliationMigration, /reason IN \('additional_capture', 'slot_unavailable'\)/i);
+    assert.doesNotMatch(reconciliationMigration, /DROP TABLE|DROP COLUMN|TRUNCATE/i);
+  });
+
+  it("sets the unapplied hold default beyond Stripe's Checkout expiry", () => {
+    assert.match(stripeBookingMigration, /ALTER COLUMN expires_at SET DEFAULT \(NOW\(\) \+ INTERVAL '40 minutes'\)/i);
+    assert.match(stripeBookingMigration, /Stripe Checkout Sessions expire after 35 minutes; the 40-minute hold/i);
   });
 });

@@ -88,8 +88,26 @@ Configure `NEXT_PUBLIC_API_URL` at frontend build time. Configure `PORT` and `FR
 
 The backend exposes `POST /api/v1/internal/reminders/run` for an external scheduler. Configure a Render Cron Job to POST to `https://<backend-service-host>/api/v1/internal/reminders/run` every five minutes, with the header `Authorization: Bearer <REMINDER_CRON_SECRET>`. Generate a random secret of at least 32 characters and set the same value as `REMINDER_CRON_SECRET` on the API service and Cron Job. The endpoint returns a count summary and is protected with a constant-time bearer-token comparison.
 
-Apply backend migrations with `npm --prefix backend run migrate` before enabling the Cron Job. `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, and `BREVO_SENDER_NAME` use the existing Brevo configuration. When any of these values or a patient email is missing, the scheduler skips delivery and retries on a later run. Reminders are sent 24 hours and 1 hour before the appointment, using `APPLICATION_TIMEZONE` (configured as `Asia/Kolkata` for this application). PostgreSQL stores unique delivery keys and processing leases so scheduler retries and multiple instances do not issue duplicate reminder sends.
+Ensure the required reminder migration is applied before enabling the Cron Job. Check the migration ledger first and apply only missing migrations individually. Do not rerun migrations that have already been applied. `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, and `BREVO_SENDER_NAME` use the existing Brevo configuration. When any of these values or a patient email is missing, the scheduler skips delivery and retries on a later run. Reminders are sent 24 hours and 1 hour before the appointment, using `APPLICATION_TIMEZONE` (configured as `Asia/Kolkata` for this application). PostgreSQL stores unique delivery keys and processing leases so scheduler retries and multiple instances do not issue duplicate reminder sends.
 
-### Future payment schema
+### Appointment payment records and slot holds
 
-Migration 008 prepares payment, refund, provider-event, and appointment-slot-hold records; it does not change the current immediate-confirmation booking flow. The recommended temporary checkout hold is **10 minutes**. Future hold creation must claim the availability slot transactionally, and expired active holds must be marked expired before another patient can claim the slot. Payment attempts can be retried after `failed` or `expired` status; a pending, captured, or refunded payment remains unique per appointment or hold. Payment amounts should snapshot the doctor's consultation fee when the future payment flow is implemented.
+Migration 008 adds payment, refund, provider-event, and appointment-slot-hold records. Migration 009 adds hold reason metadata and sets the default hold duration to **40 minutes**. This flow configures Stripe Checkout Sessions to expire after 35 minutes, leaving a five-minute buffer for the local hold. The longer local hold prevents a Checkout Session from remaining payable after its slot hold is released. Checkout expiration events release the hold earlier, and captured payments received after a competing booking are recorded for reconciliation without creating a conflicting appointment. Payment amounts are taken from and snapshot the doctor's consultation fee stored in PostgreSQL.
+
+### Stripe Test Mode
+
+Paid booking uses Stripe-hosted Checkout in one-time payment mode. The backend creates each session from the server-side consultation fee, stores its session ID in `payments.provider_order_id`, and stores the associated PaymentIntent ID in `payments.provider_payment_id`. The frontend receives only the hosted Checkout URL and redirects there; it does not need a publishable key. Return URLs are not treated as payment proof: payment status is retrieved and checked by the backend, while signed webhooks process `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, and `checkout.session.expired`.
+
+Before enabling paid booking in any target database, verify that migrations 008, 009, and 010 have been applied. Check the migration ledger first and apply only missing migration files individually, in dependency order. Do not rerun migrations that have already been applied. The development Neon database already has all three migrations applied.
+
+Configure `STRIPE_SECRET_KEY=sk_test_...` and `STRIPE_WEBHOOK_SECRET=whsec_...` on the backend. The backend rejects non-test secret keys. Do not set live Stripe credentials.
+
+For local webhook testing, install and authenticate the [Stripe CLI](https://docs.stripe.com/stripe-cli), then run:
+
+```bash
+stripe listen --forward-to localhost:3001/api/v1/payments/webhook
+```
+
+Copy the printed `whsec_...` value into the backend's local environment. Trigger or complete test Checkout payments and keep the CLI listener running.
+
+For deployment, create a Test Mode webhook endpoint at `https://<backend-service-host>/api/v1/payments/webhook` in the Stripe Dashboard and subscribe it to the four Checkout Session events above. Use that endpoint's signing secret as `STRIPE_WEBHOOK_SECRET`. The Dashboard secret differs from the local CLI forwarding secret.

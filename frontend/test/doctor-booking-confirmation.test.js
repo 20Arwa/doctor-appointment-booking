@@ -1,8 +1,10 @@
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const { describe, it } = require("node:test");
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, it } from "node:test";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const page = fs.readFileSync(path.join(__dirname, "..", "components", "doctor-booking-page.tsx"), "utf8");
 
 describe("doctor booking confirmation dialog", () => {
@@ -14,7 +16,11 @@ describe("doctor booking confirmation dialog", () => {
     assert.match(bookingHandler, /setBookingDialogOpen\(true\)/);
     assert.doesNotMatch(bookingHandler, /createAppointment\(/);
     assert.ok(confirmHandler);
-    assert.match(confirmHandler, /createAppointment\(/);
+    assert.match(confirmHandler, /createAppointmentPaymentOrder\(/);
+    assert.match(confirmHandler, /createAppointmentPaymentOrder\(/);
+    assert.match(confirmHandler, /window\.location\.assign\(order\.checkout_url\)/);
+    assert.doesNotMatch(confirmHandler, /verifyAppointmentPayment\(/);
+    assert.doesNotMatch(confirmHandler, /createAppointment\(/);
     assert.match(page, /<AlertDialogCancel disabled=\{booking\}>Go back<\/AlertDialogCancel>/);
   });
 
@@ -22,6 +28,7 @@ describe("doctor booking confirmation dialog", () => {
     assert.match(page, /Dr\. \{doctor\.first_name\} \{doctor\.last_name\}/);
     assert.match(page, /formatSlotDate\(selectedSlot\.date\)\} at \{formatSlotTime\(selectedSlot\.start_time\)\} IST/);
     assert.match(page, /inrFormatter\.format\(doctor\.consultation_fee\)/);
-    assert.match(page, /Online payment is not enabled yet/);
+    assert.match(page, /Pay in Stripe Test Mode/);
+    assert.match(page, /held for up to 40 minutes/);
   });
 });
