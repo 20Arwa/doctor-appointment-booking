@@ -4,7 +4,8 @@ import { useAuth } from "@clerk/nextjs";
 import { ArrowLeft, CalendarClock, CheckCircle2, RefreshCw, Stethoscope } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
+import { z } from "zod";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -16,6 +17,8 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { AppShellLoading } from "@/components/app-shell-loading";
+import { CheckoutReturnNotice, type CheckoutReturnState } from "@/components/checkout-return-notice";
 import { cancelAppointmentPaymentOrder, createAppointmentPaymentOrder, getAppointmentPaymentStatus, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
@@ -82,9 +85,12 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   const [bookingDialogOpen, setBookingDialogOpen] = useState(false);
   const [confirmation, setConfirmation] = useState<PatientAppointment | null>(null);
   const [paymentPendingId, setPaymentPendingId] = useState<string | null>(null);
+  const [checkoutReturn, setCheckoutReturn] = useState<CheckoutReturnState>(null);
   const [checkingPayment, setCheckingPayment] = useState(false);
   const [, startTransition] = useTransition();
   const submissionInProgress = useRef(false);
+  const paymentCheckInProgress = useRef(false);
+  const checkoutReturnProcessed = useRef(false);
 
   const routeKey = `${pathname}:${doctorId}`;
   const [previousRouteKey, setPreviousRouteKey] = useState(routeKey);
@@ -126,21 +132,6 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
     return () => { active = false; };
   }, [doctorId, getToken, pathname, retryKey]);
 
-  useEffect(() => {
-    const query = new URLSearchParams(window.location.search);
-    const returnedPaymentId = query.get("payment_id");
-    if (!returnedPaymentId) return;
-    startTransition(() => setPaymentPendingId(returnedPaymentId));
-    if (query.get("checkout") === "cancelled") {
-      startTransition(() => setBookingError("Closing the Checkout Session and checking its payment status…"));
-      void getToken().then(async (token) => {
-        if (token) await cancelAppointmentPaymentOrder(token, returnedPaymentId);
-      }).catch(() => {});
-    } else if (query.has("session_id")) {
-      startTransition(() => setBookingError("Checkout returned to Medrella. Verify the payment status below; the redirect itself does not confirm an appointment."));
-    }
-  }, [doctorId, getToken, pathname, startTransition]);
-
   async function handleBooking(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedSlotId || !slots.some((slot) => slot.id === selectedSlotId) || submissionInProgress.current) return;
@@ -154,13 +145,12 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
 
     submissionInProgress.current = true;
     setBooking(true);
+    setBookingDialogOpen(false);
     setBookingError(null);
     try {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
       const order = await createAppointmentPaymentOrder(token, selectedSlotId, reason.trim() || undefined, crypto.randomUUID());
-      setBookingDialogOpen(false);
-      setPaymentPendingId(order.payment_id);
       window.location.assign(order.checkout_url);
     } catch (error) {
       setBookingError(formatBookingError(error));
@@ -170,36 +160,73 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
     }
   }
 
-  async function checkPaymentStatus() {
-    if (!paymentPendingId || checkingPayment) return;
+  const checkPaymentStatus = useCallback(async (requestedPaymentId: string | null, preserveReturnMessage = false) => {
+    if (!requestedPaymentId || paymentCheckInProgress.current) return;
+    paymentCheckInProgress.current = true;
     setCheckingPayment(true);
     try {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
-      const status = await getAppointmentPaymentStatus(token, paymentPendingId);
+      const status = await getAppointmentPaymentStatus(token, requestedPaymentId);
       if (status.appointment) {
         setConfirmation(status.appointment);
         setPaymentPendingId(null);
+        setCheckoutReturn(null);
         setSlots((current) => current.filter((slot) => slot.id !== status.appointment?.availability_id));
         setBookingError(null);
       } else if (status.status === "failed" || status.status === "cancelled" || status.status === "expired") {
         setPaymentPendingId(null);
-        setBookingError("This payment attempt did not complete. Select the appointment time again to retry.");
+        setCheckoutReturn("cancelled");
+        setBookingError("Payment was not completed. Your appointment is not confirmed. You can choose a time and try again.");
         setRetryKey((key) => key + 1);
       } else if (status.status === "captured") {
         setPaymentPendingId(null);
+        setCheckoutReturn("captured");
         setBookingError(`Your payment was received, but the appointment could not be confirmed. Contact Medrella support${status.reconciliation_id ? ` with reference ${status.reconciliation_id}` : ""}.`);
       } else {
-        setBookingError("Payment is still being verified. Check again in a few seconds.");
+        setBookingError(preserveReturnMessage
+          ? "You returned from Checkout. Payment is still being verified. Your appointment is not confirmed yet."
+          : "Payment is still being verified. Check again in a few seconds.");
       }
     } catch (error) {
       setBookingError(formatBookingError(error));
     } finally {
       setCheckingPayment(false);
+      paymentCheckInProgress.current = false;
     }
-  }
+  }, [getToken]);
+
+  useEffect(() => {
+    if (checkoutReturnProcessed.current) return;
+    const query = new URLSearchParams(window.location.search);
+    const returnedPaymentId = query.get("payment_id");
+    if (!returnedPaymentId || !z.string().uuid().safeParse(returnedPaymentId).success) return;
+    checkoutReturnProcessed.current = true;
+    startTransition(() => setPaymentPendingId(returnedPaymentId));
+    if (query.get("checkout") === "cancelled") {
+      startTransition(() => {
+        setCheckoutReturn("cancelling");
+        setBookingError("You returned from Checkout. We’re checking whether payment completed. Your appointment is not confirmed yet.");
+      });
+      void getToken().then(async (token) => {
+        if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+        await cancelAppointmentPaymentOrder(token, returnedPaymentId);
+        await checkPaymentStatus(returnedPaymentId, true);
+      }).catch((error) => {
+        setBookingError(error instanceof Error ? error.message : "You returned from Checkout. We couldn't verify payment yet. Your appointment is not confirmed.");
+      });
+    } else if (query.has("session_id")) {
+      startTransition(() => {
+        setCheckoutReturn("success");
+        setBookingError("Checkout returned to Medrella. We’re verifying payment; this redirect does not confirm an appointment.");
+      });
+      queueMicrotask(() => void checkPaymentStatus(returnedPaymentId));
+    }
+  }, [checkPaymentStatus, doctorId, getToken, pathname, startTransition]);
 
   const selectedSlot = slots.find((slot) => slot.id === selectedSlotId) ?? null;
+
+  if (booking) return <AppShellLoading message="Redirecting to secure checkout…" />;
 
   function retryLoading() {
     setLoading(true);
@@ -254,16 +281,16 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
             </section>
           ) : null}
 
-          {paymentPendingId ? (
-            <section className="rounded-2xl border border-border bg-card p-5" aria-live="polite">
-              <h2 className="font-semibold text-card-foreground">Payment verification pending</h2>
-              <p className="mt-2 text-sm text-muted-foreground">We’re waiting for Stripe to confirm the payment. The return redirect does not confirm the appointment; Stripe payment status is checked server-side.</p>
-              <Button type="button" className="mt-4" disabled={checkingPayment} onClick={() => void checkPaymentStatus()}>
+          <CheckoutReturnNotice
+            state={checkoutReturn}
+            paymentPendingId={paymentPendingId}
+            message={bookingError}
+            statusAction={paymentPendingId ? (
+              <Button type="button" className="mt-4" disabled={checkingPayment} onClick={() => void checkPaymentStatus(paymentPendingId, checkoutReturn === "cancelling")}>
                 {checkingPayment ? "Checking…" : "Check payment status"}
               </Button>
-            </section>
-          ) : null}
-
+            ) : null}
+          />
           <section className="rounded-3xl border border-border bg-card p-6 shadow-sm sm:p-8" aria-labelledby="available-times-title">
             <div className="flex items-center gap-3">
               <CalendarClock aria-hidden="true" className="size-5 text-primary" />
@@ -294,7 +321,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
                   <p className="mt-1 text-right text-xs text-muted-foreground">{reason.length}/2000</p>
                 </div>
 
-                {bookingError ? (
+                {bookingError && !checkoutReturn ? (
                   <div className="rounded-xl border border-destructive/40 bg-destructive/5 p-4" role="alert">
                     <p className="text-sm text-foreground">{bookingError}</p>
                     {bookingError.includes("no longer available") ? <button type="button" onClick={retryLoading} className="mt-3 inline-flex min-h-9 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"><RefreshCw aria-hidden="true" className="size-4" /> Refresh available times</button> : null}

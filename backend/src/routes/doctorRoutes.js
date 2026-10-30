@@ -7,7 +7,7 @@ const { createDoctorSlots, deleteDoctorSlot, getDoctorSlots } = require("../cont
 const { doctorIdParamsSchema, slotParamsSchema, slotQuerySchema, slotsBodySchema } = require("../validators/availabilitySchemas");
 
 const router = express.Router();
-router.get("/:id/slots", validate(doctorIdParamsSchema, "params"), validate(slotQuerySchema, "query"), getDoctorSlots);
+router.get("/:id/slots", validate(doctorIdParamsSchema, "params"), validate(slotQuerySchema, "query"), requireClerkIdentity, requireLocalUser, getDoctorSlots);
 router.post("/:id/slots", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(slotsBodySchema, "body"), createDoctorSlots);
 router.delete("/:id/slots/:slotId", validate(slotParamsSchema, "params"), requireClerkIdentity, requireLocalUser, deleteDoctorSlot);
 router.get("/", listDoctors);
