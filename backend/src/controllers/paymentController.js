@@ -19,6 +19,9 @@ function createPaymentController({ service }) {
     status(request, response, next) {
       return handle(async () => response.status(200).json(await service.getPaymentStatus(response.locals.user, response.locals.params.id)), request, response, next);
     },
+    history(request, response, next) {
+      return handle(async () => response.status(200).json(await service.getPaymentHistory(response.locals.user)), request, response, next);
+    },
     cancel(request, response, next) {
       return handle(async () => response.status(200).json(await service.cancelCheckoutSession(response.locals.user, response.locals.params.id)), request, response, next);
     },

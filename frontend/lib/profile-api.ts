@@ -69,9 +69,64 @@ const paymentOrderSchema = z.object({
 });
 
 const paymentStatusSchema = z.object({
-  status: z.enum(["created", "pending", "authorized", "captured", "failed", "cancelled", "expired"]),
+  status: z.enum(["created", "pending", "authorized", "captured", "failed", "cancelled", "expired", "partially_refunded", "refunded"]),
   appointment: appointmentSchema.nullable(),
   reconciliation_id: z.string().uuid().nullable().optional(),
+});
+
+const paymentHistoryRefundSchema = z.object({
+  id: z.string().uuid(),
+  amount: z.string().regex(/^\d+(\.\d{1,2})?$/),
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  status: z.enum(["pending", "processed", "failed", "cancelled"]),
+  reason: z.string().nullable(),
+  created_at: z.string(),
+  processed_at: z.string().nullable(),
+});
+
+const paymentHistoryAppointmentSchema = z.object({
+  id: z.string().uuid().nullable().optional(),
+  status: z.enum(["confirmed", "cancelled", "completed"]).nullable().optional(),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  start_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
+  end_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
+  doctor: z.object({
+    id: z.string().uuid(),
+    first_name: z.string(),
+    last_name: z.string(),
+    specialty: z.string(),
+  }).nullable(),
+});
+
+const paymentHistoryItemSchema = z.object({
+  id: z.string().uuid(),
+  amount: z.string().regex(/^\d+(\.\d{1,2})?$/),
+  currency: z.string().regex(/^[A-Z]{3}$/),
+  status: z.enum(["created", "pending", "authorized", "captured", "failed", "cancelled", "expired", "partially_refunded", "refunded"]),
+  date: z.string(),
+  receipt_url: z.string().url().refine((value) => {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" && url.hostname === "pay.stripe.com";
+    } catch {
+      return false;
+    }
+  }).nullable(),
+  appointment: paymentHistoryAppointmentSchema.nullable(),
+  refunds: z.array(paymentHistoryRefundSchema),
+});
+
+const cancellationRefundPreviewSchema = z.object({
+  original_payment: z.object({
+    amount: z.string().regex(/^\d+(\.\d{1,2})?$/),
+    currency: z.string().regex(/^[A-Z]{3}$/),
+    status: z.enum(["created", "pending", "authorized", "captured", "failed", "cancelled", "expired", "partially_refunded", "refunded"]),
+  }).nullable(),
+  refund_percentage: z.number().int().min(0).max(100),
+  estimated_refund_amount: z.string().regex(/^\d+(\.\d{1,2})?$/),
+  currency: z.string().regex(/^[A-Z]{3}$/).nullable(),
+  refund_expected: z.boolean(),
+  explanation: z.string(),
 });
 
 export type LocalProfile = z.infer<typeof localProfileSchema>;
@@ -80,6 +135,8 @@ export type PatientAppointment = z.infer<typeof appointmentSchema>;
 export type AvailabilitySlot = z.infer<typeof availabilitySlotSchema>;
 export type PaymentOrder = z.infer<typeof paymentOrderSchema>;
 export type PaymentStatus = z.infer<typeof paymentStatusSchema>;
+export type PatientPaymentHistoryItem = z.infer<typeof paymentHistoryItemSchema>;
+export type CancellationRefundPreview = z.infer<typeof cancellationRefundPreviewSchema>;
 
 type ValidationDetail = { path: string; message: string };
 
@@ -213,6 +270,20 @@ export async function getAppointmentPaymentStatus(token: string, paymentId: stri
   const payload = await request<unknown>(token, `/payments/${encodeURIComponent(paymentId)}/status`);
   const parsed = paymentStatusSchema.safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete payment status response.");
+  return parsed.data;
+}
+
+export async function getPatientPaymentHistory(token: string): Promise<PatientPaymentHistoryItem[]> {
+  const payload = await request<unknown>(token, "/payments/history");
+  const parsed = z.array(paymentHistoryItemSchema).safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete payment history.");
+  return parsed.data;
+}
+
+export async function getAppointmentCancellationRefundPreview(token: string, appointmentId: string): Promise<CancellationRefundPreview> {
+  const payload = await request<unknown>(token, `/appointments/${encodeURIComponent(appointmentId)}/cancellation-preview`);
+  const parsed = cancellationRefundPreviewSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete cancellation refund estimate.");
   return parsed.data;
 }
 

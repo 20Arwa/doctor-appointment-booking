@@ -44,14 +44,22 @@ const getAppointment = handle(async (_request, response) => ({
   ),
 }));
 
+const previewCancellationRefund = handle(async (_request, response) => ({
+  body: await response.locals.paymentService.previewCancellationRefund(
+    response.locals.user,
+    response.locals.params.id,
+  ),
+}));
+
 const cancelAppointment = handle(async (_request, response) => {
   const appointment = await appointmentService.cancelAppointment(
     response.locals.database,
     response.locals.user,
     response.locals.params.id,
   );
+  const refund = await response.locals.paymentService.refundCancelledAppointment(response.locals.user, appointment);
   await notify(response, "cancelled", appointment);
-  return { body: appointment };
+  return { body: { ...appointment, refund } };
 });
 
 const rescheduleAppointment = handle(async (_request, response) => {
@@ -89,5 +97,6 @@ module.exports = {
   createAppointment,
   getAppointment,
   listAppointments,
+  previewCancellationRefund,
   rescheduleAppointment,
 };
