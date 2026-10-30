@@ -62,7 +62,7 @@ async function requireOwnDoctorId(database, user) {
 
 async function lockBookableSlot(client, availabilityId, now) {
   const result = await client.query(
-    `SELECT av.id, av.doctor_id, av.date::text AS date,
+    `SELECT av.id, av.doctor_id, av.deleted_at, av.date::text AS date,
             av.start_time::text AS start_time, av.end_time::text AS end_time
      FROM availability av
      JOIN doctors d ON d.id = av.doctor_id
@@ -73,6 +73,7 @@ async function lockBookableSlot(client, availabilityId, now) {
   );
   const slot = result.rows[0];
   if (!slot) fail(404, "SLOT_NOT_FOUND", "Availability slot not found");
+  if (slot.deleted_at) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer bookable");
   if (!slotStartsInFuture(slot, now)) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer bookable");
   return slot;
 }
@@ -243,10 +244,11 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
     );
     if (conflict.rows[0]) fail(409, "DOCTOR_TIME_CONFLICT", "The selected time overlaps another confirmed appointment");
     const targetSlot = await client.query(
-      `SELECT id FROM availability
+      `SELECT id, deleted_at FROM availability
        WHERE doctor_id = $1 AND date = $2::date AND start_time = $3::time AND end_time = $4::time`,
       [doctorId, input.date, input.start_time, input.end_time],
     );
+    if (targetSlot.rows[0]?.deleted_at) fail(409, "SLOT_UNAVAILABLE", "The selected availability slot has been removed");
     const availabilityId = targetSlot.rows[0]?.id ?? original.availability_id;
     const updated = await client.query(
       `UPDATE appointments SET availability_id = $2, scheduled_date = $3::date,

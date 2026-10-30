@@ -50,12 +50,21 @@ const availabilitySlotSchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   start_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
   end_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
+  hold_status: z.literal("active").nullable().optional(),
+  hold_expires_at: z.string().nullable().optional(),
 });
 
 const paymentOrderSchema = z.object({
   payment_id: z.string().uuid(),
   session_id: z.string().startsWith("cs_test_"),
-  checkout_url: z.string().url(),
+  checkout_url: z.string().url().refine((value) => {
+    try {
+      const checkoutUrl = new URL(value);
+      return checkoutUrl.protocol === "https:" && checkoutUrl.hostname === "checkout.stripe.com";
+    } catch {
+      return false;
+    }
+  }, "The server returned an invalid Stripe Checkout URL."),
   expires_at: z.string(),
 });
 

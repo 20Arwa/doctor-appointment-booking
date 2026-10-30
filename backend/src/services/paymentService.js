@@ -34,9 +34,9 @@ async function withTransaction(database, operation) {
   }
 }
 
-async function lockSlot(client, availabilityId) {
+async function lockSlot(client, availabilityId, { requireActive = false } = {}) {
   const result = await client.query(
-    `SELECT av.id, av.doctor_id, av.date::text AS date, av.start_time::text AS start_time,
+    `SELECT av.id, av.doctor_id, av.deleted_at, av.date::text AS date, av.start_time::text AS start_time,
             av.end_time::text AS end_time, d.consultation_fee::text AS fee
      FROM availability av JOIN doctors d ON d.id = av.doctor_id
      JOIN users du ON du.id = d.user_id
@@ -45,6 +45,7 @@ async function lockSlot(client, availabilityId) {
     [availabilityId],
   );
   if (!result.rows[0]) fail(404, "SLOT_NOT_FOUND", "Availability slot not found");
+  if (requireActive && result.rows[0].deleted_at) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer available for payment");
   return result.rows[0];
 }
 
@@ -151,7 +152,7 @@ function createPaymentService({ database, stripe, emailNotificationService, fron
       const patientResult = await client.query("SELECT id FROM patients WHERE user_id = $1", [user.id]);
       const patientId = patientResult.rows[0]?.id;
       if (!patientId) fail(403, "PATIENT_PROFILE_REQUIRED", "An existing patient profile is required to book appointments");
-      const slot = await lockSlot(client, input.availability_id);
+      const slot = await lockSlot(client, input.availability_id, { requireActive: true });
       await lockDoctor(client, slot.doctor_id);
       await expireHoldsForSchedule(client, slot.doctor_id, slot.date);
 

@@ -25,8 +25,8 @@ const doctorUser = { id: doctorUserId, role: "doctor", is_active: true, first_na
 const otherUser = { id: otherUserId, role: "patient", is_active: true, first_name: "Other", last_name: "Patient" };
 const registeredPatientEmail = "pia@example.test";
 
-function makeSlot(id, start_time = "10:00", date = "2099-04-10") {
-  return { id, doctor_id: doctorId, date, start_time, end_time: "10:30", doctor_active: true };
+function makeSlot(id, start_time = "10:00", date = "2099-04-10", deleted_at = null) {
+  return { id, doctor_id: doctorId, date, start_time, end_time: "10:30", doctor_active: true, deleted_at };
 }
 
 function makeAppointment({ id = appointmentId, availability_id = firstSlotId, status = "confirmed", reason = "Checkup", cancelled_at = null } = {}) {
@@ -101,10 +101,10 @@ function createDatabase({
           }
           if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
           if (sql.includes("FROM appointment_slot_holds h") && sql.includes("h.expires_at > NOW()")) return { rows: [] };
-          if (sql.startsWith("SELECT id FROM availability")) {
+          if (sql.startsWith("SELECT id, deleted_at FROM availability")) {
             const [ownerDoctorId, date, start, end] = values;
             const slot = state.slots.find((item) => item.doctor_id === ownerDoctorId && item.date === date && item.start_time === start && item.end_time === end);
-            return { rows: slot ? [{ id: slot.id }] : [] };
+            return { rows: slot ? [{ id: slot.id, deleted_at: slot.deleted_at }] : [] };
           }
           if (sql.includes("FROM availability av") && sql.includes("FOR UPDATE OF av")) {
             const [slotId] = values;
@@ -254,7 +254,7 @@ describe("appointment schemas and migration", () => {
     const directory = path.join(__dirname, "..", "migrations");
     const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(files.length, 10);
+    assert.equal(files.length, 11);
     assert.match(files[3], /^004_.*\.sql$/);
     assert.equal(files[4], "005_appointment_schedule_snapshot.sql");
     assert.equal(files[5], "006_doctor_consultation_fee.sql");
@@ -262,6 +262,7 @@ describe("appointment schemas and migration", () => {
     assert.equal(files[7], "008_payment_refund_schema.sql");
     assert.equal(files[8], "009_payment_booking_reason.sql");
     assert.equal(files[9], "010_payment_capture_reconciliation.sql");
+    assert.equal(files[10], "011_availability_soft_delete.sql");
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);
@@ -272,6 +273,26 @@ describe("appointment schemas and migration", () => {
 });
 
 describe("appointment workflows", () => {
+  it("keeps historical appointments visible through a soft-deleted availability row", async () => {
+    const pastSlot = makeSlot(firstSlotId, "10:00", "2000-04-10", "2026-10-30T00:00:00.000Z");
+    const historical = makeAppointment({ status: "completed" });
+    historical.scheduled_date = "2000-04-10";
+    historical.scheduled_start_time = "10:00";
+    historical.scheduled_end_time = "10:30";
+    const { app } = createTestApp({ database: createDatabase({ slots: [pastSlot], appointments: [historical] }) });
+    await withServer(app, async (url) => {
+      const list = await fetch(`${url}/api/v1/appointments?status=completed`);
+      assert.equal(list.status, 200);
+      const rows = await list.json();
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].availability_id, firstSlotId);
+      assert.equal(rows[0].status, "completed");
+      const detail = await fetch(`${url}/api/v1/appointments/${appointmentId}`);
+      assert.equal(detail.status, 200);
+      assert.equal((await detail.json()).availability_id, firstSlotId);
+    });
+  });
+
   it("keeps cancellation and rescheduling notifications for existing appointments", async () => {
     const notifications = [];
     const emailNotificationService = { sendAppointmentNotification: async (...args) => notifications.push(args) };

@@ -55,6 +55,14 @@ function formatTime(time: string) {
   return `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
 }
 
+function formatHoldExpiry(value: string) {
+  const expiresAt = new Date(value);
+  if (Number.isNaN(expiresAt.getTime())) return null;
+  return new Intl.DateTimeFormat("en-IN", {
+    dateStyle: "medium", timeStyle: "short", timeZone: APPLICATION_TIME_ZONE,
+  }).format(expiresAt);
+}
+
 function apiErrorMessage(error: unknown, fallback: string) {
   if (error instanceof ProfileApiError && error.status === 409) return error.message;
   return error instanceof Error ? error.message : fallback;
@@ -156,11 +164,11 @@ export function DoctorAvailabilityPage() {
       await deleteDoctorSlot(token, doctorId, slot.id);
       setDeleteTarget(null);
       refreshSlots();
-      notifySuccess("Availability slot deleted.", `availability-delete-${slot.id}`);
+      notifySuccess("Availability slot removed from active availability.", `availability-delete-${slot.id}`);
     } catch (error) {
       if (error instanceof ProfileApiError && error.status === 409) {
         refreshSlots();
-        setDeleteError("This slot is now linked to appointment history and cannot be deleted. The list has been refreshed.");
+        setDeleteError(`${error.message} The availability list is being refreshed.`);
       } else {
         setDeleteError(apiErrorMessage(error, "We couldn't delete this slot. Please try again."));
       }
@@ -214,7 +222,7 @@ export function DoctorAvailabilityPage() {
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <h2 id="existing-slots-title" className="text-xl font-semibold text-foreground">Upcoming available slots</h2>
-            <p className="mt-1 text-sm text-muted-foreground">Booked and past slots are excluded by the availability API.</p>
+            <p className="mt-1 text-sm text-muted-foreground">Upcoming slots are listed here. Checkout holds are marked while payment is pending.</p>
           </div>
           <button type="button" onClick={() => refreshSlots()} disabled={loading} className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-60"><RefreshCw aria-hidden="true" className="size-4" /> Refresh</button>
         </div>
@@ -235,6 +243,11 @@ export function DoctorAvailabilityPage() {
                   <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-secondary text-secondary-foreground"><Clock3 aria-hidden="true" className="size-5" /></span>
                   <div>
                     <p className="font-medium text-card-foreground">{formatDate(slot.date)}</p>
+                    {slot.hold_status === "active" && slot.hold_expires_at ? (
+                      <p className="mt-2 text-sm font-medium text-primary" role="status">
+                        Temporarily on hold — payment pending until {formatHoldExpiry(slot.hold_expires_at)} IST
+                      </p>
+                    ) : null}
                     <p className="mt-1 text-sm text-muted-foreground">{formatTime(slot.start_time)}–{formatTime(slot.end_time)} IST</p>
                   </div>
                 </div>

@@ -70,8 +70,8 @@ function createIdempotentStripeClient({ loseFirstResponse = false } = {}) {
   return { providerSessions, stripeClient, stripe: createStripeService({ config, stripeClient }) };
 }
 
-function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 60 * 1000).toISOString(), failPersistOrder = false } = {}) {
-  const state = { payment: null, hold: null, calls: [], holdCount: 0, paymentCount: 0, appointmentCount: 0 };
+function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 60 * 1000).toISOString(), failPersistOrder = false, slotDeleted = false, competingHold = false } = {}) {
+  const state = { payment: null, hold: null, calls: [], holdCount: 0, paymentCount: 0, appointmentCount: 0, competingHold };
   let shouldFailPersistOrder = failPersistOrder;
   const reservationRow = () => state.payment && state.hold ? [{
     id: state.payment.id,
@@ -104,7 +104,7 @@ function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 
           state.calls.push(sql);
           if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
           if (sql === "SELECT id FROM patients WHERE user_id = $1") return { rows: [{ id: patientId }] };
-          if (sql.includes("FOR UPDATE OF av, d")) return { rows: [{ ...slot }] };
+          if (sql.includes("FOR UPDATE OF av, d")) return { rows: [{ ...slot, deleted_at: slotDeleted ? "2026-10-30T00:00:00.000Z" : null }] };
           if (sql.includes("pg_advisory_xact_lock")) {
             if (heldLocks.length) return { rows: [] };
             const previous = advisoryLockTail;
@@ -123,7 +123,8 @@ function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 
           }
           if (sql.startsWith("UPDATE payments p SET status = 'expired'")) return { rows: [] };
           if (sql.startsWith("UPDATE appointment_slot_holds h SET status = 'expired'")) return { rows: [] };
-          if (sql.includes("FROM appointments a JOIN availability av") || sql.includes("FROM appointment_slot_holds h JOIN availability av")) return { rows: [] };
+          if (sql.includes("FROM appointments a JOIN availability av")) return { rows: [] };
+          if (sql.includes("FROM appointment_slot_holds h JOIN availability av")) return { rows: state.competingHold ? [{ id: holdId }] : [] };
           if (sql.startsWith("INSERT INTO appointment_slot_holds")) {
             state.hold = { id: holdId, availability_id: values[0], patient_id: values[1], reason: values[2], status: "active", expires_at: holdExpiresAt };
             state.holdCount += 1;
@@ -154,7 +155,7 @@ function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 
   };
 }
 
-function createPaymentDatabase({ competingBooking = false } = {}) {
+function createPaymentDatabase({ competingBooking = false, slotDeleted = false } = {}) {
   const state = {
     payment: { id: paymentId, provider: "stripe", provider_order_id: sessionId, provider_payment_id: null, amount: "500.00", currency: "INR", status: "pending", appointment_id: null, slot_hold_id: holdId, patient_id: patientId, availability_id: availabilityId, reason: "Review" },
     hold: { id: holdId, status: "active", patient_id: patientId, availability_id: availabilityId },
@@ -186,7 +187,7 @@ function createPaymentDatabase({ competingBooking = false } = {}) {
         async query(sql, values = []) {
           state.calls.push(sql);
           if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
-          if (sql.includes("FOR UPDATE OF av, d") || (sql.includes("FROM availability av") && sql.includes("FOR UPDATE OF av"))) return { rows: [{ ...slot }] };
+          if (sql.includes("FOR UPDATE OF av, d") || (sql.includes("FROM availability av") && sql.includes("FOR UPDATE OF av"))) return { rows: [{ ...slot, deleted_at: slotDeleted ? "2026-10-30T00:00:00.000Z" : null }] };
           if (sql.includes("pg_advisory_xact_lock")) {
             if (heldLocks.length) return { rows: [] };
             const previous = advisoryLockTail;
@@ -404,6 +405,34 @@ describe("Stripe Test Mode adapter", () => {
 });
 
 describe("Stripe appointment Checkout", () => {
+  it("rejects a new payment hold while another active unexpired Checkout hold exists", async () => {
+    const database = createReservationDatabase({ competingHold: true });
+    const service = createPaymentService({ database, stripe: {}, frontendOrigin: "https://medrella.example" });
+    await assert.rejects(
+      service.createCheckoutSession(patient, { availability_id: availabilityId, idempotency_key: paymentId }),
+      { code: "SLOT_UNAVAILABLE" },
+    );
+    assert.equal(database.state.holdCount, 0);
+    assert.equal(database.state.paymentCount, 0);
+  });
+
+  it("does not create payment holds or Checkout Sessions for soft-deleted availability", async () => {
+    const database = createReservationDatabase({ slotDeleted: true });
+    let checkoutCalls = 0;
+    const service = createPaymentService({
+      database,
+      stripe: { async createCheckoutSession() { checkoutCalls += 1; } },
+      frontendOrigin: "https://medrella.example",
+    });
+    await assert.rejects(
+      service.createCheckoutSession(patient, { availability_id: availabilityId, idempotency_key: paymentId }),
+      { code: "SLOT_UNAVAILABLE" },
+    );
+    assert.equal(database.state.holdCount, 0);
+    assert.equal(database.state.paymentCount, 0);
+    assert.equal(checkoutCalls, 0);
+  });
+
   it("uses the locked doctor fee, INR minor units, Stripe idempotency, and a buffered slot hold", async () => {
     const database = createReservationDatabase();
     const sdk = createStripeClient();
@@ -691,6 +720,7 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     database.state.payment.status = "captured";
     database.state.payment.appointment_id = appointmentId;
     database.state.payment.slot_hold_id = null;
+    database.state.hold.status = "consumed";
     database.state.appointment = { ...appointment };
     database.state.hold.status = "consumed";
     const before = {
@@ -771,6 +801,27 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     assert.deepEqual(database.state.hold, before.hold);
     assert.equal(database.state.calls.length, before.calls);
     assert.equal(database.state.appointment, null);
+  });
+
+  it("never cancels or releases a payment hold after successful capture", async () => {
+    const database = createPaymentDatabase();
+    database.state.payment.status = "captured";
+    database.state.payment.appointment_id = appointmentId;
+    database.state.payment.slot_hold_id = null;
+    database.state.hold.status = "consumed";
+    database.state.appointment = { ...appointment };
+    const stripeCalls = [];
+    const stripe = {
+      async expireCheckoutSession(id) { stripeCalls.push(["expire", id]); throw new Error("must not expire captured payment"); },
+      async retrieveCheckoutSession(id) { stripeCalls.push(["retrieve", id]); throw new Error("must not retrieve captured payment"); },
+    };
+    const service = createPaymentService({ database, stripe, timeZone: "Asia/Kolkata" });
+    const before = { ...database.state.payment };
+    assert.deepEqual(await service.cancelCheckoutSession(patient, paymentId), { status: "captured" });
+    assert.deepEqual(database.state.payment, before);
+    assert.equal(database.state.appointment.status, "confirmed");
+    assert.equal(database.state.hold.status, "consumed");
+    assert.deepEqual(stripeCalls, []);
   });
 
   it("does not mutate payment data when both Stripe expiration and fallback retrieval fail", async () => {

@@ -19,7 +19,7 @@ const user = {
   is_active: true,
 };
 
-function createDatabase({ initialSlots = [], appointmentReferences = [], currentUser = user } = {}) {
+function createDatabase({ initialSlots = [], appointmentReferences = [], paymentHoldReferences = [], holdForeignKeyRaceReferences = [], currentUser = user } = {}) {
   const slots = initialSlots.map((slot, index) => ({
     id: slot.id || `44444444-4444-4444-8444-${String(index + 1).padStart(12, "0")}`,
     doctor_id: slot.doctor_id || doctorId,
@@ -28,6 +28,7 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], current
     end_time: slot.end_time,
     created_at: "2099-01-01T00:00:00.000Z",
     updated_at: "2099-01-01T00:00:00.000Z",
+    deleted_at: slot.deleted_at || null,
   }));
   const lockTails = new Map();
 
@@ -35,28 +36,32 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], current
     slots,
     lockQueries: [],
     availabilityQueries: [],
+    appointmentQueries: [],
+    holdQueries: [],
+    deleteQueries: [],
     async query(sql, values = []) {
       if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [currentUser] };
       if (sql === "SELECT id FROM doctors WHERE user_id = $1") {
         return { rows: values[0] === currentUser.id && currentUser.role === "doctor" ? [{ id: doctorId }] : [] };
       }
-      if (sql.startsWith("SELECT id, doctor_id, date::text AS date")) {
+      if (sql.startsWith("SELECT availability.id, availability.doctor_id, availability.date::text AS date")) {
         database.availabilityQueries.push(sql);
-        const [requestedDoctorId, currentDate, currentTime, from, to] = values;
+        const [requestedDoctorId, currentDate, currentTime, _timezone, from, to] = values;
+        const doctorManagementView = currentUser.role === "doctor" && requestedDoctorId === doctorId;
         return { rows: slots.filter((slot) => slot.doctor_id === requestedDoctorId
+          && !slot.deleted_at
           && (slot.date > currentDate || (slot.date === currentDate && slot.start_time > currentTime))
-          && (!from || slot.date >= from) && (!to || slot.date <= to)) };
-      }
-      if (sql.startsWith("DELETE FROM availability")) {
-        const [slotId, requestedDoctorId] = values;
-        if (appointmentReferences.includes(slotId)) {
-          const error = new Error("foreign key conflict");
-          error.code = "23503";
-          throw error;
-        }
-        const index = slots.findIndex((slot) => slot.id === slotId && slot.doctor_id === requestedDoctorId);
-        if (index < 0) return { rows: [] };
-        return { rows: [slots.splice(index, 1)[0]] };
+          && (!from || slot.date >= from) && (!to || slot.date <= to)
+          && !appointmentReferences.some((reference) => typeof reference !== "string"
+            && reference.id === slot.id && reference.status === "confirmed" && reference.ends_at > Date.now())
+          && (doctorManagementView || !paymentHoldReferences.some((reference) => typeof reference !== "string"
+            && reference.id === slot.id && reference.status === "active" && new Date(reference.expires_at).getTime() > Date.now())))
+          .map((slot) => {
+            const activeHold = paymentHoldReferences.find((reference) => typeof reference !== "string"
+              && reference.id === slot.id && reference.status === "active" && new Date(reference.expires_at).getTime() > Date.now());
+            return { ...slot, hold_status: doctorManagementView ? activeHold?.status ?? null : null,
+              hold_expires_at: doctorManagementView ? activeHold?.expires_at ?? null : null };
+          }) };
       }
       throw new Error(`Unexpected test query: ${sql}`);
     },
@@ -64,9 +69,15 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], current
       let staged = [];
       let releaseLocks = [];
       let ownsLock = false;
+      let pendingDeleteId = null;
+      let pendingSoftDeleteId = null;
       return {
         async query(sql, values = []) {
           if (sql === "BEGIN") return { rows: [] };
+          if (sql.startsWith("SELECT id FROM availability WHERE id = $1 AND doctor_id = $2 AND deleted_at IS NULL FOR UPDATE")) {
+            const [slotId, requestedDoctorId] = values;
+            return { rows: slots.some((slot) => slot.id === slotId && slot.doctor_id === requestedDoctorId && !slot.deleted_at) ? [{ id: slotId }] : [] };
+          }
           if (sql.startsWith("SELECT pg_advisory_xact_lock")) {
             database.lockQueries.push(values);
             const lockKey = values.join(":");
@@ -80,7 +91,41 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], current
           }
           if (sql.startsWith("SELECT date::text AS date")) {
             const [requestedDoctorId, dates] = values;
-            return { rows: slots.filter((slot) => slot.doctor_id === requestedDoctorId && dates.includes(slot.date)) };
+            return { rows: slots.filter((slot) => slot.doctor_id === requestedDoctorId && !slot.deleted_at && dates.includes(slot.date)) };
+          }
+          if (sql.startsWith("SELECT 1 FROM appointments") && sql.includes("status = 'confirmed'")) {
+            database.appointmentQueries.push(sql);
+            const active = appointmentReferences.some((reference) => typeof reference !== "string" && reference.id === values[0]
+              && reference.status === "confirmed" && reference.ends_at > Date.now());
+            return { rows: active ? [{ exists: 1 }] : [] };
+          }
+          if (sql.startsWith("SELECT 1 FROM appointment_slot_holds") && sql.includes("status = 'active'")) {
+            database.holdQueries.push(sql);
+            return { rows: paymentHoldReferences.some((reference) => typeof reference !== "string" && reference.id === values[0]
+              && reference.status === "active" && reference.expires_at > Date.now()) ? [{ exists: 1 }] : [] };
+          }
+          if (sql.startsWith("SELECT EXISTS (SELECT 1 FROM appointments")) {
+            const referenced = appointmentReferences.some((reference) => (typeof reference === "string" ? reference : reference.id) === values[0])
+              || paymentHoldReferences.some((reference) => (typeof reference === "string" ? reference : reference.id) === values[0]);
+            return { rows: [{ referenced }] };
+          }
+          if (sql.startsWith("UPDATE availability SET deleted_at")) {
+            pendingSoftDeleteId = values[0];
+            return { rows: [{ id: values[0] }] };
+          }
+          if (sql.startsWith("DELETE FROM availability")) {
+            const [slotId, requestedDoctorId] = values;
+            database.deleteQueries.push(sql);
+            if (holdForeignKeyRaceReferences.includes(slotId)) {
+              const error = new Error("foreign key conflict from appointment_slot_holds");
+              error.code = "23001";
+              error.constraint = "appointment_slot_holds_availability_id_fkey";
+              throw error;
+            }
+            const slot = slots.find((item) => item.id === slotId && item.doctor_id === requestedDoctorId && !item.deleted_at);
+            if (!slot) return { rows: [] };
+            pendingDeleteId = slotId;
+            return { rows: [{ id: slotId }] };
           }
           if (sql.startsWith("INSERT INTO availability")) {
             for (let index = 0; index < values.length; index += 4) {
@@ -92,6 +137,7 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], current
                 end_time: values[index + 3],
                 created_at: "2099-01-01T00:00:00.000Z",
                 updated_at: "2099-01-01T00:00:00.000Z",
+                deleted_at: null,
               });
             }
             return { rows: staged };
@@ -99,6 +145,16 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], current
           if (sql === "COMMIT") {
             slots.push(...staged);
             staged = [];
+            if (pendingDeleteId) {
+              const index = slots.findIndex((slot) => slot.id === pendingDeleteId);
+              if (index >= 0) slots.splice(index, 1);
+              pendingDeleteId = null;
+            }
+            if (pendingSoftDeleteId) {
+              const slot = slots.find((item) => item.id === pendingSoftDeleteId);
+              if (slot) slot.deleted_at = "2026-10-30T00:00:00.000Z";
+              pendingSoftDeleteId = null;
+            }
             for (const release of releaseLocks) release();
             releaseLocks = [];
             ownsLock = false;
@@ -106,6 +162,8 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], current
           }
           if (sql === "ROLLBACK") {
             staged = [];
+            pendingDeleteId = null;
+            pendingSoftDeleteId = null;
             for (const release of releaseLocks) release();
             releaseLocks = [];
             ownsLock = false;
@@ -182,7 +240,7 @@ describe("availability validation", () => {
   it("confirms the new migration follows Phase 1", () => {
     const migrationFiles = fs.readdirSync(path.join(__dirname, "..", "migrations")).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(migrationFiles.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(migrationFiles.length, 10);
+    assert.equal(migrationFiles.length, 11);
     assert.match(migrationFiles[3], /^004_.*\.sql$/);
     assert.equal(migrationFiles[4], "005_appointment_schedule_snapshot.sql");
     assert.equal(migrationFiles[5], "006_doctor_consultation_fee.sql");
@@ -190,12 +248,17 @@ describe("availability validation", () => {
     assert.equal(migrationFiles[7], "008_payment_refund_schema.sql");
     assert.equal(migrationFiles[8], "009_payment_booking_reason.sql");
     assert.equal(migrationFiles[9], "010_payment_capture_reconciliation.sql");
+    assert.equal(migrationFiles[10], "011_availability_soft_delete.sql");
     const sql = fs.readFileSync(path.join(__dirname, "..", "migrations", "002_doctor_availability.sql"), "utf8");
     assert.match(sql, /CREATE TABLE availability/i);
     assert.match(sql, /doctor_id UUID NOT NULL REFERENCES doctors\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /CHECK \(end_time > start_time\)/i);
     assert.match(sql, /UNIQUE INDEX availability_doctor_date_start_unique\s+ON availability \(doctor_id, date, start_time\)/i);
     assert.match(sql, /CREATE INDEX availability_date_idx ON availability \(date\)/i);
+    const softDeleteSql = fs.readFileSync(path.join(__dirname, "..", "migrations", "011_availability_soft_delete.sql"), "utf8");
+    assert.match(softDeleteSql, /ADD COLUMN deleted_at TIMESTAMPTZ/i);
+    assert.match(softDeleteSql, /WHERE deleted_at IS NULL/i);
+    assert.doesNotMatch(softDeleteSql, /ON DELETE CASCADE|DROP TABLE/i);
   });
 });
 
@@ -216,6 +279,68 @@ describe("availability endpoints", () => {
       assert.equal(response.status, 200);
       assert.equal((await response.json()).length, 2);
       assert.match(database.availabilityQueries[0], /NOT EXISTS[\s\S]*FROM appointments/);
+    });
+  });
+
+  it("shows an active Checkout hold in the owning doctor's availability view with its expiry", async () => {
+    const slotId = "44444444-4444-4444-8444-000000000021";
+    const expiresAt = "2099-04-10T10:02:00.000Z";
+    const database = createDatabase({
+      initialSlots: [{ id: slotId, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
+      appointmentReferences: ["cancelled-1", "cancelled-2", "cancelled-3"].map((id) => ({ id: slotId, appointment_id: id, status: "cancelled", ends_at: 0 })),
+      paymentHoldReferences: [{ id: slotId, status: "active", expires_at: expiresAt }],
+    });
+    const { app } = createTestApp({ database });
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`);
+      assert.equal(response.status, 200);
+      const rows = await response.json();
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].hold_status, "active");
+      assert.equal(rows[0].hold_expires_at, expiresAt);
+      assert.equal(rows[0].deleted_at, null);
+      assert.equal(rows[0].status, undefined, "a payment hold is not represented as an appointment status");
+      assert.match(database.availabilityQueries[0], /hold\.status = 'active' AND hold\.expires_at > NOW\(\)/);
+    });
+  });
+
+  it("keeps active unexpired holds out of patient availability but ignores expired and released holds", async () => {
+    const activeId = "44444444-4444-4444-8444-000000000022";
+    const expiredId = "44444444-4444-4444-8444-000000000023";
+    const releasedId = "44444444-4444-4444-8444-000000000024";
+    const slots = [activeId, expiredId, releasedId].map((id) => ({ id, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }));
+    const holds = [
+      { id: activeId, status: "active", expires_at: "2099-04-10T10:02:00.000Z" },
+      { id: expiredId, status: "active", expires_at: "2000-01-01T00:00:00.000Z" },
+      { id: releasedId, status: "released", expires_at: "2099-04-10T10:02:00.000Z" },
+    ];
+    const database = createDatabase({ initialSlots: slots, paymentHoldReferences: holds, currentUser: { ...user, role: "patient" } });
+    const { app } = createTestApp({ database, currentUser: { ...user, role: "patient" } });
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`);
+      assert.equal(response.status, 200);
+      const rows = await response.json();
+      assert.deepEqual(rows.map((row) => row.id).sort(), [expiredId, releasedId]);
+      assert.ok(rows.every((row) => row.hold_status === null));
+      assert.match(database.availabilityQueries[0], /AND payment_hold\.id IS NULL/);
+    });
+  });
+
+  it("keeps the slot visible to its doctor after an active hold expires without cleanup", async () => {
+    const slotId = "44444444-4444-4444-8444-000000000025";
+    const database = createDatabase({
+      initialSlots: [{ id: slotId, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
+      paymentHoldReferences: [{ id: slotId, status: "active", expires_at: "2000-01-01T00:00:00.000Z" }],
+    });
+    const { app } = createTestApp({ database });
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`);
+      assert.equal(response.status, 200);
+      const rows = await response.json();
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].id, slotId);
+      assert.equal(rows[0].hold_status, null);
+      assert.equal(rows[0].hold_expires_at, null);
     });
   });
 
@@ -258,6 +383,7 @@ describe("availability endpoints", () => {
   it("requires an authenticated active doctor and restricts writes to their own doctor profile", async () => {
     const unauthenticated = createTestApp({ authenticated: false });
     await withServer(unauthenticated.app, async (url) => {
+      assert.equal((await fetch(`${url}/api/v1/doctors/${doctorId}/slots`)).status, 401);
       const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ slots: [slot("2099-04-10")] }) });
       assert.equal(response.status, 401);
     });
@@ -279,29 +405,122 @@ describe("availability endpoints", () => {
     });
   });
 
-  it("deletes only owned slots and returns a conflict when a slot is appointment-referenced", async () => {
+  it("hard-deletes unreferenced slots and soft-deletes historical appointment or hold references", async () => {
     const slotId = "44444444-4444-4444-8444-000000000001";
-    const { app } = createTestApp({ database: createDatabase({ initialSlots: [{ id: slotId, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }] }) });
+    const deletableDb = createDatabase({ initialSlots: [{ id: slotId, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }] });
+    const { app } = createTestApp({ database: deletableDb });
     await withServer(app, async (url) => {
       const missing = await fetch(`${url}/api/v1/doctors/${doctorId}/slots/66666666-6666-4666-8666-666666666666`, { method: "DELETE" });
       assert.equal(missing.status, 404);
       const deleted = await fetch(`${url}/api/v1/doctors/${doctorId}/slots/${slotId}`, { method: "DELETE" });
       assert.equal(deleted.status, 204);
+      assert.equal(deletableDb.slots.length, 0);
+      assert.ok(deletableDb.lockQueries.some((values) => values.length === 1 && values[0] === doctorId));
     });
+
     const referencedId = "44444444-4444-4444-8444-000000000002";
-    const referenced = createTestApp({ database: createDatabase({
-      initialSlots: [{ id: referencedId, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
-      appointmentReferences: [referencedId],
-    }) });
-    await withServer(referenced.app, async (url) => {
-      const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots/${referencedId}`, { method: "DELETE" });
-      assert.equal(response.status, 409);
-      assert.equal((await response.json()).error.code, "SLOT_REFERENCED");
+    const historicalCases = [
+      { name: "past confirmed appointment", appointments: [{ id: referencedId, status: "confirmed", ends_at: Date.parse("2000-01-01T00:00:00Z") }] },
+      { name: "cancelled appointment", appointments: [{ id: referencedId, status: "cancelled", ends_at: Date.parse("2099-04-10T10:30:00Z") }] },
+      { name: "expired hold", holds: [{ id: referencedId, status: "expired", expires_at: 0 }] },
+      { name: "released hold", holds: [{ id: referencedId, status: "released", expires_at: Date.now() + 60_000 }] },
+    ];
+    for (const [index, entry] of historicalCases.entries()) {
+      const slotIdForCase = `44444444-4444-4444-8444-${String(index + 2).padStart(12, "0")}`;
+      const database = createDatabase({
+        initialSlots: [{ id: slotIdForCase, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
+        appointmentReferences: (entry.appointments || []).map((item) => ({ ...item, id: slotIdForCase })),
+        paymentHoldReferences: (entry.holds || []).map((item) => ({ ...item, id: slotIdForCase })),
+      });
+      const test = createTestApp({ database });
+      await withServer(test.app, async (url) => {
+        const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots/${slotIdForCase}`, { method: "DELETE" });
+        assert.equal(response.status, 204, entry.name);
+        assert.equal(database.slots.length, 1);
+        assert.ok(database.slots[0].deleted_at);
+        const listed = await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`);
+        assert.deepEqual(await listed.json(), []);
+      });
+    }
+
+    const racedHoldId = "44444444-4444-4444-8444-000000000004";
+    const racedHoldDb = createDatabase({
+      initialSlots: [{ id: racedHoldId, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
+      holdForeignKeyRaceReferences: [racedHoldId],
     });
+    const racedHold = createTestApp({ database: racedHoldDb });
+    await withServer(racedHold.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots/${racedHoldId}`, { method: "DELETE" });
+      assert.equal(response.status, 409);
+      assert.equal((await response.json()).error.code, "SLOT_IN_USE");
+      assert.equal(racedHoldDb.slots.length, 1);
+    });
+
     const anotherOwner = createTestApp();
     await withServer(anotherOwner.app, async (url) => {
       const response = await fetch(`${url}/api/v1/doctors/${otherDoctorId}/slots/${slotId}`, { method: "DELETE" });
       assert.equal(response.status, 403);
+    });
+  });
+
+  it("rejects future confirmed appointments and active unexpired holds", async () => {
+    const cases = [
+      { id: "44444444-4444-4444-8444-000000000011", appointments: [{ id: "x", status: "confirmed", ends_at: Date.parse("2099-04-10T10:30:00Z") }] },
+      { id: "44444444-4444-4444-8444-000000000012", holds: [{ id: "x", status: "active", expires_at: Date.now() + 60_000 }] },
+    ];
+    for (const entry of cases) {
+      const database = createDatabase({
+        initialSlots: [{ id: entry.id, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
+        appointmentReferences: (entry.appointments || []).map((item) => ({ ...item, id: entry.id })),
+        paymentHoldReferences: (entry.holds || []).map((item) => ({ ...item, id: entry.id })),
+      });
+      const test = createTestApp({ database });
+      await withServer(test.app, async (url) => {
+        const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots/${entry.id}`, { method: "DELETE" });
+        assert.equal(response.status, 409);
+        assert.equal((await response.json()).error.code, "SLOT_IN_USE");
+        assert.equal(database.slots[0].deleted_at, null);
+      });
+    }
+  });
+
+  it("allows recreating a previously soft-deleted time slot", async () => {
+    const slotId = "44444444-4444-4444-8444-000000000013";
+    const database = createDatabase({
+      initialSlots: [{ id: slotId, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
+      appointmentReferences: [{ id: slotId, status: "cancelled", ends_at: 0 }],
+    });
+    const test = createTestApp({ database });
+    await withServer(test.app, async (url) => {
+      assert.equal((await fetch(`${url}/api/v1/doctors/${doctorId}/slots/${slotId}`, { method: "DELETE" })).status, 204);
+      const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ slots: [slot("2099-04-10", "10:00", "10:30")] }),
+      });
+      assert.equal(response.status, 201);
+      assert.equal(database.slots.length, 2);
+      assert.ok(database.slots[0].deleted_at);
+      assert.equal(database.slots[1].deleted_at, null);
+    });
+  });
+
+  it("serializes concurrent historical-slot removal and same-time availability creation", async () => {
+    const slotId = "44444444-4444-4444-8444-000000000014";
+    const database = createDatabase({
+      initialSlots: [{ id: slotId, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
+      appointmentReferences: [{ id: slotId, status: "cancelled", ends_at: 0 }],
+    });
+    const test = createTestApp({ database });
+    await withServer(test.app, async (url) => {
+      const remove = fetch(`${url}/api/v1/doctors/${doctorId}/slots/${slotId}`, { method: "DELETE" });
+      const create = fetch(`${url}/api/v1/doctors/${doctorId}/slots`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ slots: [slot("2099-04-10", "10:00", "10:30")] }),
+      });
+      const [removed, created] = await Promise.all([remove, create]);
+      assert.equal(removed.status, 204);
+      assert.ok([201, 409].includes(created.status));
+      assert.ok(database.slots.filter((item) => !item.deleted_at).length <= 1);
     });
   });
 
