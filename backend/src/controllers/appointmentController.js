@@ -27,16 +27,14 @@ const listAppointments = handle(async (_request, response) => ({
   body: await appointmentService.listAppointments(response.locals.database, response.locals.user, response.locals.query),
 }));
 
-const createAppointment = handle(async (_request, response) => {
-  const appointment = await appointmentService.createAppointment(
-    response.locals.database,
-    response.locals.user,
-    response.locals.applicationTimezone,
-    response.locals.body,
-  );
-  await notify(response, "booked", appointment);
-  return { status: 201, body: appointment };
-});
+const createAppointment = (_request, response) => {
+  if (response.locals.user.role !== "patient") {
+    return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can book appointments" } });
+  }
+  return response.status(402).json({
+    error: { code: "PAYMENT_REQUIRED", message: "Create and verify a payment order before booking an appointment" },
+  });
+};
 
 const getAppointment = handle(async (_request, response) => ({
   body: await appointmentService.getAppointment(

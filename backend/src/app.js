@@ -12,15 +12,27 @@ const env = require("./config/env");
 const { createEmailNotificationService } = require("./services/emailNotificationService");
 const { createAppointmentReminderService } = require("./services/appointmentReminderService");
 const reminderRoutes = require("./routes/reminderRoutes");
+const paymentRoutes = require("./routes/paymentRoutes");
+const { createStripeService } = require("./services/stripeService");
+const { createPaymentService } = require("./services/paymentService");
 
-function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), reminderService, reminderSecret = env.REMINDER_CRON_SECRET, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
+function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), reminderService, reminderSecret = env.REMINDER_CRON_SECRET, stripeService, paymentService, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("A PostgreSQL database pool is required");
   }
 
   const app = express();
+  const stripe = stripeService || createStripeService({ config: paymentConfig });
+  const payments = paymentService || createPaymentService({
+    database,
+    stripe,
+    emailNotificationService,
+    frontendOrigin: frontendOrigin || env.FRONTEND_ORIGIN,
+    timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata",
+  });
 
   app.use(cors({ origin: frontendOrigin, credentials: true }));
+  app.use("/api/v1/payments/webhook", paymentRoutes({ service: payments, webhook: true }));
   app.use(clerkAuthMiddleware);
   app.use(express.json());
   app.use((_request, response, next) => {
@@ -35,6 +47,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     service: reminderService || createAppointmentReminderService({ database, emailNotificationService, timeZone: applicationTimezone || "Asia/Kolkata" }),
     secret: reminderSecret,
   }));
+  app.use("/api/v1/payments", paymentRoutes({ service: payments }));
   app.use("/api/v1/users", userRoutes);
   app.use("/api/v1/patients", patientRoutes);
   app.use("/api/v1/doctors", doctorRoutes);

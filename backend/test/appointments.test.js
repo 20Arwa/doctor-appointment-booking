@@ -100,6 +100,7 @@ function createDatabase({
             return { rows: values[0] === patientUserId ? [{ id: patientId }] : [] };
           }
           if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
+          if (sql.includes("FROM appointment_slot_holds h") && sql.includes("h.expires_at > NOW()")) return { rows: [] };
           if (sql.startsWith("SELECT id FROM availability")) {
             const [ownerDoctorId, date, start, end] = values;
             const slot = state.slots.find((item) => item.doctor_id === ownerDoctorId && item.date === date && item.start_time === start && item.end_time === end);
@@ -253,12 +254,14 @@ describe("appointment schemas and migration", () => {
     const directory = path.join(__dirname, "..", "migrations");
     const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(files.length, 8);
+    assert.equal(files.length, 10);
     assert.match(files[3], /^004_.*\.sql$/);
     assert.equal(files[4], "005_appointment_schedule_snapshot.sql");
     assert.equal(files[5], "006_doctor_consultation_fee.sql");
     assert.equal(files[6], "007_appointment_reminders.sql");
     assert.equal(files[7], "008_payment_refund_schema.sql");
+    assert.equal(files[8], "009_payment_booking_reason.sql");
+    assert.equal(files[9], "010_payment_capture_reconciliation.sql");
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);
@@ -269,12 +272,14 @@ describe("appointment schemas and migration", () => {
 });
 
 describe("appointment workflows", () => {
-  it("sends booking, cancellation, and rescheduling notifications after successful operations", async () => {
+  it("keeps cancellation and rescheduling notifications for existing appointments", async () => {
     const notifications = [];
     const emailNotificationService = { sendAppointmentNotification: async (...args) => notifications.push(args) };
     const booking = createTestApp({ emailNotificationService });
     await withServer(booking.app, async (url) => {
-      assert.equal((await fetch(`${url}/api/v1/appointments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: firstSlotId }) })).status, 201);
+      const response = await fetch(`${url}/api/v1/appointments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: firstSlotId }) });
+      assert.equal(response.status, 402);
+      assert.equal((await response.json()).error.code, "PAYMENT_REQUIRED");
     });
     const cancellation = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), emailNotificationService });
     await withServer(cancellation.app, async (url) => {
@@ -284,23 +289,20 @@ describe("appointment workflows", () => {
     await withServer(reschedule.app, async (url) => {
       assert.equal((await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }) })).status, 200);
     });
-    assert.deepEqual(notifications.map(([action]) => action), ["booked", "cancelled", "rescheduled"]);
-    assert.equal(notifications[0][1].patient_email, registeredPatientEmail);
-    assert.equal(notifications[2][1].previous_date, "2099-04-10");
-    assert.equal(notifications[2][1].previous_start_time, "10:00:00");
+    assert.deepEqual(notifications.map(([action]) => action), ["cancelled", "rescheduled"]);
+    assert.equal(notifications[1][1].previous_date, "2099-04-10");
+    assert.equal(notifications[1][1].previous_start_time, "10:00:00");
   });
 
-  it("does not notify when appointment operations fail and keeps successful operations alive on mail errors", async () => {
+  it("rejects unpaid direct appointment creation without sending a booking notification", async () => {
     let notificationCount = 0;
     const emailNotificationService = { sendAppointmentNotification: async () => { notificationCount += 1; throw new Error("provider unavailable"); } };
     const { app } = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), emailNotificationService });
     await withServer(app, async (url) => {
-      const failedBooking = await fetch(`${url}/api/v1/appointments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: firstSlotId }) });
-      assert.equal(failedBooking.status, 409);
+      const failedBooking = await fetch(`${url}/api/v1/appointments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }) });
+      assert.equal(failedBooking.status, 402);
+      assert.equal((await failedBooking.json()).error.code, "PAYMENT_REQUIRED");
       assert.equal(notificationCount, 0);
-      const success = await fetch(`${url}/api/v1/appointments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }) });
-      assert.equal(success.status, 201);
-      assert.equal(notificationCount, 1);
     });
   });
 
@@ -318,43 +320,40 @@ describe("appointment workflows", () => {
     assert.doesNotMatch(JSON.stringify(errors), /valid-test-key/);
   });
 
-  it("books a future slot and prevents duplicate bookings", async () => {
+  it("requires a payment order before a future slot can be booked", async () => {
     const { app, database } = createTestApp();
     await withServer(app, async (url) => {
       const response = await fetch(`${url}/api/v1/appointments`, {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ availability_id: firstSlotId, reason: "Annual checkup" }),
       });
-      assert.equal(response.status, 201);
-      const appointment = await response.json();
-      assert.equal(appointment.status, "confirmed");
-      assert.equal(appointment.reason, "Annual checkup");
-      assert.equal(appointment.availability_id, firstSlotId);
-      assert.equal(database.state.appointments.length, 1);
+      assert.equal(response.status, 402);
+      assert.equal((await response.json()).error.code, "PAYMENT_REQUIRED");
+      assert.equal(database.state.appointments.length, 0);
 
       const duplicate = await fetch(`${url}/api/v1/appointments`, {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ availability_id: firstSlotId }),
       });
-      assert.equal(duplicate.status, 409);
+      assert.equal(duplicate.status, 402);
     });
   });
 
-  it("rejects nonexistent, past, and already occupied slots", async () => {
+  it("does not allow direct unpaid booking requests to inspect or claim slots", async () => {
     const { app } = createTestApp({ database: createDatabase({ slots: [makeSlot(firstSlotId, "10:00", "2000-01-01")] }) });
     await withServer(app, async (url) => {
       const post = (availability_id) => fetch(`${url}/api/v1/appointments`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id }),
       });
-      assert.equal((await post(secondSlotId)).status, 404);
-      assert.equal((await post(firstSlotId)).status, 409);
+      assert.equal((await post(secondSlotId)).status, 402);
+      assert.equal((await post(firstSlotId)).status, 402);
     });
     const occupied = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }) });
     await withServer(occupied.app, async (url) => {
       const response = await fetch(`${url}/api/v1/appointments`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: firstSlotId }),
       });
-      assert.equal(response.status, 409);
+      assert.equal(response.status, 402);
     });
   });
 
@@ -499,8 +498,8 @@ describe("appointment workflows", () => {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: firstSlotId }),
       });
       const responses = await Promise.all([book(), book()]);
-      assert.deepEqual(responses.map((response) => response.status).sort(), [201, 409]);
-      assert.equal(database.state.appointments.length, 1);
+      assert.deepEqual(responses.map((response) => response.status).sort(), [402, 402]);
+      assert.equal(database.state.appointments.length, 0);
     });
   });
 
@@ -515,7 +514,7 @@ describe("appointment workflows", () => {
       });
       const responses = await Promise.all([reschedule, book]);
       const statuses = responses.map((response) => response.status);
-      assert.ok(JSON.stringify(statuses.sort()) === JSON.stringify([200, 409]) || JSON.stringify(statuses.sort()) === JSON.stringify([201, 409]));
+      assert.deepEqual(statuses.sort(), [200, 402]);
       assert.equal(database.state.appointments.filter((appointment) => appointment.availability_id === secondSlotId && appointment.status !== "cancelled").length, 1);
       assert.equal(database.state.appointments.length, 2);
     });
