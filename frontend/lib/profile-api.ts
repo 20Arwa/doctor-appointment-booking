@@ -13,7 +13,7 @@ const localProfileSchema = z.object({
     specialty: z.string().optional(),
     bio: z.string().nullable().optional(),
     consultation_fee: z.number().optional(),
-    date_of_birth: z.string().nullable().optional(),
+    date_of_birth: z.iso.date().nullable().optional(),
     gender: z.string().nullable().optional(),
   }),
 });
@@ -25,6 +25,15 @@ const doctorSchema = z.object({
   specialty: z.string(),
   bio: z.string().nullable(),
   consultation_fee: z.number(),
+});
+
+const doctorPatientSchema = z.object({
+  first_name: z.string(),
+  last_name: z.string(),
+  email: z.string().email(),
+  phone: z.string().nullable(),
+  date_of_birth: z.iso.date().nullable(),
+  gender: z.string().nullable(),
 });
 
 const appointmentSchema = z.object({
@@ -42,6 +51,10 @@ const appointmentSchema = z.object({
   patient_first_name: z.string(),
   patient_last_name: z.string(),
   reason: z.string().nullable(),
+  patient_date_of_birth: z.string().nullable().optional(),
+  patient_gender: z.string().nullable().optional(),
+  consultation_fee: z.string().regex(/^\d+(\.\d{1,2})?$/).nullable().optional(),
+  consultation_currency: z.string().regex(/^[A-Z]{3}$/).nullable().optional(),
 });
 
 const availabilitySlotSchema = z.object({
@@ -116,6 +129,17 @@ const paymentHistoryItemSchema = z.object({
   refunds: z.array(paymentHistoryRefundSchema),
 });
 
+const appointmentPageSchema = z.object({
+  items: z.array(appointmentSchema),
+  has_more: z.boolean(),
+  next_offset: z.number().int().nonnegative(),
+});
+const paymentHistoryPageSchema = z.object({
+  items: z.array(paymentHistoryItemSchema),
+  has_more: z.boolean(),
+  next_offset: z.number().int().nonnegative(),
+});
+
 const cancellationRefundPreviewSchema = z.object({
   original_payment: z.object({
     amount: z.string().regex(/^\d+(\.\d{1,2})?$/),
@@ -131,11 +155,14 @@ const cancellationRefundPreviewSchema = z.object({
 
 export type LocalProfile = z.infer<typeof localProfileSchema>;
 export type DirectoryDoctor = z.infer<typeof doctorSchema>;
+export type DoctorPatient = z.infer<typeof doctorPatientSchema>;
 export type PatientAppointment = z.infer<typeof appointmentSchema>;
 export type AvailabilitySlot = z.infer<typeof availabilitySlotSchema>;
 export type PaymentOrder = z.infer<typeof paymentOrderSchema>;
 export type PaymentStatus = z.infer<typeof paymentStatusSchema>;
 export type PatientPaymentHistoryItem = z.infer<typeof paymentHistoryItemSchema>;
+export type PatientPaymentHistoryPage = z.infer<typeof paymentHistoryPageSchema>;
+export type AppointmentPage = z.infer<typeof appointmentPageSchema>;
 export type CancellationRefundPreview = z.infer<typeof cancellationRefundPreviewSchema>;
 
 type ValidationDetail = { path: string; message: string };
@@ -160,10 +187,10 @@ function apiBaseUrl() {
   return `${base}/api/v1`;
 }
 
-async function request<T>(token: string, path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(token: string | undefined, path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
-  headers.set("Authorization", `Bearer ${token}`);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
   if (init.body) headers.set("Content-Type", "application/json");
 
   let response: Response;
@@ -211,10 +238,25 @@ export async function getCurrentProfile(token: string): Promise<LocalProfile> {
   return parsed.data;
 }
 
-export async function getDoctors(token: string): Promise<DirectoryDoctor[]> {
+export async function getDoctors(token?: string): Promise<DirectoryDoctor[]> {
   const payload = await request<unknown>(token, "/doctors");
   const parsed = z.array(doctorSchema).safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete doctor list.");
+  return parsed.data;
+}
+
+export async function getDoctorPatient(token: string, patientId: string): Promise<DoctorPatient> {
+  const payload = await request<unknown>(token, `/doctors/patients/${encodeURIComponent(patientId)}`);
+  const parsed = doctorPatientSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete patient profile.");
+  return parsed.data;
+}
+
+export async function getDoctorPatientAppointmentsPage(token: string, patientId: string, view: "scheduled" | "past" | "cancelled", offset: number, limit = 5): Promise<AppointmentPage> {
+  const query = new URLSearchParams({ view, limit: String(limit), offset: String(offset) });
+  const payload = await request<unknown>(token, `/doctors/patients/${encodeURIComponent(patientId)}/appointments?${query.toString()}`);
+  const parsed = appointmentPageSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete patient appointment page.");
   return parsed.data;
 }
 
@@ -280,6 +322,14 @@ export async function getPatientPaymentHistory(token: string): Promise<PatientPa
   return parsed.data;
 }
 
+export async function getPatientPaymentHistoryPage(token: string, offset: number, limit = 5): Promise<PatientPaymentHistoryPage> {
+  const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  const payload = await request<unknown>(token, `/payments/history?${query.toString()}`);
+  const parsed = paymentHistoryPageSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete payment history page.");
+  return parsed.data;
+}
+
 export async function getAppointmentCancellationRefundPreview(token: string, appointmentId: string): Promise<CancellationRefundPreview> {
   const payload = await request<unknown>(token, `/appointments/${encodeURIComponent(appointmentId)}/cancellation-preview`);
   const parsed = cancellationRefundPreviewSchema.safeParse(payload);
@@ -295,6 +345,22 @@ export async function getAppointments(token: string): Promise<PatientAppointment
   const payload = await request<unknown>(token, "/appointments");
   const parsed = z.array(appointmentSchema).safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete appointment list.");
+  return parsed.data;
+}
+
+export async function getAppointmentsView(token: string, view: "upcoming"): Promise<PatientAppointment[]> {
+  const query = new URLSearchParams({ view });
+  const payload = await request<unknown>(token, `/appointments?${query.toString()}`);
+  const parsed = z.array(appointmentSchema).safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete appointment list.");
+  return parsed.data;
+}
+
+export async function getAppointmentHistoryPage(token: string, view: "past" | "cancelled", offset: number, limit = 5): Promise<AppointmentPage> {
+  const query = new URLSearchParams({ view, limit: String(limit), offset: String(offset) });
+  const payload = await request<unknown>(token, `/appointments?${query.toString()}`);
+  const parsed = appointmentPageSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete appointment history page.");
   return parsed.data;
 }
 

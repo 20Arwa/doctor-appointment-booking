@@ -1,6 +1,7 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
+import { CalendarDays, FileText, Mail, Phone, Stethoscope, UserRound, UsersRound, WalletCards, type LucideIcon } from "lucide-react";
 import { useState, type ChangeEvent, type FormEvent } from "react";
 import { z } from "zod";
 import { Button } from "@/components/ui/button";
@@ -13,6 +14,8 @@ import {
   updateUserDetails,
   type LocalProfile,
 } from "@/lib/profile-api";
+import { MEDICAL_SPECIALTIES } from "@/lib/medical-specialties";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 const profileSchema = z.object({
   first_name: z.string().trim().min(1, "Enter your first name.").max(100, "Use 100 characters or fewer."),
@@ -29,6 +32,13 @@ type ProfileField = keyof ProfileValues;
 type ProfileErrors = Partial<Record<ProfileField, string>>;
 
 const fieldClassName = "mt-2 min-h-11 w-full rounded-lg border border-input bg-background px-3 py-2 text-foreground shadow-sm outline-none transition-colors placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring";
+
+function FieldLabel({ label, icon: Icon, htmlFor }: { label: string; icon: LucideIcon; htmlFor?: string }) {
+  const content = <><Icon aria-hidden="true" className="size-4 text-primary/80" />{label}</>;
+  return htmlFor
+    ? <label htmlFor={htmlFor} className="inline-flex items-center gap-2 text-sm font-medium text-foreground">{content}</label>
+    : <p className="inline-flex items-center gap-2 text-sm font-medium text-foreground">{content}</p>;
+}
 
 function valuesFromProfile(profile: LocalProfile): ProfileValues {
   return {
@@ -137,9 +147,10 @@ export function ProfilePage() {
 
   function textField(field: ProfileField, label: string, options: { type?: string; autoComplete?: string; max?: string } = {}) {
     const id = `profile-${field}`;
+    const icon = field === "first_name" || field === "last_name" ? UserRound : field === "phone" ? Phone : field === "date_of_birth" ? CalendarDays : FileText;
     return (
       <div>
-        <label htmlFor={id} className="text-sm font-medium text-foreground">{label}</label>
+        <FieldLabel htmlFor={id} label={label} icon={icon} />
         <input id={id} name={field} type={options.type ?? "text"} autoComplete={options.autoComplete} max={options.max} value={values[field]} onChange={inputChange(field)} aria-invalid={Boolean(errors[field])} aria-describedby={errors[field] ? `${id}-error` : undefined} className={fieldClassName} />
         {errors[field] ? <p id={`${id}-error`} className="mt-1.5 text-sm text-destructive" role="alert">{errors[field]}</p> : null}
       </div>
@@ -150,7 +161,7 @@ export function ProfilePage() {
     const id = `profile-${field}`;
     return (
       <div className="sm:col-span-2">
-        <label htmlFor={id} className="text-sm font-medium text-foreground">{label}</label>
+        <FieldLabel htmlFor={id} label={label} icon={FileText} />
         <textarea id={id} name={field} rows={5} value={values[field]} onChange={inputChange(field)} aria-invalid={Boolean(errors[field])} aria-describedby={errors[field] ? `${id}-error` : `${id}-hint`} className={`${fieldClassName} min-h-32 resize-y`} />
         {errors[field] ? <p id={`${id}-error`} className="mt-1.5 text-sm text-destructive" role="alert">{errors[field]}</p> : <p id={`${id}-hint`} className="mt-1.5 text-sm text-muted-foreground">{hint}</p>}
       </div>
@@ -175,10 +186,10 @@ export function ProfilePage() {
             {textField("first_name", "First name", { autoComplete: "given-name" })}
             {textField("last_name", "Last name", { autoComplete: "family-name" })}
             <div>
-              <label htmlFor="profile-email" className="text-sm font-medium text-foreground">Email address</label>
+              <FieldLabel htmlFor="profile-email" label="Email address" icon={Mail} />
               <input id="profile-email" type="email" value={profile.email} readOnly className={`${fieldClassName} cursor-not-allowed bg-muted text-muted-foreground`} />
             </div>
-            {textField("phone", "Phone number", { type: "tel", autoComplete: "tel" })}
+            {textField("phone", "Phone number (optional)", { type: "tel", autoComplete: "tel" })}
           </div>
         </section>
 
@@ -189,8 +200,18 @@ export function ProfilePage() {
               <p className="mt-1 text-sm text-muted-foreground">These optional details help keep your patient profile current.</p>
             </div>
             <div className="grid gap-5 sm:grid-cols-2">
-              {textField("date_of_birth", "Date of birth", { type: "date", max: todayInApplicationZone() })}
-              {textField("gender", "Gender")}
+              {textField("date_of_birth", "Date of birth (optional)", { type: "date", max: todayInApplicationZone() })}
+              <div>
+                <FieldLabel htmlFor="profile-gender" label="Gender (optional)" icon={UsersRound} />
+                <Select value={values.gender || "none"} onValueChange={(value) => updateField("gender", value === "none" ? "" : value)}>
+                  <SelectTrigger className="mt-2" id="profile-gender" aria-invalid={Boolean(errors.gender)} aria-describedby={errors.gender ? "profile-gender-error" : undefined}><SelectValue placeholder="Select gender" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">Prefer not to say</SelectItem>
+                    {[...new Set(["Female", "Male", ...(values.gender && !["Female", "Male"].includes(values.gender) ? [values.gender] : [])])].map((gender) => <SelectItem key={gender} value={gender}>{gender}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                {errors.gender ? <p id="profile-gender-error" className="mt-1.5 text-sm text-destructive" role="alert">{errors.gender}</p> : null}
+              </div>
             </div>
           </section>
         ) : (
@@ -200,9 +221,18 @@ export function ProfilePage() {
               <p className="mt-1 text-sm text-muted-foreground">Keep your specialty and public profile description up to date.</p>
             </div>
             <div className="grid gap-5 sm:grid-cols-2">
-              {textField("specialty", "Specialty")}
               <div>
-                <p className="text-sm font-medium text-foreground">Consultation fee</p>
+                <FieldLabel htmlFor="profile-specialty" label="Specialty" icon={Stethoscope} />
+                <Select value={values.specialty} onValueChange={(value) => updateField("specialty", value)}>
+                  <SelectTrigger id="profile-specialty" aria-invalid={Boolean(errors.specialty)} aria-describedby={errors.specialty ? "profile-specialty-error" : undefined}><SelectValue placeholder="Choose a specialty" /></SelectTrigger>
+                  <SelectContent>
+                    {[...new Set([...MEDICAL_SPECIALTIES, ...(values.specialty && !MEDICAL_SPECIALTIES.includes(values.specialty as (typeof MEDICAL_SPECIALTIES)[number]) ? [values.specialty] : [])])].map((specialty) => <SelectItem key={specialty} value={specialty}>{specialty}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                {errors.specialty ? <p id="profile-specialty-error" className="mt-1.5 text-sm text-destructive" role="alert">{errors.specialty}</p> : null}
+              </div>
+              <div>
+                <FieldLabel label="Consultation fee" icon={WalletCards} />
                 <p className="mt-2 min-h-11 rounded-lg border border-border bg-muted px-3 py-2 text-foreground" aria-label="Consultation fee">{new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(profile.profile.consultation_fee ?? 500)}</p>
                 <p className="mt-1.5 text-sm text-muted-foreground">Your standard consultation fee.</p>
               </div>

@@ -1,15 +1,26 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
+import Link from "next/link";
 import { CalendarClock, CheckCircle2, RefreshCw, CalendarPlus } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { completeDoctorAppointment, doctorRescheduleAppointment, getAppointments, ProfileApiError, type PatientAppointment } from "@/lib/profile-api";
+import { completeDoctorAppointment, doctorRescheduleAppointment, ProfileApiError, type PatientAppointment } from "@/lib/profile-api";
 import { notifyError, notifySuccess } from "@/lib/notifications";
+import { useAppointmentHistory } from "@/components/use-appointment-history";
 
-function appointmentInstant(appointment: Pick<PatientAppointment, "date" | "start_time">) {
-  const instant = new Date(`${appointment.date}T${appointment.start_time}+05:30`);
+function appointmentInstant(appointment: Pick<PatientAppointment, "date" | "end_time">) {
+  const instant = new Date(`${appointment.date}T${appointment.end_time}+05:30`);
   return Number.isNaN(instant.getTime()) ? null : instant;
+}
+
+function patientAge(dateOfBirth: string | null | undefined, now: number) {
+  if (!dateOfBirth) return null;
+  const [year, month, day] = dateOfBirth.split("-").map(Number);
+  if (!year || !month || !day) return null;
+  const today = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(now)).map(({ type, value }) => [type, Number(value)]));
+  if (year > today.year || year === today.year && (month > today.month || month === today.month && day > today.day)) return null;
+  return today.year - year - (today.month < month || today.month === month && today.day < day ? 1 : 0);
 }
 
 function formatDate(date: string) {
@@ -32,11 +43,8 @@ function statusClasses(status: PatientAppointment["status"]) {
 
 export function DoctorAppointmentsPage() {
   const { getToken } = useAuth();
-  const [appointments, setAppointments] = useState<PatientAppointment[]>([]);
+  const { appointments, setAppointments, loading, error, history, retry, loadMore } = useAppointmentHistory();
   const [currentTime, setCurrentTime] = useState<number | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
   const [activeAppointment, setActiveAppointment] = useState<string | null>(null);
   const mutationLock = useRef(false);
   const [rescheduleId, setRescheduleId] = useState<string | null>(null);
@@ -45,26 +53,10 @@ export function DoctorAppointmentsPage() {
   const [rescheduleError, setRescheduleError] = useState<string | null>(null);
 
   useEffect(() => {
-    let active = true;
-    void getToken()
-      .then((token) => {
-        if (!token) throw new Error("Your session could not be verified. Please try again.");
-        return getAppointments(token);
-      })
-      .then((result) => {
-        if (active) {
-          setAppointments(result);
-          setCurrentTime(Date.now());
-        }
-      })
-      .catch((cause: unknown) => {
-        if (active) setError(cause instanceof Error ? cause.message : "We couldn't load your appointments.");
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => { active = false; };
-  }, [getToken, refreshKey]);
+    const initialTime = window.setTimeout(() => setCurrentTime(Date.now()), 0);
+    const timer = window.setInterval(() => setCurrentTime(Date.now()), 30_000);
+    return () => { window.clearTimeout(initialTime); window.clearInterval(timer); };
+  }, []);
 
   const now = currentTime ?? 0;
   const scheduled = appointments.filter((appointment) => appointment.status === "confirmed" && (() => {
@@ -79,9 +71,7 @@ export function DoctorAppointmentsPage() {
     .sort((first, second) => (appointmentInstant(second)?.getTime() ?? 0) - (appointmentInstant(first)?.getTime() ?? 0));
 
   function refreshAppointments() {
-    setLoading(true);
-    setError(null);
-    setRefreshKey((key) => key + 1);
+    retry();
   }
 
   async function markComplete(appointment: PatientAppointment) {
@@ -156,19 +146,24 @@ export function DoctorAppointmentsPage() {
 
       {!loading && !error ? (
         <>
-          <AppointmentGroup title="Scheduled appointments" empty="You have no scheduled appointments." appointments={scheduled} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
-          <AppointmentGroup title="Past appointments" empty="Your past appointments will appear here." appointments={past} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
-          <AppointmentGroup title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
+          <AppointmentGroup title="Scheduled appointments" empty="You have no scheduled appointments." appointments={scheduled} now={now} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
+          <AppointmentGroup title="Past appointments" empty="Your past appointments will appear here." appointments={past} now={now} hasMore={history.past.hasMore} loadingMore={history.past.loading} moreError={history.past.error} onShowMore={() => void loadMore("past")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
+          <AppointmentGroup title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} now={now} hasMore={history.cancelled.hasMore} loadingMore={history.cancelled.loading} moreError={history.cancelled.error} onShowMore={() => void loadMore("cancelled")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
         </>
       ) : null}
     </div>
   );
 }
 
-function AppointmentGroup({ title, empty, appointments, onComplete, activeAppointment, rescheduleId, newDate, newTime, rescheduleError, setRescheduleId, setNewDate, setNewTime, setRescheduleError, onReschedule }: {
+function AppointmentGroup({ title, empty, appointments, now, hasMore = false, loadingMore = false, moreError = null, onShowMore, onComplete, activeAppointment, rescheduleId, newDate, newTime, rescheduleError, setRescheduleId, setNewDate, setNewTime, setRescheduleError, onReschedule }: {
   title: string;
   empty: string;
   appointments: PatientAppointment[];
+  now: number;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  moreError?: string | null;
+  onShowMore?: () => void;
   onComplete: (appointment: PatientAppointment) => void;
   activeAppointment: string | null;
   rescheduleId: string | null; newDate: string; newTime: string;
@@ -186,7 +181,11 @@ function AppointmentGroup({ title, empty, appointments, onComplete, activeAppoin
             <li key={appointment.id} className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6">
               <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
                 <div>
-                  <p className="font-semibold text-card-foreground">{appointment.patient_first_name} {appointment.patient_last_name}</p>
+                  <p className="font-semibold text-card-foreground"><Link href={`/doctor/patients/${encodeURIComponent(appointment.patient_id)}`} aria-label={`View details for ${appointment.patient_first_name} ${appointment.patient_last_name}`} className="rounded-sm underline-offset-4 hover:text-primary hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">{appointment.patient_first_name} {appointment.patient_last_name}</Link></p>
+                  <p className="mt-1 text-sm text-muted-foreground">{[
+                    patientAge(appointment.patient_date_of_birth, now) !== null ? `Age ${patientAge(appointment.patient_date_of_birth, now)}` : null,
+                    appointment.patient_gender,
+                  ].filter(Boolean).join(" · ") || "No patient details provided"}</p>
                   <div className="mt-4 flex items-start gap-2 text-sm text-foreground">
                     <CalendarClock aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                     <span>{formatDate(appointment.date)} · {formatTime(appointment.start_time)}–{formatTime(appointment.end_time)} IST</span>
@@ -194,7 +193,7 @@ function AppointmentGroup({ title, empty, appointments, onComplete, activeAppoin
                   {appointment.reason ? <p className="mt-3 text-sm leading-6 text-muted-foreground"><span className="font-medium text-foreground">Reason:</span> {appointment.reason}</p> : null}
                   <p className="mt-2 text-xs text-muted-foreground">Appointment ID: {appointment.id}</p>
                 </div>
-                <span className={`inline-flex w-fit rounded-full px-3 py-1 text-xs font-semibold capitalize ${statusClasses(appointment.status)}`}>{appointment.status}</span>
+                <span className={`inline-flex w-fit rounded-full px-3 py-1 text-xs font-semibold ${statusClasses(appointment.status)}`}>{appointment.status === "confirmed" && (appointmentInstant(appointment)?.getTime() ?? Infinity) <= now ? "Awaiting completion" : appointment.status}</span>
               </div>
             {appointment.status === "confirmed" ? (
               <div className="mt-5 border-t border-border pt-4">
@@ -219,6 +218,7 @@ function AppointmentGroup({ title, empty, appointments, onComplete, activeAppoin
                     size="sm"
                     disabled={activeAppointment !== null}
                     onClick={() => onComplete(appointment)}
+                    hidden={(appointmentInstant(appointment)?.getTime() ?? Infinity) > now}
                   >
                     <CheckCircle2 aria-hidden="true" className="size-4" />
                     {activeAppointment === appointment.id
@@ -270,6 +270,8 @@ function AppointmentGroup({ title, empty, appointments, onComplete, activeAppoin
           ))}
         </ul>
       )}
+      {moreError ? <p className="mt-3 text-sm text-destructive" role="alert">{moreError}</p> : null}
+      {hasMore ? <div className="mt-4 flex justify-center"><button type="button" onClick={onShowMore} disabled={loadingMore} className="inline-flex min-h-11 items-center justify-center rounded-lg border border-border bg-card px-5 text-sm font-semibold text-foreground transition-colors hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-wait disabled:opacity-60">{loadingMore ? "Loading…" : moreError ? "Try again" : "Show More"}</button></div> : null}
     </section>
   );
 }

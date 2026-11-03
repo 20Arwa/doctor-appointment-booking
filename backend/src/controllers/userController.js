@@ -13,7 +13,7 @@ async function getMe(_request, response, next) {
     const table = user.role === "doctor" ? "doctors" : "patients";
     const profileColumns = user.role === "doctor"
       ? "id, specialty, bio, consultation_fee::float8 AS consultation_fee, created_at, updated_at"
-      : "id, date_of_birth, gender, created_at, updated_at";
+      : "id, date_of_birth::text AS date_of_birth, gender, created_at, updated_at";
     const profile = await response.locals.database.query(`SELECT ${profileColumns} FROM ${table} WHERE user_id = $1`, [user.id]);
     return response.json({ ...user, profile: profile.rows[0] || null });
   } catch (error) { return next(error); }

@@ -2,16 +2,28 @@
 
 import { useAuth } from "@clerk/nextjs";
 import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { RefreshCw, Search, Stethoscope } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { getDoctors, type DirectoryDoctor } from "@/lib/profile-api";
+import { matchesMedicalSpecialty, MEDICAL_SPECIALTIES, resolveMedicalSpecialty } from "@/lib/medical-specialties";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 const inrFormatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
 
+function normalizeName(value: string) {
+  return value.toLocaleLowerCase("en").replace(/\bdr\.?\s*/g, "").replace(/\s+/g, " ").trim();
+}
+
 export function DoctorDirectory() {
   const { getToken } = useAuth();
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [doctors, setDoctors] = useState<DirectoryDoctor[]>([]);
   const [search, setSearch] = useState("");
+  const querySpecialty = searchParams.get("specialty");
+  const specialty = resolveMedicalSpecialty(querySpecialty);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retryKey, setRetryKey] = useState(0);
@@ -35,19 +47,19 @@ export function DoctorDirectory() {
     return () => { active = false; };
   }, [getToken, retryKey]);
 
-  const normalizeName = (value: string) => value
-    .toLocaleLowerCase("en")
-    .replace(/\bdr\.?\s*/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
   const normalizedSearch = normalizeName(search);
-  const filteredDoctors = useMemo(() => {
-    if (!normalizedSearch) return doctors;
-    return doctors.filter((doctor) =>
-      normalizeName(`${doctor.first_name} ${doctor.last_name}`).includes(normalizedSearch)
-      || doctor.specialty.toLocaleLowerCase("en").includes(search.trim().toLocaleLowerCase("en")),
-    );
-  }, [doctors, normalizedSearch, search]);
+  const filteredDoctors = useMemo(() => doctors.filter((doctor) =>
+    normalizeName(`${doctor.first_name} ${doctor.last_name}`).includes(normalizedSearch)
+    && matchesMedicalSpecialty(doctor.specialty, specialty),
+  ), [doctors, normalizedSearch, specialty]);
+
+  function selectSpecialty(nextSpecialty: string) {
+    const nextParams = new URLSearchParams(searchParams.toString());
+    if (nextSpecialty === "all") nextParams.delete("specialty");
+    else nextParams.set("specialty", nextSpecialty);
+    const query = nextParams.toString();
+    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
+  }
 
   return (
     <div className="space-y-6">
@@ -57,17 +69,24 @@ export function DoctorDirectory() {
         <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">Browse doctors by name or specialty.</p>
       </header>
 
-      <div className="relative max-w-xl">
-        <label htmlFor="doctor-search" className="sr-only">Search doctors by name or specialty</label>
-        <Search aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 size-5 -translate-y-1/2 text-muted-foreground" />
-        <input
-          id="doctor-search"
-          type="search"
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Search name or specialty"
-          className="min-h-12 w-full rounded-xl border border-input bg-background py-3 pl-11 pr-4 text-foreground shadow-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-        />
+      <div className="grid max-w-3xl gap-4 sm:grid-cols-2">
+        <div>
+          <label htmlFor="doctor-search" className="mb-1.5 block text-sm font-medium text-foreground">Search by doctor name</label>
+          <div className="relative">
+            <Search aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 size-5 -translate-y-1/2 text-muted-foreground" />
+            <input id="doctor-search" type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search doctor name..." className="min-h-12 w-full rounded-xl border border-input bg-background py-3 pl-11 pr-4 text-foreground shadow-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring" />
+          </div>
+        </div>
+        <div>
+          <label htmlFor="doctor-specialty" className="mb-1.5 block text-sm font-medium text-foreground">Specialty</label>
+          <Select value={specialty} onValueChange={selectSpecialty}>
+            <SelectTrigger id="doctor-specialty"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Specialties</SelectItem>
+              {MEDICAL_SPECIALTIES.map((item) => <SelectItem key={item} value={item}>{item}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </div>
       </div>
 
       {loading ? <p className="rounded-xl bg-muted p-5 text-sm text-muted-foreground" role="status">Loading doctors…</p> : null}
@@ -90,7 +109,7 @@ export function DoctorDirectory() {
       ) : null}
 
       {!loading && !error && doctors.length > 0 && filteredDoctors.length === 0 ? (
-        <p className="rounded-xl bg-muted p-5 text-sm text-muted-foreground" role="status">No doctors match “{search.trim()}”. Try another name or specialty.</p>
+        <p className="rounded-xl bg-muted p-5 text-sm text-muted-foreground" role="status">No doctors match those filters. Try another name or specialty.</p>
       ) : null}
 
       {!loading && !error && filteredDoctors.length > 0 ? (
