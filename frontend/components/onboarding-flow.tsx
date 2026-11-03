@@ -15,6 +15,8 @@ import {
 } from "@/lib/profile-api";
 import { emptyOnboardingForm, onboardingFormSchema, type OnboardingFormValues } from "@/lib/onboarding-schemas";
 import { dashboardPath } from "@/lib/roles";
+import { MEDICAL_SPECIALTIES } from "@/lib/medical-specialties";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 type Role = "patient" | "doctor";
 type FieldName = keyof OnboardingFormValues;
@@ -277,13 +279,27 @@ export function OnboardingFlow() {
                 <Field label="Phone (optional)" name="phone" value={values.phone} error={fieldErrors.phone} onChange={(value) => updateField("phone", value)} autoComplete="tel" type="tel" />
                 {role === "doctor" ? (
                   <>
-                    <Field label="Specialty" name="specialty" value={values.specialty} error={fieldErrors.specialty} required onChange={(value) => updateField("specialty", value)} />
+                    <div>
+                      <label htmlFor="specialty-select" className="mb-1.5 block text-sm font-medium text-foreground">Specialty <span aria-hidden="true">*</span></label>
+                      <Select value={values.specialty} onValueChange={(value) => updateField("specialty", value)}>
+                        <SelectTrigger id="specialty-select" aria-invalid={Boolean(fieldErrors.specialty)} aria-describedby={fieldErrors.specialty ? "specialty-error" : undefined}><SelectValue placeholder="Choose a specialty" /></SelectTrigger>
+                        <SelectContent>{MEDICAL_SPECIALTIES.map((specialty) => <SelectItem key={specialty} value={specialty}>{specialty}</SelectItem>)}</SelectContent>
+                      </Select>
+                      {fieldErrors.specialty ? <p id="specialty-error" className="mt-1.5 text-sm text-destructive" role="alert">{fieldErrors.specialty}</p> : null}
+                    </div>
                     <TextAreaField label="Bio (optional)" name="bio" value={values.bio} error={fieldErrors.bio} onChange={(value) => updateField("bio", value)} rows={4} />
                   </>
                 ) : (
                   <>
                     <Field label="Date of birth (optional)" name="date_of_birth" value={values.date_of_birth} error={fieldErrors.date_of_birth} onChange={(value) => updateField("date_of_birth", value)} type="date" />
-                    <Field label="Gender (optional)" name="gender" value={values.gender} error={fieldErrors.gender} onChange={(value) => updateField("gender", value)} />
+                    <div>
+                      <label htmlFor="gender-select" className="mb-1.5 block text-sm font-medium text-foreground">Gender (optional)</label>
+                      <Select value={values.gender || "none"} onValueChange={(value) => updateField("gender", value === "none" ? "" : value)}>
+                        <SelectTrigger id="gender-select" aria-invalid={Boolean(fieldErrors.gender)} aria-describedby={fieldErrors.gender ? "gender-error" : undefined}><SelectValue placeholder="Select gender" /></SelectTrigger>
+                        <SelectContent><SelectItem value="none">Prefer not to say</SelectItem><SelectItem value="Female">Female</SelectItem><SelectItem value="Male">Male</SelectItem></SelectContent>
+                      </Select>
+                      {fieldErrors.gender ? <p id="gender-error" className="mt-1.5 text-sm text-destructive" role="alert">{fieldErrors.gender}</p> : null}
+                    </div>
                   </>
                 )}
               </div>

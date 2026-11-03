@@ -369,6 +369,7 @@ function createPaymentService({ database, stripe, emailNotificationService, fron
         patientId: current.patient_id,
         reason: current.reason,
         holdId: current.slot_hold_id,
+        consultationFee: current.amount,
         timeZone,
       }).catch(async (error) => {
         if (!(error instanceof appointmentService.AppointmentError) || error.code !== "SLOT_UNAVAILABLE") throw error;
@@ -531,8 +532,12 @@ function createPaymentService({ database, stripe, emailNotificationService, fron
     return { status: payment.status, appointment: appointmentDetails ? appointment : null, reconciliation_id: reconciliation.rows[0]?.id || null };
   }
 
-  async function getPaymentHistory(user) {
+  async function getPaymentHistory(user, pagination = {}) {
     if (user.role !== "patient") fail(403, "FORBIDDEN", "Only patients can view payment history");
+    const limit = pagination.limit;
+    const offset = pagination.offset ?? 0;
+    const pageSql = limit === undefined ? "" : " LIMIT $2 OFFSET $3";
+    const queryValues = limit === undefined ? [user.id] : [user.id, limit + 1, offset];
     const result = await database.query(
       `SELECT p.id, p.amount::text AS amount, p.currency, p.status, p.provider,
               p.provider_payment_id, p.created_at, p.captured_at,
@@ -551,9 +556,11 @@ function createPaymentService({ database, stripe, emailNotificationService, fron
        LEFT JOIN availability av ON av.id = COALESCE(a.availability_id, h.availability_id)
        LEFT JOIN doctors d ON d.id = av.doctor_id
        LEFT JOIN users du ON du.id = d.user_id
-       ORDER BY COALESCE(p.captured_at, p.created_at) DESC, p.id`, [user.id],
+       ORDER BY COALESCE(p.captured_at, p.created_at) DESC, p.id${pageSql}`, queryValues,
     );
-    const paymentIds = result.rows.map((payment) => payment.id);
+    const hasMore = limit !== undefined && result.rows.length > limit;
+    const pageRows = limit === undefined ? result.rows : result.rows.slice(0, limit);
+    const paymentIds = pageRows.map((payment) => payment.id);
     const refundRows = paymentIds.length
       ? (await database.query(
         `SELECT id, payment_id, amount::text AS amount, currency, status, reason,
@@ -567,7 +574,7 @@ function createPaymentService({ database, stripe, emailNotificationService, fron
       list.push(refund);
       refundsByPayment.set(refund.payment_id, list);
     }
-    return Promise.all(result.rows.map(async (payment) => {
+    const items = await Promise.all(pageRows.map(async (payment) => {
       let receiptUrl = null;
       if (["captured", "partially_refunded", "refunded"].includes(payment.status)
         && payment.provider === "stripe" && payment.provider_payment_id) {
@@ -615,6 +622,8 @@ function createPaymentService({ database, stripe, emailNotificationService, fron
         refunds: refundsByPayment.get(payment.id) || [],
       };
     }));
+    if (limit === undefined) return items;
+    return { items, has_more: hasMore, next_offset: offset + items.length };
   }
 
   async function cancelCheckoutSession(user, paymentId) {

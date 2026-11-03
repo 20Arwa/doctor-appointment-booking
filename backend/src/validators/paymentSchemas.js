@@ -7,5 +7,11 @@ const createPaymentOrderSchema = z.object({
 }).strict();
 
 const paymentIdParamsSchema = z.object({ id: z.string().uuid() }).strict();
+const paymentHistoryQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+  offset: z.coerce.number().int().min(0).max(1000000).optional(),
+}).strict().refine((query) => query.offset === undefined || query.limit !== undefined, {
+  path: ["offset"], message: "offset requires limit",
+});
 
-module.exports = { createPaymentOrderSchema, paymentIdParamsSchema };
+module.exports = { createPaymentOrderSchema, paymentHistoryQuerySchema, paymentIdParamsSchema };

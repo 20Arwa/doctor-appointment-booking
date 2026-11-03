@@ -17,10 +17,10 @@ import {
 import { Button } from "@/components/ui/button";
 import { CancellationRefundEstimate } from "@/components/cancellation-refund-estimate";
 import { notifyError, notifySuccess } from "@/lib/notifications";
+import { useAppointmentHistory } from "@/components/use-appointment-history";
 import {
   cancelAppointment,
   getAppointmentCancellationRefundPreview,
-  getAppointments,
   getDoctorSlots,
   ProfileApiError,
   rescheduleAppointment,
@@ -35,6 +35,13 @@ function appointmentInstant(appointment: Pick<PatientAppointment, "date" | "star
   const instant = new Date(`${appointment.date}T${appointment.start_time}+05:30`);
   return Number.isNaN(instant.getTime()) ? null : instant;
 }
+
+function appointmentEndInstant(appointment: Pick<PatientAppointment, "date" | "end_time">) {
+  const instant = new Date(`${appointment.date}T${appointment.end_time}+05:30`);
+  return Number.isNaN(instant.getTime()) ? null : instant;
+}
+
+const inrFormatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
 
 function appointmentDate(date: string) {
   const [year, month, day] = date.split("-").map(Number);
@@ -82,11 +89,8 @@ function conflictMessage(error: unknown, fallback: string) {
 export function PatientAppointmentsPage() {
   const { getToken } = useAuth();
   const pathname = usePathname();
-  const [appointments, setAppointments] = useState<PatientAppointment[]>([]);
+  const { appointments, setAppointments, loading, error: loadError, history, retry: retryAppointments, loadMore } = useAppointmentHistory();
   const [currentTime, setCurrentTime] = useState<number | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
   const [activeRequest, setActiveRequest] = useState<string | null>(null);
   const requestLock = useRef(false);
   const [rescheduleId, setRescheduleId] = useState<string | null>(null);
@@ -106,26 +110,10 @@ export function PatientAppointmentsPage() {
   }
 
   useEffect(() => {
-    let active = true;
-    void getToken()
-      .then((token) => {
-        if (!token) throw new Error("Your session could not be verified. Please try again.");
-        return getAppointments(token);
-      })
-      .then((result) => {
-        if (active) {
-          setAppointments(result);
-          setCurrentTime(Date.now());
-        }
-      })
-      .catch((error: unknown) => {
-        if (active) setLoadError(error instanceof Error ? error.message : "We couldn't load your appointments.");
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => { active = false; };
-  }, [getToken, refreshKey]);
+    const initialTime = window.setTimeout(() => setCurrentTime(Date.now()), 0);
+    const timer = window.setInterval(() => setCurrentTime(Date.now()), 30_000);
+    return () => { window.clearTimeout(initialTime); window.clearInterval(timer); };
+  }, []);
 
   useEffect(() => {
     if (!cancelTarget) return;
@@ -150,19 +138,17 @@ export function PatientAppointmentsPage() {
     return secondInstant - firstInstant;
   });
   const upcoming = ordered.filter((appointment) => appointment.status === "confirmed" && (() => {
-    const instant = appointmentInstant(appointment);
+    const instant = appointmentEndInstant(appointment);
     return instant !== null && instant.getTime() > now;
   })()).sort((first, second) => (appointmentInstant(first)?.getTime() ?? 0) - (appointmentInstant(second)?.getTime() ?? 0));
   const past = ordered.filter((appointment) => appointment.status !== "cancelled" && (() => {
-    const instant = appointmentInstant(appointment);
-    return appointment.status === "completed" || instant !== null && instant.getTime() <= now;
+    const endInstant = appointmentEndInstant(appointment);
+    return appointment.status === "completed" || endInstant !== null && endInstant.getTime() <= now;
   })());
   const cancelled = ordered.filter((appointment) => appointment.status === "cancelled");
 
   function retryList() {
-    setLoading(true);
-    setLoadError(null);
-    setRefreshKey((key) => key + 1);
+    retryAppointments();
   }
 
   async function beginReschedule(appointment: PatientAppointment) {
@@ -265,13 +251,13 @@ export function PatientAppointmentsPage() {
       {!loading && !loadError ? (
         <>
           <AppointmentSection title="Upcoming appointments" empty="You have no upcoming appointments." appointments={upcoming}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
-          <AppointmentSection title="Past appointments" empty="Your past appointments will appear here." appointments={past}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+          <AppointmentSection title="Past appointments" empty="Your past appointments will appear here." appointments={past} hasMore={history.past.hasMore} loadingMore={history.past.loading} moreError={history.past.error} onShowMore={() => void loadMore("past")}>
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
-          <AppointmentSection title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+          <AppointmentSection title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} hasMore={history.cancelled.hasMore} loadingMore={history.cancelled.loading} moreError={history.cancelled.error} onShowMore={() => void loadMore("cancelled")}>
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
         </>
       ) : null}
@@ -279,7 +265,7 @@ export function PatientAppointmentsPage() {
         <AlertDialogContent className="max-w-md rounded-2xl border border-border bg-card p-6 text-card-foreground shadow-xl ring-0 sm:max-w-md">
           <AlertDialogHeader>
             <AlertDialogTitle>Cancel appointment?</AlertDialogTitle>
-            <AlertDialogDescription>This will cancel your confirmed appointment. You can review cancelled appointments in the history below.</AlertDialogDescription>
+            <AlertDialogDescription>This will cancel your confirmed appointment.</AlertDialogDescription>
           </AlertDialogHeader>
           <CancellationRefundEstimate preview={refundPreview} loading={refundPreviewLoading} error={refundPreviewError} />
           <AlertDialogFooter className="m-0 flex-row justify-end gap-3 border-0 bg-transparent p-0">
@@ -295,22 +281,29 @@ export function PatientAppointmentsPage() {
   );
 }
 
-function AppointmentSection({ title, empty, appointments, children }: {
+function AppointmentSection({ title, empty, appointments, children, hasMore = false, loadingMore = false, moreError = null, onShowMore }: {
   title: string;
   empty: string;
   appointments: PatientAppointment[];
   children: (appointment: PatientAppointment) => React.ReactNode;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  moreError?: string | null;
+  onShowMore?: () => void;
 }) {
   return (
     <section aria-label={title}>
       <h2 className="text-xl font-semibold text-foreground">{title}</h2>
       {appointments.length === 0 ? <p className="mt-4 rounded-xl bg-muted p-5 text-sm text-muted-foreground">{empty}</p> : <ul className="mt-4 space-y-4">{appointments.map(children)}</ul>}
+      {moreError ? <p className="mt-3 text-sm text-destructive" role="alert">{moreError}</p> : null}
+      {hasMore ? <div className="mt-4 flex justify-center"><button type="button" onClick={onShowMore} disabled={loadingMore} className="inline-flex min-h-11 items-center justify-center rounded-lg border border-border bg-card px-5 text-sm font-semibold text-foreground transition-colors hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-wait disabled:opacity-60">{loadingMore ? "Loading…" : moreError ? "Try again" : "Show More"}</button></div> : null}
     </section>
   );
 }
 
-function AppointmentCard({ appointment, activeRequest, rescheduleId, slots, slotsLoading, slotsError, selectedSlotId, onCancel, onBeginReschedule, onSelectSlot, onConfirmReschedule, onCloseReschedule }: {
+function AppointmentCard({ appointment, isPast, activeRequest, rescheduleId, slots, slotsLoading, slotsError, selectedSlotId, onCancel, onBeginReschedule, onSelectSlot, onConfirmReschedule, onCloseReschedule }: {
   appointment: PatientAppointment;
+  isPast: boolean;
   activeRequest: string | null;
   rescheduleId: string | null;
   slots: AvailabilitySlot[];
@@ -323,7 +316,6 @@ function AppointmentCard({ appointment, activeRequest, rescheduleId, slots, slot
   onConfirmReschedule: () => void;
   onCloseReschedule: () => void;
 }) {
-  const instant = appointmentInstant(appointment);
   const isBusy = activeRequest?.endsWith(appointment.id) ?? false;
   const rescheduling = rescheduleId === appointment.id;
 
@@ -340,10 +332,12 @@ function AppointmentCard({ appointment, activeRequest, rescheduleId, slots, slot
           {appointment.reason ? <p className="mt-3 text-sm leading-6 text-muted-foreground"><span className="font-medium text-foreground">Reason:</span> {appointment.reason}</p> : null}
           <p className="mt-2 text-xs text-muted-foreground">Appointment ID: {appointment.id}</p>
         </div>
-        <span className={`inline-flex w-fit rounded-full px-3 py-1 text-xs font-semibold capitalize ${statusClasses(appointment.status)}`}>{appointment.status}</span>
+        <span className={`inline-flex w-fit rounded-full px-3 py-1 text-xs font-semibold ${statusClasses(appointment.status)}`}>{appointment.status === "confirmed" && isPast ? "Awaiting completion" : appointment.status}</span>
       </div>
 
-      {appointment.status === "confirmed" ? (
+      <p className="mt-3 text-sm text-muted-foreground">Consultation fee: {appointment.consultation_fee != null ? inrFormatter.format(Number(appointment.consultation_fee)) : "Unavailable"}</p>
+
+      {appointment.status === "confirmed" && !isPast ? (
         <div className="mt-5 flex flex-wrap gap-3 border-t border-border pt-4">
           <Button type="button" variant="outline" size="compact" disabled={Boolean(activeRequest)} onClick={onBeginReschedule}>
             {activeRequest === `slots:${appointment.id}` ? "Loading times…" : "Reschedule"}
@@ -381,7 +375,7 @@ function AppointmentCard({ appointment, activeRequest, rescheduleId, slots, slot
         </div>
       ) : null}
       {isBusy ? <span className="sr-only" role="status">Updating appointment</span> : null}
-      {instant === null ? <span className="sr-only">Appointment time could not be interpreted.</span> : null}
+      {!appointmentEndInstant(appointment) ? <span className="sr-only">Appointment time could not be interpreted.</span> : null}
     </li>
   );
 }

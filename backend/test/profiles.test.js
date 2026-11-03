@@ -108,10 +108,11 @@ describe("Phase 1 database migration", () => {
 
 describe("profile authorization", () => {
   it("reads Clerk's function-valued request auth before serving the current profile", async () => {
-    const patientProfile = { id: "22222222-2222-4222-8222-222222222222", date_of_birth: null, gender: null };
+    const patientProfile = { id: "22222222-2222-4222-8222-222222222222", date_of_birth: "1990-02-03", gender: null };
+    let profileQuery = "";
     const app = testApp({ databaseQuery: async (sql) => {
       if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [sampleUser] };
-      if (sql.includes("FROM patients WHERE user_id")) return { rows: [patientProfile] };
+      if (sql.includes("FROM patients WHERE user_id")) { profileQuery = sql; return { rows: [patientProfile] }; }
       return { rows: [] };
     } });
 
@@ -122,6 +123,8 @@ describe("profile authorization", () => {
       assert.equal(response.status, 200);
       assert.equal(body.id, sampleUser.id);
       assert.equal(body.profile.id, patientProfile.id);
+      assert.equal(body.profile.date_of_birth, "1990-02-03");
+      assert.match(profileQuery, /date_of_birth::text AS date_of_birth/i);
     });
   });
 

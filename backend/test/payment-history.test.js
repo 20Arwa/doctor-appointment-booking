@@ -39,7 +39,8 @@ function createFixture() {
         return { rows: [] };
       }
       if (sql.includes("FROM payments p") && sql.includes("patient_owner.user_id = $1")) {
-        return { rows: values[0] === ownerId ? historyRows : [] };
+        if (values[0] !== ownerId) return { rows: [] };
+        return { rows: values.length > 1 ? historyRows.slice(values[2], values[2] + values[1]) : historyRows };
       }
       if (sql.includes("FROM refunds WHERE payment_id = ANY")) {
         return { rows: values[0].includes(paymentId) ? refunds : [] };
@@ -105,6 +106,24 @@ describe("patient payment history API", () => {
     assert.equal(payment.receipt_url, "https://pay.stripe.com/receipts/payment/test-receipt");
     const withoutReceipt = payments.find((item) => item.id === paymentWithoutReceiptId);
     assert.equal(withoutReceipt.receipt_url, null);
+  });
+
+  it("returns bounded payment pages with a has-more flag", async () => {
+    fixture.stripeCalls.length = 0;
+    const response = await fetch(`${baseUrl}/api/v1/payments/history?limit=1&offset=0`);
+    assert.equal(response.status, 200);
+    const page = await response.json();
+    assert.equal(page.items.length, 1);
+    assert.equal(page.items[0].id, paymentId);
+    assert.equal(page.has_more, true);
+    assert.equal(page.next_offset, 1);
+    assert.ok(fixture.databaseCalls.some(({ sql, values }) => sql.includes("LIMIT $2 OFFSET $3") && values[1] === 2 && values[2] === 0));
+    assert.deepEqual(fixture.stripeCalls, [intentId]);
+
+    const second = await fetch(`${baseUrl}/api/v1/payments/history?limit=1&offset=1`);
+    const secondPage = await second.json();
+    assert.equal(secondPage.items[0].id, paymentWithoutReceiptId);
+    assert.equal(secondPage.has_more, false);
   });
 
   it("scopes history to the authenticated patient and does not retrieve another patient's Stripe data", async () => {

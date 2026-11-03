@@ -64,11 +64,15 @@ function refundAmount(refunds: PatientPaymentHistoryItem["refunds"], currency: s
   return refundedMinorUnits ? formatPaymentAmount(refundedMinorUnits / 100, currency) : null;
 }
 
-export function PaymentHistoryView({ payments, loading, error, onRetry }: {
+export function PaymentHistoryView({ payments, loading, error, onRetry, hasMore, loadingMore, moreError, onShowMore }: {
   payments: PatientPaymentHistoryItem[];
   loading: boolean;
   error: string | null;
   onRetry: () => void;
+  hasMore: boolean;
+  loadingMore: boolean;
+  moreError: string | null;
+  onShowMore: () => void;
 }) {
   if (loading) {
     return <div role="status" aria-live="polite" className="rounded-2xl border border-border bg-card p-6 text-muted-foreground">Loading payment history…</div>;
@@ -89,7 +93,8 @@ export function PaymentHistoryView({ payments, loading, error, onRetry }: {
     </section>;
   }
   return (
-    <ul className="space-y-4" aria-label="Payment history">
+    <div className="space-y-4">
+      <ul className="space-y-4" aria-label="Payment history">
       {payments.map((payment) => {
         const refunded = refundAmount(payment.refunds, payment.currency);
         return (
@@ -129,6 +134,9 @@ export function PaymentHistoryView({ payments, loading, error, onRetry }: {
           </li>
         );
       })}
-    </ul>
+      </ul>
+      {moreError ? <p className="text-sm text-destructive" role="alert">{moreError}</p> : null}
+      {hasMore ? <div className="flex justify-center"><button type="button" onClick={onShowMore} disabled={loadingMore} className="inline-flex min-h-11 items-center justify-center rounded-lg border border-border bg-card px-5 text-sm font-semibold text-foreground transition-colors hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-wait disabled:opacity-60">{loadingMore ? "Loading…" : moreError ? "Try again" : "Show More"}</button></div> : null}
+    </div>
   );
 }

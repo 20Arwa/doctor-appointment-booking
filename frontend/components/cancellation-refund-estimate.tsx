@@ -34,8 +34,13 @@ export function CancellationRefundEstimate({ preview, loading, error }: {
         <dd className="mt-0.5 font-semibold text-foreground">{preview.currency ? formatAmount(preview.estimated_refund_amount, preview.currency) : "Unavailable"}</dd>
       </div>
     </dl>
-    {!preview.refund_expected && <p className="mt-3 text-sm font-medium text-muted-foreground">No refund is expected. {preview.explanation}</p>}
-    {preview.refund_expected && <p className="mt-3 text-sm text-muted-foreground">{preview.explanation}</p>}
-    <p className="mt-2 text-xs text-muted-foreground">This estimate is informational. The backend recalculates the actual refund when you confirm cancellation.</p>
+    {!preview.refund_expected && (
+      <p className="mt-3 text-sm font-medium text-muted-foreground">
+        No refund is expected. {preview.explanation}
+      </p>
+    )}
+    <p className="mt-2 text-xs text-muted-foreground">
+      The estimated refund may change. The final amount will be calculated when you confirm the cancellation.
+    </p>  
   </section>;
 }

@@ -2,7 +2,7 @@ const express = require("express");
 const { createPaymentController } = require("../controllers/paymentController");
 const { requireClerkIdentity, requireLocalUser } = require("../middleware/auth");
 const { validate } = require("../middleware/validate");
-const { createPaymentOrderSchema, paymentIdParamsSchema } = require("../validators/paymentSchemas");
+const { createPaymentOrderSchema, paymentHistoryQuerySchema, paymentIdParamsSchema } = require("../validators/paymentSchemas");
 
 function createPaymentRoutes({ service, webhook = false }) {
   const router = express.Router();
@@ -12,7 +12,7 @@ function createPaymentRoutes({ service, webhook = false }) {
     return router;
   }
   router.use(requireClerkIdentity, requireLocalUser);
-  router.get("/history", controller.history);
+  router.get("/history", validate(paymentHistoryQuerySchema, "query"), controller.history);
   router.post("/orders", validate(createPaymentOrderSchema, "body"), controller.createOrder);
   router.get("/:id/status", validate(paymentIdParamsSchema, "params"), controller.status);
   router.post("/:id/cancel", validate(paymentIdParamsSchema, "params"), controller.cancel);

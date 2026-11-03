@@ -24,7 +24,7 @@ function handle(operation) {
 }
 
 const listAppointments = handle(async (_request, response) => ({
-  body: await appointmentService.listAppointments(response.locals.database, response.locals.user, response.locals.query),
+  body: await appointmentService.listAppointments(response.locals.database, response.locals.user, response.locals.query, response.locals.applicationTimezone),
 }));
 
 const createAppointment = (_request, response) => {

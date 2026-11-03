@@ -9,7 +9,6 @@ import {
   LayoutDashboard,
   Menu,
   ReceiptText,
-  Stethoscope,
   UserRound,
   X,
 } from "lucide-react";
@@ -19,6 +18,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, ty
 import { getCurrentProfile, ProfileApiError, type LocalProfile } from "@/lib/profile-api";
 import { dashboardPath, type AppRole } from "@/lib/roles";
 import { AppShellLoading } from "@/components/app-shell-loading";
+import { HomepageSectionNavigation } from "@/components/homepage-section-navigation";
 
 type AppNavigationItem = {
   label: string;
@@ -129,7 +129,8 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
       <UpdateProfileContext.Provider value={setProfile}>
       <div className="min-h-screen bg-background text-foreground md:flex">
         <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r border-sidebar-border bg-sidebar px-4 py-6 text-sidebar-foreground md:flex">
-          <Link href={dashboardPath(requiredRole)} aria-label="Medrella dashboard" className="flex items-center gap-2 px-3 text-xl font-semibold tracking-tight focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sidebar-ring">
+          {/* <Link href={dashboardPath(requiredRole)} aria-label="Medrella dashboard" className="flex items-center gap-2 px-3 text-xl font-semibold tracking-tight focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sidebar-ring"> */}
+          <Link href="/" aria-label="Medrella dashboard" className="flex items-center gap-2 px-3 text-xl font-semibold tracking-tight focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sidebar-ring">
             <span className="flex size-9 items-center justify-center rounded-full bg-sidebar-primary text-sidebar-primary-foreground"><HeartPulse aria-hidden="true" className="size-5" /></span>
             Medrella
             {/* <span className="text-sidebar-primary">.</span> */}
@@ -149,6 +150,7 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
           <header className="sticky top-0 z-20 flex min-h-16 items-center justify-between gap-4 border-b border-border bg-background/95 px-4 backdrop-blur sm:px-6 md:px-8">
             <Link href={dashboardPath(requiredRole)} aria-label="Medrella dashboard" className="text-lg font-semibold tracking-tight text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring md:hidden">Medrella<span className="text-primary">.</span></Link>
             <p className="hidden text-sm font-medium text-muted-foreground md:block">{roleLabel}</p>
+          <HomepageSectionNavigation role={requiredRole} />
             <div className="ml-auto flex items-center gap-3">
               <span className="hidden max-w-64 truncate text-sm font-medium text-foreground sm:block">{displayName}</span>
               <details className="group relative md:hidden" ref={mobileNavigation}>
@@ -194,7 +196,7 @@ function NavigationLinks({ items, pathname, onNavigate, mobile = false }: {
             onClick={onNavigate}
             className={`flex min-h-11 items-center gap-3 rounded-xl px-3 text-sm font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 ${mobile
               ? isActive ? "bg-secondary text-secondary-foreground focus-visible:outline-ring" : "text-foreground hover:bg-muted focus-visible:outline-ring"
-              : isActive ? "bg-sidebar-accent text-sidebar-accent-foreground focus-visible:outline-sidebar-ring" : "text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:outline-sidebar-ring"
+              : isActive ? "bg-sidebar-primary text-sidebar-primary-foreground shadow-sm focus-visible:outline-sidebar-ring" : "text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:outline-sidebar-ring"
             }`}
           >
             <Icon aria-hidden="true" className="size-5 shrink-0" />

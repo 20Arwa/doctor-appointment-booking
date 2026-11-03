@@ -1,3 +1,5 @@
+const appointmentService = require("../services/appointmentService");
+
 async function listDoctors(_request, response) {
   const result = await response.locals.database.query(
     "SELECT d.id, u.first_name, u.last_name, d.specialty, d.bio, d.consultation_fee::float8 AS consultation_fee, d.created_at, d.updated_at FROM doctors d JOIN users u ON u.id = d.user_id WHERE u.is_active = TRUE ORDER BY u.last_name, u.first_name",
@@ -34,4 +36,38 @@ async function updateDoctor(_request, response, next) {
   } catch (error) { return next(error); }
 }
 
-module.exports = { getDoctor, listDoctors, updateDoctor };
+async function getDoctorPatient(_request, response, next) {
+  try {
+    const patient = await appointmentService.getDoctorPatient(
+      response.locals.database,
+      response.locals.user,
+      response.locals.params.patientId,
+    );
+    return response.json(patient);
+  } catch (error) {
+    if (error instanceof appointmentService.AppointmentError) {
+      return response.status(error.status).json({ error: { code: error.code, message: error.message } });
+    }
+    return next(error);
+  }
+}
+
+async function listDoctorPatientAppointments(_request, response, next) {
+  try {
+    const page = await appointmentService.listDoctorPatientAppointments(
+      response.locals.database,
+      response.locals.user,
+      response.locals.params.patientId,
+      response.locals.query,
+      response.locals.applicationTimezone,
+    );
+    return response.json(page);
+  } catch (error) {
+    if (error instanceof appointmentService.AppointmentError) {
+      return response.status(error.status).json({ error: { code: error.code, message: error.message } });
+    }
+    return next(error);
+  }
+}
+
+module.exports = { getDoctor, getDoctorPatient, listDoctorPatientAppointments, listDoctors, updateDoctor };

@@ -17,6 +17,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { notifySuccess } from "@/lib/notifications";
 import { AppShellLoading } from "@/components/app-shell-loading";
 import { CheckoutReturnNotice, type CheckoutReturnState } from "@/components/checkout-return-notice";
 import { cancelAppointmentPaymentOrder, createAppointmentPaymentOrder, getAppointmentPaymentStatus, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
@@ -91,6 +92,18 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   const submissionInProgress = useRef(false);
   const paymentCheckInProgress = useRef(false);
   const checkoutReturnProcessed = useRef(false);
+  const confirmationRef = useRef<HTMLElement>(null);
+  const announcedConfirmation = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!confirmation || announcedConfirmation.current === confirmation.id) return;
+    announcedConfirmation.current = confirmation.id;
+    notifySuccess("Appointment booked successfully!", `appointment-booked-${confirmation.id}`);
+    requestAnimationFrame(() => {
+      confirmationRef.current?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+      confirmationRef.current?.focus({ preventScroll: true });
+    });
+  }, [confirmation]);
 
   const routeKey = `${pathname}:${doctorId}`;
   const [previousRouteKey, setPreviousRouteKey] = useState(routeKey);
@@ -270,7 +283,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
           </section>
 
           {confirmation ? (
-            <section className="rounded-3xl border border-border bg-card p-6 shadow-sm sm:p-8" aria-live="polite" aria-labelledby="booking-confirmation-title">
+            <section ref={confirmationRef} tabIndex={-1} className="scroll-mt-8 rounded-3xl border border-border bg-card p-6 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring sm:p-8" aria-live="polite" aria-labelledby="booking-confirmation-title">
               <div className="flex items-center gap-3">
                 <CheckCircle2 aria-hidden="true" className="size-7 text-primary" />
                 <h2 id="booking-confirmation-title" className="text-xl font-semibold text-card-foreground">Appointment confirmed</h2>
@@ -361,7 +374,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
                   </div>
                 </dl>
               ) : null}
-              <p className="text-sm text-muted-foreground">Pay in Stripe Test Mode. Your selected slot is held for up to 40 minutes while Checkout is in progress.</p>
+              {/* <p className="text-sm text-muted-foreground">Pay in Stripe Test Mode. Your selected slot is held for up to 40 minutes while Checkout is in progress.</p> */}
               {bookingError ? <p className="text-sm text-destructive" role="alert">{bookingError}</p> : null}
               <AlertDialogFooter className="m-0 flex-row justify-end gap-3 border-0 bg-transparent p-0">
                 <AlertDialogCancel disabled={booking}>Go back</AlertDialogCancel>

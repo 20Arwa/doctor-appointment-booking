@@ -75,13 +75,27 @@ function createDatabase({
           : slot?.doctor_id === doctorId && ownerId === currentUser.id;
         return { rows: allowed ? [details(appointment)] : [] };
       }
-      if (sql.includes("FROM appointments a") && sql.includes("ORDER BY av.date")) {
-        const [ownerId, status, from, to] = values;
-        const rows = state.appointments.filter((appointment) => {
+      if (sql.includes("FROM appointments a") && sql.includes("ORDER BY a.scheduled_date")) {
+        const ownerId = values[0];
+        const statusIndex = Number(sql.match(/a\.status = \$(\d+)/)?.[1] || 0) - 1;
+        const fromIndex = Number(sql.match(/a\.scheduled_date >= \$(\d+)/)?.[1] || 0) - 1;
+        const toIndex = Number(sql.match(/a\.scheduled_date <= \$(\d+)/)?.[1] || 0) - 1;
+        const status = statusIndex >= 0 ? values[statusIndex] : undefined;
+        const from = fromIndex >= 0 ? values[fromIndex] : undefined;
+        const to = toIndex >= 0 ? values[toIndex] : undefined;
+        let rows = state.appointments.filter((appointment) => {
           const slot = state.slots.find((item) => item.id === appointment.availability_id);
           const owned = currentUser.role === "patient" ? ownerId === patientUserId && appointment.patient_id === patientId : ownerId === doctorUserId && slot?.doctor_id === doctorId;
-          return owned && (!status || appointment.status === status) && (!from || slot.date >= from) && (!to || slot.date <= to);
+          const pastView = sql.includes("a.status = 'completed' OR");
+          const cancelledView = sql.includes("a.status = 'cancelled'");
+          const isPast = appointment.status === "completed" || appointment.status === "confirmed" && (appointment.scheduled_date ?? slot?.date) <= new Date().toISOString().slice(0, 10);
+          return owned && (!status || appointment.status === status)
+            && (!pastView || isPast)
+            && (!cancelledView || appointment.status === "cancelled")
+            && (!from || slot.date >= from) && (!to || slot.date <= to);
         }).map(details);
+        if (sql.includes("ORDER BY a.scheduled_date DESC")) rows = rows.reverse();
+        if (sql.includes(" LIMIT ")) rows = rows.slice(values[values.length - 1], values[values.length - 2] + values[values.length - 1]);
         return { rows };
       }
       throw new Error(`Unexpected database query: ${sql}`);
@@ -242,6 +256,9 @@ describe("appointment schemas and migration", () => {
     assert.equal(appointmentQuerySchema.safeParse({ status: "confirmed", from: "2099-04-01", to: "2099-04-02" }).success, true);
     assert.equal(appointmentQuerySchema.safeParse({ status: "pending" }).success, false);
     assert.equal(appointmentQuerySchema.safeParse({ from: "2099-04-03", to: "2099-04-02" }).success, false);
+    assert.equal(appointmentQuerySchema.safeParse({ view: "past", limit: "5", offset: "0" }).success, true);
+    assert.equal(appointmentQuerySchema.safeParse({ view: "past" }).success, false);
+    assert.equal(appointmentQuerySchema.safeParse({ view: "past", limit: "1000" }).success, false);
     assert.equal(createAppointmentSchema.safeParse({ availability_id: firstSlotId, reason: "Checkup" }).success, true);
     assert.equal(createAppointmentSchema.safeParse({ availability_id: "nope", patient_id: patientId }).success, false);
     assert.equal(rescheduleAppointmentSchema.safeParse({ availability_id: secondSlotId }).success, true);
@@ -254,7 +271,7 @@ describe("appointment schemas and migration", () => {
     const directory = path.join(__dirname, "..", "migrations");
     const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(files.length, 11);
+    assert.equal(files.length, 12);
     assert.match(files[3], /^004_.*\.sql$/);
     assert.equal(files[4], "005_appointment_schedule_snapshot.sql");
     assert.equal(files[5], "006_doctor_consultation_fee.sql");
@@ -263,16 +280,50 @@ describe("appointment schemas and migration", () => {
     assert.equal(files[8], "009_payment_booking_reason.sql");
     assert.equal(files[9], "010_payment_capture_reconciliation.sql");
     assert.equal(files[10], "011_availability_soft_delete.sql");
+    assert.equal(files[11], "012_appointment_consultation_fee_snapshot.sql");
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);
     assert.match(sql, /UNIQUE INDEX appointments_availability_active_unique\s+ON appointments \(availability_id\)\s+WHERE status <> 'cancelled'/i);
     const snapshot = fs.readFileSync(path.join(directory, "005_appointment_schedule_snapshot.sql"), "utf8");
     assert.match(snapshot, /DROP INDEX appointments_availability_active_unique/i);
+    const feeSnapshot = fs.readFileSync(path.join(directory, "012_appointment_consultation_fee_snapshot.sql"), "utf8");
+    assert.match(feeSnapshot, /ADD COLUMN consultation_fee NUMERIC\(10, 2\)/i);
+    assert.match(feeSnapshot, /payment\.appointment_id = appointment\.id/i);
   });
 });
 
 describe("appointment workflows", () => {
+  it("paginates past and cancelled appointment history on the server", async () => {
+    const slots = Array.from({ length: 7 }, (_, index) => makeSlot(`55555555-5555-4555-8555-${String(index + 1).padStart(12, "0")}`, "10:00", "2000-04-10"));
+    const appointments = slots.map((slot, index) => ({
+      ...makeAppointment({ id: `66666666-6666-4666-8666-${String(index + 1).padStart(12, "0")}`, availability_id: slot.id, status: index === 0 ? "cancelled" : "completed" }),
+      scheduled_date: "2000-04-10",
+      scheduled_start_time: "10:00",
+      scheduled_end_time: "10:30",
+    }));
+    const { app } = createTestApp({ database: createDatabase({ slots, appointments }) });
+    await withServer(app, async (url) => {
+      const pastResponse = await fetch(`${url}/api/v1/appointments?view=past&limit=5&offset=0`);
+      const past = await pastResponse.json();
+      assert.equal(pastResponse.status, 200);
+      assert.equal(past.items.length, 5);
+      assert.equal(past.has_more, true);
+      assert.equal(past.next_offset, 5);
+      const nextPastResponse = await fetch(`${url}/api/v1/appointments?view=past&limit=5&offset=5`);
+      const nextPast = await nextPastResponse.json();
+      assert.equal(nextPast.items.length, 1);
+      assert.notEqual(nextPast.items[0].id, past.items[0].id);
+      assert.equal(nextPast.has_more, false);
+
+      const cancelledResponse = await fetch(`${url}/api/v1/appointments?view=cancelled&limit=5&offset=0`);
+      const cancelled = await cancelledResponse.json();
+      assert.equal(cancelled.items.length, 1);
+      assert.equal(cancelled.items[0].status, "cancelled");
+      assert.equal(cancelled.has_more, false);
+    });
+  });
+
   it("keeps historical appointments visible through a soft-deleted availability row", async () => {
     const pastSlot = makeSlot(firstSlotId, "10:00", "2000-04-10", "2026-10-30T00:00:00.000Z");
     const historical = makeAppointment({ status: "completed" });

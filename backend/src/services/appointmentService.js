@@ -6,13 +6,17 @@ const APPOINTMENT_DETAILS = `
          a.scheduled_date::text AS date, a.scheduled_start_time::text AS start_time, a.scheduled_end_time::text AS end_time,
          d.id AS doctor_id, du.first_name AS doctor_first_name, du.last_name AS doctor_last_name,
          d.specialty, p.id AS patient_id, pu.first_name AS patient_first_name,
-         pu.last_name AS patient_last_name, pu.email AS patient_email
+         pu.last_name AS patient_last_name, pu.email AS patient_email,
+         p.date_of_birth::text AS patient_date_of_birth, p.gender AS patient_gender,
+         a.consultation_fee::text AS consultation_fee,
+         CASE WHEN a.consultation_fee IS NULL THEN NULL ELSE 'INR' END AS consultation_currency
   FROM appointments a
   JOIN availability av ON av.id = a.availability_id
   JOIN doctors d ON d.id = av.doctor_id
   JOIN users du ON du.id = d.user_id
   JOIN patients p ON p.id = a.patient_id
-  JOIN users pu ON pu.id = p.user_id`;
+  JOIN users pu ON pu.id = p.user_id
+  `;
 
 class AppointmentError extends Error {
   constructor(status, code, message) {
@@ -91,7 +95,7 @@ async function ensureNoActivePaymentHold(client, doctorId, date, startTime, endT
   if (held.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time is temporarily reserved for payment");
 }
 
-async function createPaymentAppointment(client, { availabilityId, patientId, reason, holdId, timeZone }) {
+async function createPaymentAppointment(client, { availabilityId, patientId, reason, holdId, consultationFee, timeZone }) {
   const slot = await lockBookableSlot(client, availabilityId, timeContext(timeZone));
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [slot.doctor_id]);
   await ensureNoActivePaymentHold(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time, holdId);
@@ -106,9 +110,9 @@ async function createPaymentAppointment(client, { availabilityId, patientId, rea
   );
   if (conflict.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time overlaps another confirmed appointment");
   const created = await client.query(
-    `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time)
-     VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time) RETURNING id`,
-    [patientId, availabilityId, reason, slot.date, slot.start_time, slot.end_time],
+    `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time, consultation_fee)
+     VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time, $7::numeric) RETURNING id`,
+    [patientId, availabilityId, reason, slot.date, slot.start_time, slot.end_time, consultationFee],
   );
   return readDetails(client, created.rows[0].id);
 }
@@ -118,7 +122,7 @@ async function readDetails(client, appointmentId) {
   return result.rows[0];
 }
 
-async function listAppointments(database, user, filters) {
+async function listAppointments(database, user, filters, timeZone = "Asia/Kolkata") {
   let ownership;
   if (user.role === "patient") {
     ownership = "p.user_id = $1";
@@ -127,20 +131,119 @@ async function listAppointments(database, user, filters) {
   }
   const values = [user.id];
   const where = [ownership];
+  if (filters.view === "upcoming") {
+    values.push(timeZone);
+    where.push(`a.status = 'confirmed' AND ((a.scheduled_date + a.scheduled_end_time) AT TIME ZONE $${values.length}) > NOW()`);
+  } else if (filters.view === "past") {
+    values.push(timeZone);
+    where.push(`(a.status = 'completed' OR (a.status = 'confirmed' AND ((a.scheduled_date + a.scheduled_end_time) AT TIME ZONE $${values.length}) <= NOW()))`);
+  } else if (filters.view === "cancelled") {
+    where.push("a.status = 'cancelled'");
+  }
   if (filters.status) {
     values.push(filters.status);
     where.push(`a.status = $${values.length}`);
   }
   if (filters.from) {
     values.push(filters.from);
-    where.push(`av.date >= $${values.length}::date`);
+    where.push(`a.scheduled_date >= $${values.length}::date`);
   }
   if (filters.to) {
     values.push(filters.to);
-    where.push(`av.date <= $${values.length}::date`);
+    where.push(`a.scheduled_date <= $${values.length}::date`);
   }
-  const result = await database.query(`${APPOINTMENT_DETAILS} WHERE ${where.join(" AND ")} ORDER BY av.date, av.start_time`, values);
-  return result.rows;
+  const order = filters.view === "past" || filters.view === "cancelled"
+    ? "a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC"
+    : "a.scheduled_date, a.scheduled_start_time, a.id";
+  let pagination = "";
+  if (filters.limit !== undefined) {
+    values.push(filters.limit + 1, filters.offset ?? 0);
+    pagination = ` LIMIT $${values.length - 1} OFFSET $${values.length}`;
+  }
+  const result = await database.query(`${APPOINTMENT_DETAILS} WHERE ${where.join(" AND ")} ORDER BY ${order}${pagination}`, values);
+  if (filters.limit === undefined) return result.rows;
+  const items = result.rows.slice(0, filters.limit);
+  const hasMore = result.rows.length > filters.limit;
+  return { items, has_more: hasMore, next_offset: (filters.offset ?? 0) + items.length };
+}
+
+async function requireDoctorPatientRelationship(database, user, patientId) {
+  if (user.role !== "doctor") fail(403, "FORBIDDEN", "Only doctors may view patient details");
+  const result = await database.query(
+    `SELECT 1
+     FROM appointments a
+     JOIN availability av ON av.id = a.availability_id
+     JOIN doctors d ON d.id = av.doctor_id
+     WHERE d.user_id = $1 AND a.patient_id = $2
+     LIMIT 1`,
+    [user.id, patientId],
+  );
+  if (!result.rows[0]) fail(404, "PATIENT_NOT_FOUND", "Patient not found for this doctor");
+}
+
+async function getDoctorPatient(database, user, patientId) {
+  if (user.role !== "doctor") fail(403, "FORBIDDEN", "Only doctors may view patient details");
+  const result = await database.query(
+    `SELECT pu.first_name, pu.last_name, pu.email, pu.phone,
+            p.date_of_birth::text AS date_of_birth, p.gender
+     FROM patients p
+     JOIN users pu ON pu.id = p.user_id
+     WHERE p.id = $1
+       AND EXISTS (
+         SELECT 1
+         FROM appointments a
+         JOIN availability av ON av.id = a.availability_id
+         JOIN doctors d ON d.id = av.doctor_id
+         WHERE a.patient_id = p.id AND d.user_id = $2
+       )`,
+    [patientId, user.id],
+  );
+  if (!result.rows[0]) fail(404, "PATIENT_NOT_FOUND", "Patient not found for this doctor");
+  return result.rows[0];
+}
+
+async function listDoctorPatientAppointments(database, user, patientId, filters, timeZone = "Asia/Kolkata") {
+  await requireDoctorPatientRelationship(database, user, patientId);
+  const values = [user.id, patientId];
+  const where = ["d.user_id = $1", "p.id = $2"];
+  if (filters.view === "scheduled") {
+    values.push(timeZone);
+    where.push(`a.status = 'confirmed' AND ((a.scheduled_date + a.scheduled_end_time) AT TIME ZONE $${values.length}) > NOW()`);
+  } else if (filters.view === "past") {
+    values.push(timeZone);
+    where.push(`(a.status = 'completed' OR (a.status = 'confirmed' AND ((a.scheduled_date + a.scheduled_end_time) AT TIME ZONE $${values.length}) <= NOW()))`);
+  } else {
+    where.push("a.status = 'cancelled'");
+  }
+
+  values.push(filters.limit + 1, filters.offset ?? 0);
+  const result = await database.query(
+    `SELECT a.id, a.status, a.reason, a.cancelled_at, a.created_at, a.updated_at,
+            av.id AS availability_id,
+            a.scheduled_date::text AS date, a.scheduled_start_time::text AS start_time,
+            a.scheduled_end_time::text AS end_time,
+            d.id AS doctor_id, du.first_name AS doctor_first_name, du.last_name AS doctor_last_name,
+            d.specialty, p.id AS patient_id, pu.first_name AS patient_first_name,
+            pu.last_name AS patient_last_name, p.date_of_birth::text AS patient_date_of_birth,
+            p.gender AS patient_gender, a.consultation_fee::text AS consultation_fee,
+            CASE WHEN a.consultation_fee IS NULL THEN NULL ELSE 'INR' END AS consultation_currency
+     FROM appointments a
+     JOIN availability av ON av.id = a.availability_id
+     JOIN doctors d ON d.id = av.doctor_id
+     JOIN users du ON du.id = d.user_id
+     JOIN patients p ON p.id = a.patient_id
+     JOIN users pu ON pu.id = p.user_id
+     WHERE ${where.join(" AND ")}
+     ORDER BY a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC
+     LIMIT $${values.length - 1} OFFSET $${values.length}`,
+    values,
+  );
+  const items = result.rows.slice(0, filters.limit);
+  return {
+    items,
+    has_more: result.rows.length > filters.limit,
+    next_offset: (filters.offset ?? 0) + items.length,
+  };
 }
 
 async function getAppointment(database, user, appointmentId) {
@@ -175,7 +278,7 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
   const now = timeContext(timeZone);
   return withTransaction(database, async (client) => {
     const owned = await client.query(
-      `SELECT a.id, a.status, a.availability_id, a.patient_id, a.reason
+      `SELECT a.id, a.status, a.availability_id, a.patient_id, a.reason, a.consultation_fee
        FROM appointments a JOIN patients p ON p.id = a.patient_id
        WHERE a.id = $1 AND p.user_id = $2
        FOR UPDATE OF a`,
@@ -202,9 +305,9 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
       [appointmentId],
     );
     const created = await client.query(
-      `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time)
-       VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time) RETURNING id`,
-      [original.patient_id, newAvailabilityId, original.reason, slot.date, slot.start_time, slot.end_time],
+      `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time, consultation_fee)
+       VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time, $7::numeric) RETURNING id`,
+      [original.patient_id, newAvailabilityId, original.reason, slot.date, slot.start_time, slot.end_time, original.consultation_fee],
     );
     const appointment = await readDetails(client, created.rows[0].id);
     return { ...appointment, previous_date: previousAppointment.date, previous_start_time: previousAppointment.start_time };
@@ -287,6 +390,8 @@ module.exports = {
   doctorRescheduleAppointment,
   getAppointment,
   listAppointments,
+  getDoctorPatient,
+  listDoctorPatientAppointments,
   readAppointmentDetails: readDetails,
   rescheduleAppointment,
 };
