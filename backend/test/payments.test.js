@@ -590,12 +590,17 @@ describe("Stripe Checkout webhook and reconciliation", () => {
   it("confirms once, sends one existing Brevo booking email, and ignores repeated/out-of-order success events", async () => {
     const database = createPaymentDatabase();
     const stripe = { constructWebhookEvent(raw, signature) { assert.ok(Buffer.isBuffer(raw)); assert.equal(signature, "stripe-signature"); return JSON.parse(raw.toString("utf8")); } };
-    const service = createPaymentService({ database, stripe, timeZone: "Asia/Kolkata", emailNotificationService: { async sendAppointmentNotification(action, item) { database.state.sentEmails.push([action, item.id]); } } });
+    const deliveryEvents = [];
+    const emailNotificationService = { async sendAppointmentNotification(action, item) { database.state.sentEmails.push([action, item.id]); return { sent: true, attempts: 1, providerMessageId: "brevo-booking-id" }; } };
+    const service = createPaymentService({ database, stripe, timeZone: "Asia/Kolkata", emailNotificationService, notificationDeliveryService: { async sendAppointmentNotification(event) { deliveryEvents.push(event); return emailNotificationService.sendAppointmentNotification("booked", event.appointment); } } });
     const first = await service.processWebhook(Buffer.from(JSON.stringify(createSessionEvent("checkout.session.completed", "evt_complete"))), "stripe-signature");
     assert.equal(first.status, "confirmed");
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.payment.provider_payment_id, intentId);
     assert.equal(database.state.sentEmails.length, 1);
+    assert.equal(deliveryEvents.length, 1);
+    assert.equal(deliveryEvents[0].eventType, "appointment.booked");
+    assert.match(deliveryEvents[0].eventKey, /^appointment\.booked:/);
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
     assert.deepEqual(await service.processWebhook(Buffer.from(JSON.stringify(createSessionEvent("checkout.session.completed", "evt_complete"))), "stripe-signature"), { duplicate: true });
     const delayedSuccess = await service.processWebhook(Buffer.from(JSON.stringify(createSessionEvent("checkout.session.async_payment_succeeded", "evt_async_success"))), "stripe-signature");

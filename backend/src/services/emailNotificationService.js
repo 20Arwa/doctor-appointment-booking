@@ -50,8 +50,8 @@ function createEmailNotificationService({
     const apiKey = configuredValue(config.BREVO_API_KEY);
     const senderEmail = configuredValue(config.BREVO_SENDER_EMAIL);
     const senderName = configuredValue(config.BREVO_SENDER_NAME);
-    if (!apiKey || !senderEmail || !senderName) return { sent: false, skipped: true, reason: "missing_configuration" };
-    if (!appointment.patient_email) return { sent: false, skipped: true, reason: "missing_recipient" };
+    if (!apiKey || !senderEmail || !senderName) return { sent: false, skipped: true, reason: "missing_configuration", attempts: 0 };
+    if (!appointment.patient_email) return { sent: false, skipped: true, reason: "missing_recipient", attempts: 0 };
 
     let failure = "network";
     let status;
@@ -72,7 +72,16 @@ function createEmailNotificationService({
           }),
           signal: controller.signal,
         });
-        if (response.ok) return { sent: true };
+        if (response.ok) {
+          let providerMessageId = null;
+          try {
+            const body = await response.json();
+            if (typeof body?.messageId === "string" && body.messageId.length <= 255) providerMessageId = body.messageId;
+          } catch (_error) {
+            // Provider acceptance remains successful even when its optional response body is unavailable.
+          }
+          return { sent: true, attempts, providerMessageId, ...(Number.isInteger(response.status) ? { status: response.status } : {}) };
+        }
 
         status = response.status;
         const retryable = RETRYABLE_STATUSES.has(status) || status >= 500;
@@ -89,7 +98,7 @@ function createEmailNotificationService({
 
     // Never log provider bodies, raw exception messages, recipients, or request data.
     logger.error("Brevo email delivery failed", { failure, ...(status ? { status } : {}), attempts });
-    return { sent: false, error: true, reason: failure, ...(status ? { status } : {}) };
+    return { sent: false, error: true, reason: failure, attempts, ...(status ? { status } : {}) };
   }
 
   return {

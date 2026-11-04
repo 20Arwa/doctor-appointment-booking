@@ -356,11 +356,16 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
     const updated = await client.query(
       `UPDATE appointments SET availability_id = $2, scheduled_date = $3::date,
        scheduled_start_time = $4::time, scheduled_end_time = $5::time,
-       updated_at = NOW() WHERE id = $1 RETURNING id`,
+       updated_at = NOW() WHERE id = $1 RETURNING id, updated_at::text AS reschedule_version`,
       [appointmentId, availabilityId, input.date, input.start_time, input.end_time],
     );
     const appointment = await readDetails(client, updated.rows[0].id);
-    return { ...appointment, previous_date: original.date, previous_start_time: original.start_time };
+    return {
+      ...appointment,
+      previous_date: original.date,
+      previous_start_time: original.start_time,
+      reschedule_version: updated.rows[0].reschedule_version,
+    };
   });
 }
 

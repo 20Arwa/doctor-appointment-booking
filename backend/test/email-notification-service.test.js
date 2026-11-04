@@ -12,10 +12,13 @@ const ok = { ok: true, status: 201 };
 describe("Brevo email notification service", () => {
   it("sends appointment notifications with the configured sender and existing template", async () => {
     let request;
-    const service = createEmailNotificationService({ config, fetchImpl: async (url, options) => { request = { url, options }; return ok; } });
+    const service = createEmailNotificationService({ config, fetchImpl: async (url, options) => { request = { url, options }; return { ...ok, async json() { return { messageId: "<brevo-message-id>" }; } }; } });
     const result = await service.sendAppointmentNotification("rescheduled", appointment);
     const body = JSON.parse(request.options.body);
     assert.equal(result.sent, true);
+    assert.equal(result.providerMessageId, "<brevo-message-id>");
+    assert.equal(result.attempts, 1);
+    assert.equal(result.status, 201);
     assert.equal(request.url, "https://api.brevo.com/v3/smtp/email");
     assert.equal(request.options.headers["api-key"], config.BREVO_API_KEY);
     assert.deepEqual(body.sender, { email: config.BREVO_SENDER_EMAIL, name: config.BREVO_SENDER_NAME });
@@ -75,17 +78,17 @@ describe("Brevo email notification service", () => {
     let calls = 0;
     const fetchImpl = async () => { calls += 1; return ok; };
     const missingConfig = createEmailNotificationService({ config: { ...config, BREVO_API_KEY: "replace_with_key" }, fetchImpl });
-    assert.deepEqual(await missingConfig.sendAppointmentNotification("booked", appointment), { sent: false, skipped: true, reason: "missing_configuration" });
+    assert.deepEqual(await missingConfig.sendAppointmentNotification("booked", appointment), { sent: false, skipped: true, reason: "missing_configuration", attempts: 0 });
     const missingRecipient = createEmailNotificationService({ config, fetchImpl });
-    assert.deepEqual(await missingRecipient.sendAppointmentReminder("1h", { ...appointment, patient_email: "" }), { sent: false, skipped: true, reason: "missing_recipient" });
+    assert.deepEqual(await missingRecipient.sendAppointmentReminder("1h", { ...appointment, patient_email: "" }), { sent: false, skipped: true, reason: "missing_recipient", attempts: 0 });
     assert.equal(calls, 0);
   });
 
   it("keeps reminder and appointment notification method results compatible on success", async () => {
     let count = 0;
     const service = createEmailNotificationService({ config, fetchImpl: async () => { count += 1; return ok; } });
-    assert.deepEqual(await service.sendAppointmentNotification("booked", appointment), { sent: true });
-    assert.deepEqual(await service.sendAppointmentReminder("24h", appointment), { sent: true });
+    assert.deepEqual(await service.sendAppointmentNotification("booked", appointment), { sent: true, attempts: 1, providerMessageId: null, status: 201 });
+    assert.deepEqual(await service.sendAppointmentReminder("24h", appointment), { sent: true, attempts: 1, providerMessageId: null, status: 201 });
     assert.equal(count, 2);
   });
 });
