@@ -275,7 +275,7 @@ describe("appointment schemas and migration", () => {
     const directory = path.join(__dirname, "..", "migrations");
     const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(files.length, 13);
+    assert.equal(files.length, 14);
     assert.match(files[3], /^004_.*\.sql$/);
     assert.equal(files[4], "005_appointment_schedule_snapshot.sql");
     assert.equal(files[5], "006_doctor_consultation_fee.sql");
@@ -286,6 +286,7 @@ describe("appointment schemas and migration", () => {
     assert.equal(files[10], "011_availability_soft_delete.sql");
     assert.equal(files[11], "012_appointment_consultation_fee_snapshot.sql");
     assert.equal(files[12], "013_notification_deliveries.sql");
+    assert.equal(files[13], "014_notification_delivery_recovery.sql");
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);

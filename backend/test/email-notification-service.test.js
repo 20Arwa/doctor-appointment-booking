@@ -74,6 +74,14 @@ describe("Brevo email notification service", () => {
     assert.equal(calls, 2);
   });
 
+  it("honors the remaining delivery-wide attempt budget on recovery", async () => {
+    let calls = 0;
+    const service = createEmailNotificationService({ config, maxAttempts: 2, retryDelayMs: 0, delay: async () => {}, fetchImpl: async () => { calls += 1; return { ok: false, status: 503 }; } });
+    const result = await service.sendNotificationPayload({ to: appointment.patient_email, subject: "Saved", textContent: "Saved body", sender: { email: config.BREVO_SENDER_EMAIL, name: config.BREVO_SENDER_NAME } }, "44e37b4c-4470-4f67-91a2-0bc4f7cc9a12", { maxAttempts: 1 });
+    assert.equal(result.attempts, 1);
+    assert.equal(calls, 1);
+  });
+
   it("distinguishes missing configuration and recipient without making requests", async () => {
     let calls = 0;
     const fetchImpl = async () => { calls += 1; return ok; };
@@ -90,5 +98,37 @@ describe("Brevo email notification service", () => {
     assert.deepEqual(await service.sendAppointmentNotification("booked", appointment), { sent: true, attempts: 1, providerMessageId: null, status: 201 });
     assert.deepEqual(await service.sendAppointmentReminder("24h", appointment), { sent: true, attempts: 1, providerMessageId: null, status: 201 });
     assert.equal(count, 2);
+  });
+
+  it("passes a stable Brevo idempotency key in the transactional email body headers", async () => {
+    let requestBody;
+    const service = createEmailNotificationService({ config, fetchImpl: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return { ...ok, async json() { return { messageId: "<brevo-idempotent>" }; } };
+    } });
+    const payload = { to: "patient@example.test", subject: "Saved subject", textContent: "Saved body" };
+    await service.sendNotificationPayload(payload, "44e37b4c-4470-4f67-91a2-0bc4f7cc9a12");
+    assert.deepEqual(requestBody.headers, { idempotencyKey: "44e37b4c-4470-4f67-91a2-0bc4f7cc9a12" });
+    assert.deepEqual(requestBody.to, [{ email: "patient@example.test" }]);
+    assert.equal(requestBody.subject, "Saved subject");
+    assert.equal(requestBody.textContent, "Saved body");
+  });
+
+  it("snapshots sender details without credentials and uses them for the preserved request", async () => {
+    let requestBody;
+    const mutableConfig = { ...config };
+    const service = createEmailNotificationService({ config: mutableConfig, fetchImpl: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return { ...ok, async json() { return { messageId: "<snapshot>" }; } };
+    } });
+    const payload = service.createNotificationPayload("booked", appointment);
+    mutableConfig.BREVO_SENDER_EMAIL = "changed@example.test";
+    mutableConfig.BREVO_SENDER_NAME = "Changed Sender";
+    mutableConfig.BREVO_API_KEY = "rotated-api-key";
+    await service.sendNotificationPayload(payload, "44e37b4c-4470-4f67-91a2-0bc4f7cc9a12");
+    assert.deepEqual(payload.sender, { email: "sender@example.test", name: "Medrella" });
+    assert.equal(Object.hasOwn(payload, "apiKey"), false);
+    assert.deepEqual(requestBody.sender, { email: "sender@example.test", name: "Medrella" });
+    assert.equal(requestBody.headers.idempotencyKey, "44e37b4c-4470-4f67-91a2-0bc4f7cc9a12");
   });
 });

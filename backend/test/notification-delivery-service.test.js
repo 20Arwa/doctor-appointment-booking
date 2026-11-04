@@ -65,6 +65,200 @@ describe("notification delivery persistence", () => {
     assert.doesNotMatch(migration, /recipient_email|text_content|html_content/i);
   });
 
+  it("defines recovery payload, idempotency, scheduling, classification, and lease schema", () => {
+    const migration = fs.readFileSync(path.join(__dirname, "..", "migrations", "014_notification_delivery_recovery.sql"), "utf8");
+    assert.match(migration, /payload JSONB/i);
+    assert.match(migration, /idempotency_key UUID/i);
+    assert.match(migration, /next_attempt_at TIMESTAMPTZ/i);
+    assert.match(migration, /failure_classification TEXT/i);
+    assert.match(migration, /lease_token UUID/i);
+    assert.match(migration, /lease_expires_at TIMESTAMPTZ/i);
+    assert.match(migration, /status = 'ambiguous'/i);
+  });
+
+  it("persists the minimal rendered payload, reuses its UUID key, and applies bounded exponential backoff", async () => {
+    let saved;
+    let updateSql;
+    let updateValues;
+    const database = { async query(sql, values = []) {
+      if (sql.startsWith("INSERT INTO notification_deliveries")) {
+        saved = { payload: JSON.parse(values[4]), idempotencyKey: values[5] };
+        return { rows: [{ id: "delivery-id", payload: saved.payload, idempotency_key: saved.idempotencyKey, lease_token: values[6] }] };
+      }
+      if (sql.startsWith("UPDATE notification_deliveries")) { updateSql = sql; updateValues = values; return { rows: [] }; }
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const sent = [];
+    const service = createNotificationDeliveryService({ database, emailNotificationService: { createNotificationPayload: () => ({ to: "before@example.test", subject: "Appointment confirmed", textContent: "Saved body", sender: { email: "saved-sender@example.test", name: "Saved Sender" } }), async sendNotificationPayload(payload, key) { sent.push({ payload, key }); return { sent: false, error: true, reason: "provider_error", status: 503, attempts: 1 }; } } });
+    await service.sendAppointmentNotification({ eventKey: "snapshotted", eventType: "appointment.booked", appointment: { ...appointment, patient_email: "before@example.test" } });
+    assert.deepEqual(sent[0].payload, { to: "before@example.test", subject: "Appointment confirmed", textContent: "Saved body", sender: { email: "saved-sender@example.test", name: "Saved Sender" } });
+    assert.equal(sent[0].key, saved.idempotencyKey);
+    assert.match(saved.idempotencyKey, /^[0-9a-f-]{36}$/i);
+    assert.equal(updateValues[1], "failed");
+    assert.equal(updateValues[6], "transient");
+    assert.match(updateSql, /next_attempt_at = CASE WHEN \$7 = 'transient'.*NOW\(\)/is);
+    assert.match(updateSql, /attempt_count \+ \$3\) < \$9/);
+    assert.match(updateSql, /LEAST\(\$8 \* POWER\(2, GREATEST\(attempt_count \+ \$3 - 1, 0\)\), \$10\)/);
+    assert.equal(updateValues[7], 30_000);
+    assert.equal(updateValues[9], 30 * 60_000);
+  });
+
+  it("records permanent and ambiguous failures without scheduling retries", async () => {
+    const results = [];
+    const database = { async query(sql, values = []) {
+      if (sql.startsWith("INSERT INTO notification_deliveries")) return { rows: [{ id: "delivery", payload: JSON.parse(values[4]), idempotency_key: values[5], lease_token: values[6] }] };
+      if (sql.startsWith("UPDATE notification_deliveries")) { results.push(values); return { rows: [] }; }
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const outcomes = [{ sent: false, permanent: true, reason: "provider_error", status: 400, attempts: 1 }, { sent: false, ambiguous: true, reason: "timeout", attempts: 1 }];
+    const service = createNotificationDeliveryService({ database, emailNotificationService: { async sendNotificationPayload() { return outcomes.shift(); } } });
+    await service.sendAppointmentNotification({ eventKey: "permanent", eventType: "appointment.booked", appointment: { ...appointment, patient_email: "p@example.test" } });
+    await service.sendAppointmentNotification({ eventKey: "ambiguous", eventType: "appointment.booked", appointment: { ...appointment, patient_email: "p@example.test" } });
+    assert.equal(results[0][1], "failed");
+    assert.equal(results[0][6], "permanent");
+    assert.equal(results[1][1], "ambiguous");
+    assert.equal(results[1][6], "ambiguous");
+  });
+
+  it("uses SKIP LOCKED claiming, lease guarded writes, and does not resend stale or expired-key outcomes", async () => {
+    let claimAttempts = 0;
+    let sends = 0;
+    let claimSql = "";
+    let staleSql = "";
+    let completionSql = "";
+    const database = { async query(sql) {
+      if (sql.includes("lease_expires_at < NOW()")) { staleSql = sql; return { rows: [{ id: "stale" }], rowCount: 1 }; }
+      if (sql.includes("created_at <= NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("WITH candidates")) {
+        claimSql = sql;
+        claimAttempts += 1;
+        if (claimAttempts === 1) return { rows: [{ id: "claimed", payload: { to: "p@example.test", subject: "s", textContent: "b" }, idempotency_key: "44e37b4c-4470-4f67-91a2-0bc4f7cc9a12", lease_token: "55e37b4c-4470-4f67-91a2-0bc4f7cc9a12", attempt_count: 1, created_at: new Date() }] };
+        return { rows: [] };
+      }
+      if (sql.startsWith("UPDATE notification_deliveries SET status = $2")) { completionSql = sql; return { rows: [] }; }
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const service = createNotificationDeliveryService({ database, emailNotificationService: { async sendNotificationPayload() { sends += 1; return { sent: true, attempts: 1 }; } } });
+    await Promise.all([service.runRecovery(), service.runRecovery()]);
+    assert.match(claimSql, /FOR UPDATE SKIP LOCKED/i);
+    assert.match(claimSql, /lease_token = gen_random_uuid\(\)/i);
+    assert.match(staleSql, /lease_expires_at < NOW\(\)/i);
+    assert.match(completionSql, /lease_token = \$11/i);
+    assert.equal(claimAttempts, 2);
+    assert.equal(sends, 1);
+  });
+
+  it("marks expired idempotency windows ambiguous without dispatching", async () => {
+    const statements = [];
+    let sends = 0;
+    const database = { async query(sql) {
+      statements.push(sql);
+      if (sql.includes("lease_expires_at < NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("created_at <= NOW()")) return { rows: [{ id: "expired" }], rowCount: 1 };
+      if (sql.includes("WITH candidates")) return { rows: [] };
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const service = createNotificationDeliveryService({ database, emailNotificationService: { async sendNotificationPayload() { sends += 1; return { sent: true }; } } });
+    const result = await service.runRecovery();
+    const expiryUpdate = statements.find((sql) => sql.includes("created_at <= NOW()"));
+    assert.match(expiryUpdate, /SET status = 'ambiguous'/);
+    assert.match(expiryUpdate, /NOW\(\) - \(\$1 \* INTERVAL '1 millisecond'\)/);
+    assert.equal(result.markedAmbiguous, 1);
+    assert.equal(sends, 0);
+  });
+
+  it("retries only due, under-limit rows with a complete saved payload and the same UUID", async () => {
+    const savedPayload = { to: "original@example.test", subject: "Original subject", textContent: "Original body", sender: { email: "original-sender@example.test", name: "Original Sender" } };
+    const key = "44e37b4c-4470-4f67-91a2-0bc4f7cc9a12";
+    let claimSql;
+    let claimValues;
+    let updateValues;
+    let updateSql;
+    const database = { async query(sql, values = []) {
+      if (sql.includes("lease_expires_at < NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("created_at <= NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("WITH candidates")) {
+        claimSql = sql;
+        claimValues = values;
+        return { rows: [{ id: "delivery", payload: savedPayload, idempotency_key: key, lease_token: "55e37b4c-4470-4f67-91a2-0bc4f7cc9a12", attempt_count: 2, created_at: new Date() }] };
+      }
+      if (sql.includes("SET status = $2")) { updateSql = sql; updateValues = values; return { rows: [], rowCount: 1 }; }
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const sends = [];
+    const service = createNotificationDeliveryService({ database, emailNotificationService: { async sendNotificationPayload(payload, idempotencyKey) { sends.push({ payload, idempotencyKey }); return { sent: false, attempts: 1, reason: "provider_error" }; } } });
+    await service.runRecovery();
+    assert.deepEqual(sends, [{ payload: savedPayload, idempotencyKey: key }]);
+    assert.match(claimSql, /next_attempt_at <= NOW\(\)/);
+    assert.match(claimSql, /attempt_count < \$1/);
+    assert.match(claimSql, /payload IS NOT NULL/);
+    assert.match(claimSql, /idempotency_key IS NOT NULL/);
+    assert.match(claimSql, /created_at > NOW\(\)/);
+    assert.deepEqual(claimValues, [5, 25, 1_800_000, 120_000]);
+    assert.match(updateSql, /lease_token = \$11/);
+    assert.equal(updateValues[10], "55e37b4c-4470-4f67-91a2-0bc4f7cc9a12");
+  });
+
+  it("does not exceed the five-send delivery budget on its final recovery attempt", async () => {
+    let requestOptions;
+    let updateSql;
+    let updateValues;
+    const database = { async query(sql, values = []) {
+      if (sql.includes("lease_expires_at < NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("created_at <= NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("WITH candidates")) return { rows: [{ id: "last-attempt", payload: { to: "p@example.test", subject: "s", textContent: "b", sender: { email: "s@example.test", name: "S" } }, idempotency_key: "44e37b4c-4470-4f67-91a2-0bc4f7cc9a12", lease_token: "55e37b4c-4470-4f67-91a2-0bc4f7cc9a12", attempt_count: 4, created_at: new Date() }] };
+      if (sql.includes("SET status = $2")) { updateSql = sql; updateValues = values; return { rows: [], rowCount: 1 }; }
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const service = createNotificationDeliveryService({ database, emailNotificationService: { async sendNotificationPayload(_payload, _key, options) { requestOptions = options; return { sent: false, attempts: 1, reason: "provider_error" }; } } });
+    await service.runRecovery();
+    assert.deepEqual(requestOptions, { maxAttempts: 1 });
+    assert.equal(updateValues[2], 1);
+    assert.match(updateSql, /\(attempt_count \+ \$3\) < \$9/);
+    assert.equal(updateValues[8], 5);
+  });
+
+  it("excludes historical failed/skipped deliveries without a recovery classification or snapshot", async () => {
+    const statements = [];
+    let sends = 0;
+    const database = { async query(sql) {
+      statements.push(sql);
+      if (sql.includes("lease_expires_at < NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("created_at <= NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("WITH candidates")) return { rows: [] };
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const service = createNotificationDeliveryService({ database, emailNotificationService: { async sendNotificationPayload() { sends += 1; return { sent: true }; } } });
+    await service.runRecovery();
+    const claimSql = statements.find((sql) => sql.includes("WITH candidates"));
+    assert.match(claimSql, /failure_classification = 'transient'/);
+    assert.match(claimSql, /payload IS NOT NULL/);
+    assert.match(claimSql, /idempotency_key IS NOT NULL/);
+    assert.equal(sends, 0);
+  });
+
+  it("rejects completion from a stale lease token after another claim takes ownership", async () => {
+    const oldToken = "55e37b4c-4470-4f67-91a2-0bc4f7cc9a12";
+    let currentToken = oldToken;
+    let completionApplied = false;
+    let completionSql;
+    const database = { async query(sql, values = []) {
+      if (sql.includes("lease_expires_at < NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("created_at <= NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("WITH candidates")) return { rows: [{ id: "delivery", payload: { to: "p@example.test", subject: "s", textContent: "b", sender: { email: "s@example.test", name: "S" } }, idempotency_key: "44e37b4c-4470-4f67-91a2-0bc4f7cc9a12", lease_token: oldToken, attempt_count: 1, created_at: new Date() }] };
+      if (sql.includes("SET status = $2")) {
+        completionSql = sql;
+        completionApplied = values[10] === currentToken;
+        return { rows: [], rowCount: completionApplied ? 1 : 0 };
+      }
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const service = createNotificationDeliveryService({ database, emailNotificationService: { async sendNotificationPayload() { currentToken = "66e37b4c-4470-4f67-91a2-0bc4f7cc9a12"; return { sent: true, attempts: 1 }; } } });
+    await service.runRecovery();
+    assert.match(completionSql, /lease_token = \$11/);
+    assert.equal(completionApplied, false);
+  });
+
   it("records accepted deliveries, message IDs, and actual transport attempt counts", async () => {
     const harness = createHarness({ outcome: { sent: true, attempts: 2, providerMessageId: "brevo-accepted-id", status: 201 } });
     const result = await harness.service.sendAppointmentNotification({ eventKey: "booked:key", eventType: "appointment.booked", appointment });
