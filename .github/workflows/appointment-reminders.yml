@@ -1,0 +1,28 @@
+name: Appointment Reminders
+
+on:
+  schedule:
+    - cron: '2/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-reminders:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Trigger reminder endpoint
+        env:
+          REMINDER_CRON_SECRET: ${{ secrets.REMINDER_CRON_SECRET }}
+        run: |
+          test -n "$REMINDER_CRON_SECRET"
+
+          curl --fail --silent --show-error \
+            --connect-timeout 15 \
+            --max-time 120 \
+            --request POST \
+            "https://doctor-appointment-booking-20rh.onrender.com/api/v1/internal/reminders/run" \
+            --header "Authorization: Bearer ${REMINDER_CRON_SECRET}"
