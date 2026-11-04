@@ -16,8 +16,9 @@ const paymentRoutes = require("./routes/paymentRoutes");
 const { createStripeService } = require("./services/stripeService");
 const { createPaymentService } = require("./services/paymentService");
 const { createNotificationDeliveryService } = require("./services/notificationDeliveryService");
+const notificationRecoveryRoutes = require("./routes/notificationRecoveryRoutes");
 
-function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), notificationDeliveryService, reminderService, reminderSecret = env.REMINDER_CRON_SECRET, stripeService, paymentService, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
+function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), notificationDeliveryService, reminderService, reminderSecret = env.REMINDER_CRON_SECRET, notificationRecoverySecret = env.NOTIFICATION_RECOVERY_CRON_SECRET, stripeService, paymentService, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("A PostgreSQL database pool is required");
   }
@@ -52,6 +53,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     service: reminderService || createAppointmentReminderService({ database, emailNotificationService, timeZone: applicationTimezone || "Asia/Kolkata" }),
     secret: reminderSecret,
   }));
+  app.use("/api/v1/internal/notification-deliveries", notificationRecoveryRoutes({ service: notificationDeliveries, secret: notificationRecoverySecret }));
   app.use("/api/v1/payments", paymentRoutes({ service: payments }));
   app.use("/api/v1/users", userRoutes);
   app.use("/api/v1/patients", patientRoutes);
