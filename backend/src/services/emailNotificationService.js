@@ -1,4 +1,8 @@
 const BREVO_EMAILS_URL = "https://api.brevo.com/v3/smtp/email";
+const REQUEST_TIMEOUT_MS = 8000;
+const MAX_ATTEMPTS = 2;
+const RETRY_DELAY_MS = 200;
+const RETRYABLE_STATUSES = new Set([408, 425, 429]);
 
 function configuredValue(value) {
   if (!value || /^(replace_|your_|<|placeholder)/i.test(value.trim())) return null;
@@ -29,51 +33,71 @@ function reminderMessage(reminderType, appointment) {
   return `Reminder: your appointment with ${doctor} is in ${lead}, on ${current}.`;
 }
 
-function createEmailNotificationService({ config, fetchImpl = globalThis.fetch, logger = console }) {
+function isTransientNetworkError(error) {
+  return error?.name === "AbortError" || error?.name === "TimeoutError" || error instanceof TypeError;
+}
+
+function createEmailNotificationService({
+  config,
+  fetchImpl = globalThis.fetch,
+  logger = console,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  maxAttempts = MAX_ATTEMPTS,
+  retryDelayMs = RETRY_DELAY_MS,
+  delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}) {
+  async function sendEmail({ subject, textContent, appointment }) {
+    const apiKey = configuredValue(config.BREVO_API_KEY);
+    const senderEmail = configuredValue(config.BREVO_SENDER_EMAIL);
+    const senderName = configuredValue(config.BREVO_SENDER_NAME);
+    if (!apiKey || !senderEmail || !senderName) return { sent: false, skipped: true, reason: "missing_configuration" };
+    if (!appointment.patient_email) return { sent: false, skipped: true, reason: "missing_recipient" };
+
+    let failure = "network";
+    let status;
+    let attempts = 0;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      attempts = attempt;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetchImpl(BREVO_EMAILS_URL, {
+          method: "POST",
+          headers: { "api-key": apiKey, "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({
+            sender: { email: senderEmail, name: senderName },
+            to: [{ email: appointment.patient_email }],
+            subject,
+            textContent,
+          }),
+          signal: controller.signal,
+        });
+        if (response.ok) return { sent: true };
+
+        status = response.status;
+        const retryable = RETRYABLE_STATUSES.has(status) || status >= 500;
+        failure = "provider_error";
+        if (!retryable || attempt === maxAttempts) break;
+      } catch (error) {
+        failure = error?.name === "AbortError" || error?.name === "TimeoutError" ? "timeout" : "network_error";
+        if (!isTransientNetworkError(error) || attempt === maxAttempts) break;
+      } finally {
+        clearTimeout(timeout);
+      }
+      await delay(retryDelayMs);
+    }
+
+    // Never log provider bodies, raw exception messages, recipients, or request data.
+    logger.error("Brevo email delivery failed", { failure, ...(status ? { status } : {}), attempts });
+    return { sent: false, error: true, reason: failure, ...(status ? { status } : {}) };
+  }
+
   return {
     async sendAppointmentReminder(reminderType, appointment) {
-      const apiKey = configuredValue(config.BREVO_API_KEY);
-      const senderEmail = configuredValue(config.BREVO_SENDER_EMAIL);
-      const senderName = configuredValue(config.BREVO_SENDER_NAME);
-      if (!apiKey || !senderEmail || !senderName || !appointment.patient_email) return { sent: false, skipped: true };
-      try {
-        const response = await fetchImpl(BREVO_EMAILS_URL, {
-          method: "POST",
-          headers: { "api-key": apiKey, "content-type": "application/json", accept: "application/json" },
-          body: JSON.stringify({
-            sender: { email: senderEmail, name: senderName },
-            to: [{ email: appointment.patient_email }],
-            subject: "Appointment reminder",
-            textContent: reminderMessage(reminderType, appointment),
-          }),
-        });
-        if (!response.ok) throw new Error(`Brevo returned HTTP ${response.status}`);
-        return { sent: true };
-      } catch (error) {
-        logger.error("Appointment reminder email delivery failed", { message: error.message });
-        return { sent: false, error: true };
-      }
+      return sendEmail({ subject: "Appointment reminder", textContent: reminderMessage(reminderType, appointment), appointment });
     },
     async sendAppointmentNotification(action, appointment) {
-      const apiKey = configuredValue(config.BREVO_API_KEY);
-      const senderEmail = configuredValue(config.BREVO_SENDER_EMAIL);
-      const senderName = configuredValue(config.BREVO_SENDER_NAME);
-      if (!apiKey || !senderEmail || !senderName || !appointment.patient_email) return;
-      try {
-        const response = await fetchImpl(BREVO_EMAILS_URL, {
-          method: "POST",
-          headers: { "api-key": apiKey, "content-type": "application/json", accept: "application/json" },
-          body: JSON.stringify({
-            sender: { email: senderEmail, name: senderName },
-            to: [{ email: appointment.patient_email }],
-            subject: appointmentSubject(action),
-            textContent: appointmentMessage(action, appointment),
-          }),
-        });
-        if (!response.ok) throw new Error(`Brevo returned HTTP ${response.status}`);
-      } catch (error) {
-        logger.error(`Appointment ${action} email delivery failed`, { message: error.message });
-      }
+      return sendEmail({ subject: appointmentSubject(action), textContent: appointmentMessage(action, appointment), appointment });
     },
   };
 }
