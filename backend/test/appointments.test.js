@@ -4,6 +4,7 @@ const path = require("node:path");
 const { describe, it } = require("node:test");
 const { createApp } = require("../src/app");
 const { createEmailNotificationService } = require("../src/services/emailNotificationService");
+const { createNotificationDeliveryService } = require("../src/services/notificationDeliveryService");
 const {
   appointmentQuerySchema,
   createAppointmentSchema,
@@ -223,7 +224,7 @@ function createDatabase({
   return database;
 }
 
-function createTestApp({ currentUser = patientUser, database = createDatabase({ currentUser }), authenticated = true, applicationTimezone = "Asia/Kolkata", emailNotificationService = { sendAppointmentNotification: async () => {} } } = {}) {
+function createTestApp({ currentUser = patientUser, database = createDatabase({ currentUser }), authenticated = true, applicationTimezone = "Asia/Kolkata", emailNotificationService = { sendAppointmentNotification: async () => {} }, notificationDeliveryService } = {}) {
   return {
     database,
     app: createApp({
@@ -231,6 +232,9 @@ function createTestApp({ currentUser = patientUser, database = createDatabase({ 
       frontendOrigin: "http://localhost:3000",
       applicationTimezone,
       emailNotificationService,
+      notificationDeliveryService: notificationDeliveryService || {
+        sendAppointmentNotification: ({ eventType, appointment }) => emailNotificationService.sendAppointmentNotification(eventType.slice("appointment.".length), appointment),
+      },
       clerkAuthMiddleware: (request, _response, next) => {
         request.auth = Object.assign(
           () => authenticated
@@ -271,7 +275,7 @@ describe("appointment schemas and migration", () => {
     const directory = path.join(__dirname, "..", "migrations");
     const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(files.length, 12);
+    assert.equal(files.length, 13);
     assert.match(files[3], /^004_.*\.sql$/);
     assert.equal(files[4], "005_appointment_schedule_snapshot.sql");
     assert.equal(files[5], "006_doctor_consultation_fee.sql");
@@ -281,6 +285,7 @@ describe("appointment schemas and migration", () => {
     assert.equal(files[9], "010_payment_capture_reconciliation.sql");
     assert.equal(files[10], "011_availability_soft_delete.sql");
     assert.equal(files[11], "012_appointment_consultation_fee_snapshot.sql");
+    assert.equal(files[12], "013_notification_deliveries.sql");
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);
@@ -364,6 +369,47 @@ describe("appointment workflows", () => {
     assert.deepEqual(notifications.map(([action]) => action), ["cancelled", "rescheduled"]);
     assert.equal(notifications[1][1].previous_date, "2099-04-10");
     assert.equal(notifications[1][1].previous_start_time, "10:00:00");
+  });
+
+  it("routes patient cancellation and patient/doctor reschedules through stable delivery events", async () => {
+    const events = [];
+    const notificationDeliveryService = { async sendAppointmentNotification(event) { events.push(event); } };
+    const cancellation = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), notificationDeliveryService });
+    await withServer(cancellation.app, async (url) => {
+      assert.equal((await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" })).status, 200);
+    });
+    const patientReschedule = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), notificationDeliveryService });
+    await withServer(patientReschedule.app, async (url) => {
+      assert.equal((await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }) })).status, 200);
+    });
+    const doctorReschedule = createTestApp({ currentUser: doctorUser, database: createDatabase({ currentUser: doctorUser, appointments: [makeAppointment()] }), notificationDeliveryService });
+    await withServer(doctorReschedule.app, async (url) => {
+      assert.equal((await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ date: "2099-04-11", start_time: "12:00", end_time: "12:30" }) })).status, 200);
+    });
+    assert.deepEqual(events.map(({ eventType }) => eventType), ["appointment.cancelled", "appointment.rescheduled", "appointment.rescheduled"]);
+    assert.notEqual(events[1].eventKey, events[2].eventKey);
+    assert.match(events[1].eventKey, /^appointment\.rescheduled:/);
+    assert.equal(events[1].appointment.id, secondAppointmentId);
+    assert.equal(events[2].appointment.id, appointmentId);
+  });
+
+  it("keeps cancellation successful and sends once when tracking record creation fails", async () => {
+    const database = createDatabase({ appointments: [makeAppointment()] });
+    const query = database.query.bind(database);
+    database.query = async (sql, values) => {
+      if (sql.startsWith("INSERT INTO notification_deliveries")) throw new Error("database unavailable");
+      return query(sql, values);
+    };
+    let emailCalls = 0;
+    const emailNotificationService = { async sendAppointmentNotification() { emailCalls += 1; return { sent: true, attempts: 1 }; } };
+    const notificationDeliveryService = createNotificationDeliveryService({ database, emailNotificationService, logger: { error() {} } });
+    const { app } = createTestApp({ database, emailNotificationService, notificationDeliveryService });
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" });
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).status, "cancelled");
+    });
+    assert.equal(emailCalls, 1);
   });
 
   it("rejects unpaid direct appointment creation without sending a booking notification", async () => {

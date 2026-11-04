@@ -15,18 +15,21 @@ const reminderRoutes = require("./routes/reminderRoutes");
 const paymentRoutes = require("./routes/paymentRoutes");
 const { createStripeService } = require("./services/stripeService");
 const { createPaymentService } = require("./services/paymentService");
+const { createNotificationDeliveryService } = require("./services/notificationDeliveryService");
 
-function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), reminderService, reminderSecret = env.REMINDER_CRON_SECRET, stripeService, paymentService, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
+function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), notificationDeliveryService, reminderService, reminderSecret = env.REMINDER_CRON_SECRET, stripeService, paymentService, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("A PostgreSQL database pool is required");
   }
 
   const app = express();
   const stripe = stripeService || createStripeService({ config: paymentConfig });
+  const notificationDeliveries = notificationDeliveryService || createNotificationDeliveryService({ database, emailNotificationService });
   const payments = paymentService || createPaymentService({
     database,
     stripe,
     emailNotificationService,
+    notificationDeliveryService: notificationDeliveries,
     frontendOrigin: frontendOrigin || env.FRONTEND_ORIGIN,
     timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata",
   });
@@ -41,6 +44,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     response.locals.clerkProfileResolver = clerkProfileResolver;
     response.locals.applicationTimezone = applicationTimezone;
     response.locals.emailNotificationService = emailNotificationService;
+    response.locals.notificationDeliveryService = notificationDeliveries;
     next();
   });
   app.use("/api/v1", healthRoutes);
