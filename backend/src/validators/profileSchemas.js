@@ -20,7 +20,7 @@ const patientUpdateSchema = z.object({
   date_of_birth: z.iso.date().nullable().optional(),
   gender: z.string().trim().max(40).nullable().optional(),
 }).strict().refine((body) => Object.keys(body).length > 0, "At least one field is required");
-const doctorUpdateSchema = z.object({ specialty: z.string().trim().min(1).max(150).optional(), bio: z.string().trim().max(5000).nullable().optional() })
+const doctorUpdateSchema = z.object({ specialty: z.string().trim().min(1).max(150).optional(), bio: z.string().trim().max(5000).nullable().optional(), appointment_duration_minutes: z.number().int().min(5).max(240).optional() })
   .strict().refine((body) => Object.keys(body).length > 0, "At least one field is required");
 const idParamsSchema = z.object({ id: z.uuid() }).strict();
 

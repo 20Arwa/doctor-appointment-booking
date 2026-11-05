@@ -6,11 +6,17 @@ const { doctorUpdateSchema, idParamsSchema } = require("../validators/profileSch
 const { createDoctorSlots, deleteDoctorSlot, getDoctorSlots } = require("../controllers/availabilityController");
 const { doctorIdParamsSchema, slotParamsSchema, slotQuerySchema, slotsBodySchema } = require("../validators/availabilitySchemas");
 const { doctorPatientAppointmentsQuerySchema, doctorPatientParamsSchema } = require("../validators/doctorPatientSchemas");
+const scheduleController = require("../controllers/scheduleController");
+const { createScheduleSchema, exceptionSchema, generateSchema, scheduleParamsSchema } = require("../validators/scheduleSchemas");
 
 const router = express.Router();
 router.get("/patients/:patientId/appointments", requireClerkIdentity, requireLocalUser, validate(doctorPatientParamsSchema, "params"), validate(doctorPatientAppointmentsQuerySchema, "query"), listDoctorPatientAppointments);
 router.get("/patients/:patientId", requireClerkIdentity, requireLocalUser, validate(doctorPatientParamsSchema, "params"), getDoctorPatient);
 router.get("/:id/slots", validate(doctorIdParamsSchema, "params"), validate(slotQuerySchema, "query"), requireClerkIdentity, requireLocalUser, getDoctorSlots);
+router.get("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, scheduleController.listSchedules);
+router.post("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(createScheduleSchema, "body"), scheduleController.createSchedule);
+router.post("/:id/schedules/:scheduleId/generate", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(generateSchema, "body"), scheduleController.generateAvailability);
+router.post("/:id/schedules/:scheduleId/exceptions", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(exceptionSchema, "body"), scheduleController.createException);
 router.post("/:id/slots", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(slotsBodySchema, "body"), createDoctorSlots);
 router.delete("/:id/slots/:slotId", validate(slotParamsSchema, "params"), requireClerkIdentity, requireLocalUser, deleteDoctorSlot);
 router.get("/", listDoctors);
