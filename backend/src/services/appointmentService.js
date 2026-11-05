@@ -67,7 +67,8 @@ async function requireOwnDoctorId(database, user) {
 async function lockBookableSlot(client, availabilityId, now) {
   const result = await client.query(
     `SELECT av.id, av.doctor_id, av.deleted_at, av.date::text AS date,
-            av.start_time::text AS start_time, av.end_time::text AS end_time
+            av.start_time::text AS start_time, av.end_time::text AS end_time,
+            av.mode, av.capacity
      FROM availability av
      JOIN doctors d ON d.id = av.doctor_id
      JOIN users du ON du.id = d.user_id
@@ -98,21 +99,36 @@ async function ensureNoActivePaymentHold(client, doctorId, date, startTime, endT
 async function createPaymentAppointment(client, { availabilityId, patientId, reason, holdId, consultationFee, timeZone }) {
   const slot = await lockBookableSlot(client, availabilityId, timeContext(timeZone));
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [slot.doctor_id]);
-  await ensureNoActivePaymentHold(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time, holdId);
-  const conflict = await client.query(
-    `SELECT 1 FROM appointments other
-     JOIN availability other_av ON other_av.id = other.availability_id
-     WHERE other_av.doctor_id = $1 AND other.status = 'confirmed'
-       AND other.scheduled_date = $2::date
-       AND other.scheduled_start_time < $4::time
-       AND other.scheduled_end_time > $3::time LIMIT 1`,
-    [slot.doctor_id, slot.date, slot.start_time, slot.end_time],
+  const reservationCount = await client.query(
+    `SELECT
+       (SELECT COUNT(*) FROM appointment_allocations allocation
+        WHERE allocation.availability_id = $1 AND allocation.status IN ('held','confirmed')
+          AND (allocation.status <> 'held' OR allocation.expires_at > NOW()))::int
+       + (SELECT COUNT(*) FROM appointment_slot_holds hold
+          WHERE hold.availability_id = $1 AND hold.status = 'active' AND hold.expires_at > NOW()
+            AND hold.id <> $2)::int AS occupied`, [availabilityId, holdId],
   );
-  if (conflict.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time overlaps another confirmed appointment");
+  if (Number(reservationCount.rows[0]?.occupied || 0) >= Number(slot.capacity || 1)) {
+    fail(409, "SLOT_UNAVAILABLE", "The selected slot has reached its booking capacity");
+  }
+  if (!slot.mode) {
+    await ensureNoActivePaymentHold(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time, holdId);
+    const conflict = await client.query(
+      `SELECT 1 FROM appointments other JOIN availability other_av ON other_av.id = other.availability_id
+       WHERE other_av.doctor_id = $1 AND other.status = 'confirmed' AND other.scheduled_date = $2::date
+         AND other.scheduled_start_time < $4::time AND other.scheduled_end_time > $3::time LIMIT 1`,
+      [slot.doctor_id, slot.date, slot.start_time, slot.end_time],
+    );
+    if (conflict.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time overlaps another confirmed appointment");
+  }
+  const allocation = slot.mode ? await client.query(
+    `INSERT INTO appointment_allocations (availability_id, mode, patient_id, status)
+     VALUES ($1, $2, $3, 'confirmed') RETURNING id`, [availabilityId, slot.mode, patientId],
+  ) : { rows: [{ id: null }] };
   const created = await client.query(
-    `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time, consultation_fee)
-     VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time, $7::numeric) RETURNING id`,
-    [patientId, availabilityId, reason, slot.date, slot.start_time, slot.end_time, consultationFee],
+    `INSERT INTO appointments (patient_id, availability_id, allocation_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time, consultation_fee)
+     VALUES ($1, $2, $3, 'confirmed', $4, $5::date, $6::time, $7::time, $8::numeric) RETURNING id`,
+    [patientId, availabilityId, allocation.rows[0].id, reason, slot.date, slot.start_time, slot.end_time, consultationFee],
   );
   return readDetails(client, created.rows[0].id);
 }
@@ -269,6 +285,7 @@ async function cancelAppointment(database, user, appointmentId) {
       "UPDATE appointments SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW() WHERE id = $1",
       [appointmentId],
     );
+    await client.query("UPDATE appointment_allocations SET status = 'released', updated_at = NOW() WHERE id = (SELECT allocation_id FROM appointments WHERE id = $1) AND status = 'confirmed'", [appointmentId]);
     return readDetails(client, appointmentId);
   });
 }
@@ -278,7 +295,7 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
   const now = timeContext(timeZone);
   return withTransaction(database, async (client) => {
     const owned = await client.query(
-      `SELECT a.id, a.status, a.availability_id, a.patient_id, a.reason, a.consultation_fee
+      `SELECT a.id, a.status, a.availability_id, a.allocation_id, a.patient_id, a.reason, a.consultation_fee
        FROM appointments a JOIN patients p ON p.id = a.patient_id
        WHERE a.id = $1 AND p.user_id = $2
        FOR UPDATE OF a`,
@@ -292,22 +309,39 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
 
     const slot = await lockBookableSlot(client, newAvailabilityId, now);
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [slot.doctor_id]);
-    await ensureNoActivePaymentHold(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time);
-    const conflict = await client.query(
+    if (!slot.mode) await ensureNoActivePaymentHold(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time);
+    const conflict = slot.mode ? { rows: [] } : await client.query(
       `SELECT 1 FROM appointments other JOIN availability other_av ON other_av.id = other.availability_id
        WHERE other_av.doctor_id = $1 AND other.status = 'confirmed' AND other_av.date = $2::date
          AND other_av.start_time < $4::time AND other_av.end_time > $3::time LIMIT 1`,
       [slot.doctor_id, slot.date, slot.start_time, slot.end_time],
     );
     if (conflict.rows[0]) fail(409, "SLOT_UNAVAILABLE", "The selected time overlaps another confirmed appointment");
+    const occupied = await client.query(
+      `SELECT (SELECT COUNT(*) FROM appointment_allocations WHERE availability_id = $1 AND status IN ('held','confirmed')
+                AND (status <> 'held' OR expires_at > NOW()) AND id IS DISTINCT FROM $2)::int
+              + (SELECT COUNT(*) FROM appointment_slot_holds WHERE availability_id = $1 AND status = 'active' AND expires_at > NOW())::int AS count`,
+      [newAvailabilityId, original.allocation_id],
+    );
+    if (Number(occupied.rows[0]?.count || 0) >= Number(slot.capacity || 1)) fail(409, "SLOT_UNAVAILABLE", "The selected slot has reached its booking capacity");
+    const newAllocation = slot.mode ? await client.query(
+      "INSERT INTO appointment_allocations (availability_id, mode, patient_id, status) VALUES ($1,$2,$3,'confirmed') RETURNING id",
+      [newAvailabilityId, slot.mode, original.patient_id],
+    ) : { rows: [{ id: null }] };
     await client.query(
       "UPDATE appointments SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW() WHERE id = $1",
       [appointmentId],
     );
     const created = await client.query(
-      `INSERT INTO appointments (patient_id, availability_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time, consultation_fee)
-       VALUES ($1, $2, 'confirmed', $3, $4::date, $5::time, $6::time, $7::numeric) RETURNING id`,
-      [original.patient_id, newAvailabilityId, original.reason, slot.date, slot.start_time, slot.end_time, original.consultation_fee],
+      `INSERT INTO appointments (patient_id, availability_id, allocation_id, status, reason, scheduled_date, scheduled_start_time, scheduled_end_time, consultation_fee)
+       VALUES ($1, $2, $3, 'confirmed', $4, $5::date, $6::time, $7::time, $8::numeric) RETURNING id`,
+      [original.patient_id, newAvailabilityId, newAllocation.rows[0].id, original.reason, slot.date, slot.start_time, slot.end_time, original.consultation_fee],
+    );
+    if (original.allocation_id) await client.query("UPDATE appointment_allocations SET status = 'released', updated_at = NOW() WHERE id = $1 AND status = 'confirmed'", [original.allocation_id]);
+    if (original.allocation_id && newAllocation.rows[0].id) await client.query(
+      `INSERT INTO appointment_reschedule_history (appointment_id, patient_id, changed_by_user_id, previous_allocation_id, previous_availability_id, previous_date, previous_start_time, previous_end_time, new_allocation_id, new_availability_id, new_date, new_start_time, new_end_time)
+       VALUES ($1,$2,$3,$4,$5,$6::date,$7::time,$8::time,$9,$10,$11::date,$12::time,$13::time)`,
+      [appointmentId, original.patient_id, user.id, original.allocation_id, original.availability_id, previousAppointment.date, previousAppointment.start_time, previousAppointment.end_time, newAllocation.rows[0].id, newAvailabilityId, slot.date, slot.start_time, slot.end_time],
     );
     const appointment = await readDetails(client, created.rows[0].id);
     return { ...appointment, previous_date: previousAppointment.date, previous_start_time: previousAppointment.start_time };
@@ -322,7 +356,7 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
   }
   return withTransaction(database, async (client) => {
     const owned = await client.query(
-      `SELECT a.id, a.status, a.availability_id, a.scheduled_date::text AS date,
+      `SELECT a.id, a.status, a.availability_id, a.allocation_id, a.patient_id, a.scheduled_date::text AS date,
               a.scheduled_start_time::text AS start_time, a.scheduled_end_time::text AS end_time
        FROM appointments a JOIN availability av ON av.id = a.availability_id
        WHERE a.id = $1 AND av.doctor_id = $2 FOR UPDATE OF a`,
@@ -335,8 +369,13 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
       fail(409, "APPOINTMENT_TIME_UNCHANGED", "Choose a different appointment date or time");
     }
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [doctorId]);
-    await ensureNoActivePaymentHold(client, doctorId, input.date, input.start_time, input.end_time);
-    const conflict = await client.query(
+    const targetSlot = await client.query(
+      `SELECT id, deleted_at, mode, capacity FROM availability
+       WHERE doctor_id = $1 AND date = $2::date AND start_time = $3::time AND end_time = $4::time
+       FOR UPDATE`,
+      [doctorId, input.date, input.start_time, input.end_time],
+    );
+    const conflict = targetSlot.rows[0]?.mode ? { rows: [] } : await client.query(
       `SELECT 1 FROM appointments other
        JOIN availability other_av ON other_av.id = other.availability_id
        WHERE other_av.doctor_id = $1 AND other.id <> $2 AND other.status = 'confirmed'
@@ -346,18 +385,33 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
       [doctorId, appointmentId, input.date, input.start_time, input.end_time],
     );
     if (conflict.rows[0]) fail(409, "DOCTOR_TIME_CONFLICT", "The selected time overlaps another confirmed appointment");
-    const targetSlot = await client.query(
-      `SELECT id, deleted_at FROM availability
-       WHERE doctor_id = $1 AND date = $2::date AND start_time = $3::time AND end_time = $4::time`,
-      [doctorId, input.date, input.start_time, input.end_time],
-    );
+    if (!targetSlot.rows[0]?.mode) await ensureNoActivePaymentHold(client, doctorId, input.date, input.start_time, input.end_time);
     if (targetSlot.rows[0]?.deleted_at) fail(409, "SLOT_UNAVAILABLE", "The selected availability slot has been removed");
     const availabilityId = targetSlot.rows[0]?.id ?? original.availability_id;
+    if (original.allocation_id && !targetSlot.rows[0]) fail(409, "SLOT_UNAVAILABLE", "Choose a generated availability slot for this appointment");
+    let allocationId = null;
+    if (targetSlot.rows[0]?.mode) {
+      const capacity = await client.query(
+        `SELECT (SELECT COUNT(*) FROM appointment_allocations WHERE availability_id = $1 AND status IN ('held','confirmed')
+                  AND (status <> 'held' OR expires_at > NOW()) AND id IS DISTINCT FROM $2)::int
+                + (SELECT COUNT(*) FROM appointment_slot_holds WHERE availability_id = $1 AND status = 'active' AND expires_at > NOW())::int AS occupied`,
+        [availabilityId, original.allocation_id],
+      );
+      if (Number(capacity.rows[0]?.occupied || 0) >= Number(targetSlot.rows[0].capacity || 1)) fail(409, "SLOT_UNAVAILABLE", "The selected slot has reached its booking capacity");
+      const allocation = await client.query("INSERT INTO appointment_allocations (availability_id, mode, patient_id, status) VALUES ($1,$2,$3,'confirmed') RETURNING id", [availabilityId, targetSlot.rows[0].mode, original.patient_id]);
+      allocationId = allocation.rows[0].id;
+    }
     const updated = await client.query(
-      `UPDATE appointments SET availability_id = $2, scheduled_date = $3::date,
+      `UPDATE appointments SET availability_id = $2, allocation_id = $6, scheduled_date = $3::date,
        scheduled_start_time = $4::time, scheduled_end_time = $5::time,
        updated_at = NOW() WHERE id = $1 RETURNING id, updated_at::text AS reschedule_version`,
-      [appointmentId, availabilityId, input.date, input.start_time, input.end_time],
+      [appointmentId, availabilityId, input.date, input.start_time, input.end_time, allocationId],
+    );
+    if (original.allocation_id) await client.query("UPDATE appointment_allocations SET status = 'released', updated_at = NOW() WHERE id = $1 AND status = 'confirmed'", [original.allocation_id]);
+    if (original.allocation_id && allocationId) await client.query(
+      `INSERT INTO appointment_reschedule_history (appointment_id, patient_id, changed_by_user_id, previous_allocation_id, previous_availability_id, previous_date, previous_start_time, previous_end_time, new_allocation_id, new_availability_id, new_date, new_start_time, new_end_time)
+       VALUES ($1,$2,$3,$4,$5,$6::date,$7::time,$8::time,$9,$10,$11::date,$12::time,$13::time)`,
+      [appointmentId, original.patient_id, user.id, original.allocation_id, original.availability_id, original.date, original.start_time, original.end_time, allocationId, availabilityId, input.date, input.start_time, input.end_time],
     );
     const appointment = await readDetails(client, updated.rows[0].id);
     return {

@@ -39,7 +39,7 @@ async function withTransaction(database, operation) {
 async function lockSlot(client, availabilityId, { requireActive = false } = {}) {
   const result = await client.query(
     `SELECT av.id, av.doctor_id, av.deleted_at, av.date::text AS date, av.start_time::text AS start_time,
-            av.end_time::text AS end_time, d.consultation_fee::text AS fee
+            av.end_time::text AS end_time, d.consultation_fee::text AS fee, av.mode, av.capacity
      FROM availability av JOIN doctors d ON d.id = av.doctor_id
      JOIN users du ON du.id = d.user_id
      WHERE av.id = $1 AND du.is_active = TRUE
@@ -203,7 +203,14 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
       const slotDateTime = new Date(`${slot.date}T${String(slot.start_time).slice(0, 8)}+05:30`);
       if (Number.isNaN(slotDateTime.getTime()) || slotDateTime <= new Date()) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer bookable");
       const amount = stripeMinorUnits(slot.fee);
-      if (await scheduleConflict(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time, "00000000-0000-0000-0000-000000000000")) {
+      const occupancy = await client.query(
+        `SELECT (SELECT COUNT(*) FROM appointment_allocations allocation WHERE allocation.availability_id = $1
+                   AND allocation.status IN ('held','confirmed') AND (allocation.status <> 'held' OR allocation.expires_at > NOW()))::int
+                + (SELECT COUNT(*) FROM appointment_slot_holds hold WHERE hold.availability_id = $1
+                   AND hold.status = 'active' AND hold.expires_at > NOW())::int AS occupied`, [input.availability_id],
+      );
+      if (Number(occupancy.rows[0]?.occupied || 0) >= Number(slot.capacity || 1)) fail(409, "SLOT_UNAVAILABLE", "The selected slot has reached its booking capacity");
+      if (!slot.mode && await scheduleConflict(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time, "00000000-0000-0000-0000-000000000000")) {
         fail(409, "SLOT_UNAVAILABLE", "The selected appointment time is already booked or reserved");
       }
 

@@ -33,7 +33,7 @@ async function getDoctorSlots(_request, response, next) {
     const ownership = await getOwnDoctorId(response);
     isOwnDoctorManagementView = !ownership.error && ownership.doctorId === id;
   }
-  const values = [id, now.date, now.time, response.locals.applicationTimezone];
+  const values = [id, now.date, now.time, response.locals.applicationTimezone, isOwnDoctorManagementView];
   const filters = ["doctor_id = $1", "deleted_at IS NULL", "(date > $2::date OR (date = $2::date AND start_time > $3::time))"];
   if (from) {
     values.push(from);
@@ -45,13 +45,21 @@ async function getDoctorSlots(_request, response, next) {
   }
 
   try {
-    const holdFilter = isOwnDoctorManagementView ? "" : "AND payment_hold.id IS NULL";
+    const holdFilter = isOwnDoctorManagementView ? "" : "AND (availability.mode IS NOT NULL OR payment_hold.id IS NULL)";
     const result = await response.locals.database.query(
       `SELECT availability.id, availability.doctor_id, availability.date::text AS date,
               availability.start_time::text AS start_time, availability.end_time::text AS end_time,
+              availability.mode, availability.capacity,
+              GREATEST(availability.capacity - COALESCE(occupancy.booked, 0) - COALESCE(occupancy.held, 0), 0)::int AS remaining_capacity,
               availability.created_at, availability.updated_at,
               payment_hold.status AS hold_status, payment_hold.expires_at AS hold_expires_at
        FROM availability
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*) FILTER (WHERE allocation.status = 'confirmed' OR (allocation.status = 'held' AND allocation.expires_at > NOW()))::int AS booked,
+                (SELECT COUNT(*)::int FROM appointment_slot_holds hold
+                 WHERE hold.availability_id = availability.id AND hold.status = 'active' AND hold.expires_at > NOW()) AS held
+         FROM appointment_allocations allocation WHERE allocation.availability_id = availability.id
+       ) occupancy ON TRUE
        LEFT JOIN LATERAL (
          SELECT hold.id, hold.status, hold.expires_at
          FROM appointment_slot_holds hold
@@ -61,11 +69,13 @@ async function getDoctorSlots(_request, response, next) {
          LIMIT 1
        ) payment_hold ON TRUE
        WHERE ${filters.join(" AND ")}
-         AND NOT EXISTS (
+         AND (availability.booking_visibility = 'public' OR $5::boolean)
+         AND (availability.mode IS NOT NULL OR NOT EXISTS (
            SELECT 1 FROM appointments appointment
             WHERE appointment.availability_id = availability.id AND appointment.status = 'confirmed'
               AND ((appointment.scheduled_date + appointment.scheduled_end_time) AT TIME ZONE $4) > NOW()
-          )
+          ))
+         AND (availability.mode IS NULL OR availability.capacity > COALESCE(occupancy.booked, 0) + COALESCE(occupancy.held, 0) OR $5::boolean)
           ${holdFilter}
        ORDER BY date, start_time`,
       values,
