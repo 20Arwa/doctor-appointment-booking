@@ -7,6 +7,54 @@ async function owner(response, doctorId) {
 }
 function fail(response, status, code, message) { return response.status(status).json({ error: { code, message } }); }
 
+async function assertWindowAvailable(client, { doctorId, scheduleId, date, startTime, endTime, mode, capacity, visibility }) {
+  const matching = await client.query(
+    `SELECT 1
+     FROM availability av
+     JOIN doctor_schedule_windows window ON window.id = av.schedule_window_id
+     WHERE av.doctor_id = $1 AND av.schedule_id = $2 AND av.date = $3::date
+       AND av.start_time = $4::time AND av.end_time = $5::time
+       AND av.mode = $6 AND av.capacity = $7 AND av.booking_visibility = $8
+       AND av.deleted_at IS NULL AND window.deleted_at IS NULL
+     LIMIT 1`, [doctorId, scheduleId, date, startTime, endTime, mode, capacity, visibility],
+  );
+  if (matching.rows[0]) return true;
+
+  const conflict = await client.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM availability av
+       WHERE av.doctor_id = $1 AND av.date = $2::date AND av.deleted_at IS NULL
+         AND av.start_time < $4::time AND av.end_time > $3::time
+     ) OR EXISTS (
+       SELECT 1 FROM doctor_schedule_windows window
+       WHERE window.doctor_id = $1 AND window.service_date = $2::date AND window.deleted_at IS NULL
+         AND window.start_time < $4::time AND window.end_time > $3::time
+     ) OR EXISTS (
+       SELECT 1 FROM availability legacy
+       WHERE legacy.doctor_id = $1 AND legacy.date = $2::date
+         AND legacy.mode = 'stream' AND legacy.deleted_at IS NOT NULL
+         AND legacy.start_time < $4::time AND legacy.end_time > $3::time
+         AND (
+           EXISTS (SELECT 1 FROM appointments appointment
+                   WHERE appointment.availability_id = legacy.id
+                     AND appointment.status IN ('confirmed', 'completed'))
+           OR EXISTS (SELECT 1 FROM appointment_allocations allocation
+                      WHERE allocation.availability_id = legacy.id
+                        AND allocation.status IN ('held', 'confirmed'))
+           OR EXISTS (SELECT 1 FROM appointment_slot_holds hold
+                      WHERE hold.availability_id = legacy.id
+                        AND hold.status = 'active' AND hold.expires_at > NOW())
+         )
+     ) AS has_conflict`, [doctorId, date, startTime, endTime],
+  );
+  if (conflict.rows[0]?.has_conflict) {
+    const error = new Error("Generated availability overlaps existing or still-booked availability");
+    error.code = "23P01";
+    throw error;
+  }
+  return false;
+}
+
 async function listSchedules(_request, response, next) {
   try {
     const { id } = response.locals.params;
@@ -76,35 +124,58 @@ async function generateAvailability(_request, response, next) {
       for (const period of dayPeriods) {
         let minute = Number(period.start_time.slice(0, 2)) * 60 + Number(period.start_time.slice(3, 5));
         const end = Number(period.end_time.slice(0, 2)) * 60 + Number(period.end_time.slice(3, 5));
-        let count = 0;
-        while (minute + duration <= end && (schedule.mode !== "stream" || count < schedule.stream_capacity_per_window)) {
+        const periodStart = `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
+        if (schedule.mode === "stream") {
+          if (date < now.date || (date === now.date && periodStart <= now.time)) continue;
+          const alreadyGenerated = await assertWindowAvailable(client, {
+            doctorId: id, scheduleId, date, startTime: periodStart, endTime: period.end_time,
+            mode: "stream", capacity: schedule.stream_capacity_per_window, visibility: schedule.visibility,
+          });
+          if (!alreadyGenerated) {
+            const window = await client.query(
+              `INSERT INTO doctor_schedule_windows (schedule_id, doctor_id, mode, visibility, service_date, start_time, end_time, wave_capacity_per_slot, stream_capacity_per_window)
+               VALUES ($1,$2,'stream',$3,$4::date,$5::time,$6::time,0,$7) RETURNING id`,
+              [scheduleId, id, schedule.visibility, date, periodStart, period.end_time, schedule.stream_capacity_per_window],
+            );
+            await client.query(
+              `INSERT INTO availability (doctor_id, date, start_time, end_time, schedule_window_id, schedule_id, mode, booking_visibility, capacity)
+               VALUES ($1,$2::date,$3::time,$4::time,$5,$6,'stream',$7,$8)`,
+              [id, date, periodStart, period.end_time, window.rows[0].id, scheduleId, schedule.visibility, schedule.stream_capacity_per_window],
+            );
+            generated += 1;
+          }
+          continue;
+        }
+        while (minute + duration <= end) {
           const endMinute = minute + duration;
           const startTime = `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
           const endTime = `${String(Math.floor(endMinute / 60)).padStart(2, "0")}:${String(endMinute % 60).padStart(2, "0")}`;
-          if (date < now.date || (date === now.date && startTime <= now.time)) { minute += duration; count += 1; continue; }
-          const exists = await client.query(
-            `SELECT 1 FROM availability WHERE doctor_id = $1 AND date = $2::date AND start_time = $3::time AND deleted_at IS NULL
-             UNION ALL SELECT 1 FROM doctor_schedule_windows WHERE schedule_id = $4 AND service_date = $2::date AND start_time = $3::time AND deleted_at IS NULL LIMIT 1`,
-            [id, date, startTime, scheduleId],
-          );
-          if (!exists.rows[0]) {
+          if (date < now.date || (date === now.date && startTime <= now.time)) { minute += duration; continue; }
+          const alreadyGenerated = await assertWindowAvailable(client, {
+            doctorId: id, scheduleId, date, startTime, endTime, mode: "wave",
+            capacity: schedule.wave_capacity_per_slot, visibility: schedule.visibility,
+          });
+          if (!alreadyGenerated) {
             const window = await client.query(
               `INSERT INTO doctor_schedule_windows (schedule_id, doctor_id, mode, visibility, service_date, start_time, end_time, wave_capacity_per_slot, stream_capacity_per_window) VALUES ($1,$2,$3,$4,$5::date,$6::time,$7::time,$8,$9) RETURNING id`,
               [scheduleId, id, schedule.mode, schedule.visibility, date, startTime, endTime, schedule.wave_capacity_per_slot, schedule.stream_capacity_per_window],
             );
             await client.query(
               `INSERT INTO availability (doctor_id, date, start_time, end_time, schedule_window_id, schedule_id, mode, booking_visibility, capacity) VALUES ($1,$2::date,$3::time,$4::time,$5,$6,$7,$8,$9)`,
-              [id, date, startTime, endTime, window.rows[0].id, scheduleId, schedule.mode, schedule.visibility, schedule.mode === "wave" ? schedule.wave_capacity_per_slot : 1],
+              [id, date, startTime, endTime, window.rows[0].id, scheduleId, schedule.mode, schedule.visibility, schedule.wave_capacity_per_slot],
             );
             generated += 1;
           }
           minute += duration;
-          count += 1;
         }
       }
     }
     await client.query("COMMIT");
-    return response.status(201).json({ schedule_id: scheduleId, generated_slots: generated });
+    return response.status(201).json({
+      schedule_id: scheduleId,
+      mode: schedule.mode,
+      [schedule.mode === "stream" ? "generated_windows" : "generated_slots"]: generated,
+    });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     if (error.code === "23P01" || error.code === "23505") return fail(response, 409, "SCHEDULE_CONFLICT", "Generated availability overlaps another schedule");

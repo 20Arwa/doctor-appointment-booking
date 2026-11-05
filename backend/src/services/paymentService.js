@@ -55,22 +55,22 @@ async function lockDoctor(client, doctorId) {
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [doctorId]);
 }
 
-async function expireHoldsForSchedule(client, doctorId, date) {
+async function expireHoldsForAvailability(client, availabilityId) {
   await client.query(
     `UPDATE payments p SET status = 'expired', expired_at = NOW(), updated_at = NOW()
      FROM appointment_slot_holds h JOIN availability av ON av.id = h.availability_id
      WHERE p.slot_hold_id = h.id AND p.provider = 'stripe'
        AND h.status = 'active' AND h.expires_at <= NOW()
        AND p.status IN ('created', 'pending', 'authorized')
-       AND av.doctor_id = $1 AND av.date = $2::date`,
-    [doctorId, date],
+       AND av.id = $1`,
+    [availabilityId],
   );
   await client.query(
     `UPDATE appointment_slot_holds h SET status = 'expired', updated_at = NOW()
      FROM availability av
      WHERE av.id = h.availability_id AND h.status = 'active' AND h.expires_at <= NOW()
-       AND av.doctor_id = $1 AND av.date = $2::date`,
-    [doctorId, date],
+       AND av.id = $1`,
+    [availabilityId],
   );
 }
 
@@ -144,6 +144,8 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
   const refundService = createRefundService({ database, stripe, logger, now });
   async function closePaymentWithoutSession(reservation, status = "failed") {
     await withTransaction(database, async (client) => {
+      const slot = await lockSlot(client, reservation.availability_id);
+      await lockDoctor(client, slot.doctor_id);
       const closed = await client.query(
         `UPDATE payments SET status = $2,
            failed_at = CASE WHEN $2 = 'failed' THEN COALESCE(failed_at, NOW()) ELSE failed_at END,
@@ -167,7 +169,7 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
       if (!patientId) fail(403, "PATIENT_PROFILE_REQUIRED", "An existing patient profile is required to book appointments");
       const slot = await lockSlot(client, input.availability_id, { requireActive: true });
       await lockDoctor(client, slot.doctor_id);
-      await expireHoldsForSchedule(client, slot.doctor_id, slot.date);
+      await expireHoldsForAvailability(client, slot.id);
 
       const prior = await client.query(
         `SELECT p.id, p.status, p.provider_order_id, p.amount::text AS amount, p.currency,
@@ -372,6 +374,10 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
          WHERE id = $1`,
         [current.id, intent],
       );
+      await client.query(
+        "UPDATE appointment_slot_holds SET status = 'consumed', updated_at = NOW() WHERE id = $1 AND status = 'active'",
+        [current.slot_hold_id],
+      );
       const appointment = await appointmentService.createPaymentAppointment(client, {
         availabilityId: current.availability_id,
         patientId: current.patient_id,
@@ -381,14 +387,13 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
         timeZone,
       }).catch(async (error) => {
         if (!(error instanceof appointmentService.AppointmentError) || error.code !== "SLOT_UNAVAILABLE") throw error;
-        await client.query("UPDATE appointment_slot_holds SET status = 'expired', updated_at = NOW() WHERE id = $1 AND status = 'active'", [current.slot_hold_id]);
+        await client.query("UPDATE appointment_slot_holds SET status = 'expired', updated_at = NOW() WHERE id = $1 AND status IN ('active', 'consumed')", [current.slot_hold_id]);
         const reconciliationId = await recordReconciliation(client, current, session, event?.id ?? null, "slot_unavailable");
         if (event) await client.query("UPDATE payment_provider_events SET processed_at = NOW() WHERE provider = 'stripe' AND provider_event_id = $1", [event.id]);
         return { status: "captured_slot_unavailable", reconciliation_id: reconciliationId };
       });
       if (appointment?.status === "captured_slot_unavailable") return appointment;
       await client.query("UPDATE payments SET appointment_id = $2, slot_hold_id = NULL, updated_at = NOW() WHERE id = $1", [current.id, appointment.id]);
-      await client.query("UPDATE appointment_slot_holds SET status = 'consumed', updated_at = NOW() WHERE id = $1", [current.slot_hold_id]);
       if (event) await client.query("UPDATE payment_provider_events SET processed_at = NOW() WHERE provider = 'stripe' AND provider_event_id = $1", [event.id]);
       return { status: "confirmed", appointment, created: true };
     });
