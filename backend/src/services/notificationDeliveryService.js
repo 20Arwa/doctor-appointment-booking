@@ -8,16 +8,18 @@ const BREVO_IDEMPOTENCY_TTL_MS = 30 * 60_000;
 const PROCESSING_LEASE_MS = 2 * 60_000;
 const BATCH_SIZE = 25;
 
-function appointmentPayload(eventType, appointment) {
+function appointmentPayload(eventType, appointment, recipientType) {
   const action = eventType.slice("appointment.".length);
   const doctor = `Dr. ${[appointment.doctor_first_name, appointment.doctor_last_name].filter(Boolean).join(" ")}`;
   const current = `${appointment.date} at ${String(appointment.start_time || "").slice(0, 5)}`;
   const subject = { booked: "Appointment confirmed", cancelled: "Appointment cancelled", rescheduled: "Appointment rescheduled" }[action];
-  let textContent;
-  if (action === "booked") textContent = `Your appointment with ${doctor} is confirmed for ${current}.`;
-  else if (action === "cancelled") textContent = `Your appointment with ${doctor} on ${current} has been cancelled.`;
-  else textContent = `Your appointment with ${doctor} has been rescheduled from ${appointment.previous_date} at ${String(appointment.previous_start_time || "").slice(0, 5)} to ${current}.`;
-  return { to: appointment.patient_email || null, subject, textContent, sender: { email: null, name: null } };
+  const textContent = recipientType === "doctor"
+    ? `${action === "booked" ? "A patient booked" : action === "cancelled" ? "A patient cancelled" : "A patient's appointment was rescheduled"} with you. Doctor: ${doctor}. Date: ${appointment.date}. Time: ${String(appointment.start_time || "").slice(0, 5)}.`
+    : action === "booked" ? `Your appointment with ${doctor} is confirmed for ${current}.`
+      : action === "cancelled" ? `Your appointment with ${doctor} on ${current} has been cancelled.`
+        : `Your appointment with ${doctor} has been rescheduled from ${appointment.previous_date} at ${String(appointment.previous_start_time || "").slice(0, 5)} to ${current}.`;
+  const recipient = recipientType === "doctor" ? appointment.doctor_email : appointment.patient_email;
+  return { to: recipient || null, subject, textContent, sender: { email: null, name: null } };
 }
 
 function createNotificationDeliveryService({ database, emailNotificationService, logger = console }) {
@@ -25,17 +27,18 @@ function createNotificationDeliveryService({ database, emailNotificationService,
     logger.error("Notification delivery tracking failed", { operation, reason: "database_error" });
   }
 
-  async function createDelivery({ eventKey, eventType, appointment }) {
+  async function createDelivery({ eventKey, eventType, appointment, recipient }) {
     const action = eventType.slice("appointment.".length);
     const payload = typeof emailNotificationService.createNotificationPayload === "function"
-      ? emailNotificationService.createNotificationPayload(action, appointment)
-      : appointmentPayload(eventType, appointment);
+      ? emailNotificationService.createNotificationPayload(action, appointment, recipient.type)
+      : appointmentPayload(eventType, appointment, recipient.type);
     const idempotencyKey = randomUUID();
     const inserted = await database.query(
       `INSERT INTO notification_deliveries (event_key, event_type, appointment_id, recipient_user_id, payload, idempotency_key, last_attempt_at, lease_token, lease_expires_at)
-       SELECT $1, $2, $3, p.user_id, $5::jsonb, $6, NOW(), $7, NOW() + ($8 * INTERVAL '1 millisecond')
-       FROM patients p WHERE p.id = $4 ON CONFLICT (event_key) DO NOTHING RETURNING id, idempotency_key, payload, lease_token`,
-      [eventKey, eventType, appointment.id, appointment.patient_id, JSON.stringify(payload), idempotencyKey, randomUUID(), PROCESSING_LEASE_MS],
+       SELECT $1, $2, $3, recipient.user_id, $5::jsonb, $6, NOW(), $7, NOW() + ($8 * INTERVAL '1 millisecond')
+       FROM (SELECT $4::uuid AS user_id) recipient WHERE $4::uuid IS NOT NULL
+       ON CONFLICT (event_key) DO NOTHING RETURNING id, idempotency_key, payload, lease_token`,
+      [eventKey, eventType, appointment.id, recipient.userId, JSON.stringify(payload), idempotencyKey, randomUUID(), PROCESSING_LEASE_MS],
     );
     if (inserted.rows[0]) return { ...inserted.rows[0], created: true };
     let existing;
@@ -77,17 +80,29 @@ function createNotificationDeliveryService({ database, emailNotificationService,
     return outcome;
   }
 
-  async function sendAppointmentNotification({ eventKey, eventType, appointment }) {
-    let delivery;
-    try { delivery = await createDelivery({ eventKey, eventType, appointment }); }
-    catch (_error) { logTrackingFailure("create"); return sendWithoutTracking(eventType, appointment); }
-    if (!delivery) { logTrackingFailure("create"); return sendWithoutTracking(eventType, appointment); }
-    if (!delivery.created) {
-      if (delivery.lookupFailed) logTrackingFailure("duplicate_check");
-      return { sent: false, duplicate: true };
+  async function sendAppointmentNotification({ eventKey, eventType, appointment, actorRole = "patient" }) {
+    const recipients = [{ type: "patient", userId: appointment.patient_user_id, email: appointment.patient_email }];
+    if (eventType !== "appointment.rescheduled" || actorRole !== "doctor") {
+      recipients.push({ type: "doctor", userId: appointment.doctor_user_id, email: appointment.doctor_email });
     }
-    try { return await dispatch({ ...delivery, event_type: eventType, appointment }, delivery.lease_token); }
-    catch (_error) { logTrackingFailure("update"); return { sent: false, ambiguous: true, reason: "unexpected_error" }; }
+    const outcomes = [];
+    for (const recipient of recipients) {
+      if (!recipient.userId || !recipient.email) { outcomes.push({ sent: false, skipped: true, reason: "missing_recipient" }); continue; }
+      const recipientEventKey = `${eventKey}:${recipient.type}:${recipient.userId}`;
+      let delivery;
+      try { delivery = await createDelivery({ eventKey: recipientEventKey, eventType, appointment, recipient }); }
+      catch (_error) { logTrackingFailure("create"); outcomes.push({ sent: false, skipped: true, reason: "tracking_unavailable" }); continue; }
+      if (!delivery) { logTrackingFailure("create"); outcomes.push({ sent: false, skipped: true, reason: "tracking_unavailable" }); continue; }
+      if (!delivery.created) {
+        if (delivery.lookupFailed) logTrackingFailure("duplicate_check");
+        outcomes.push({ sent: false, duplicate: true });
+        continue;
+      }
+      try { outcomes.push(await dispatch({ ...delivery, event_type: eventType, appointment }, delivery.lease_token)); }
+      catch (_error) { logTrackingFailure("update"); outcomes.push({ sent: false, ambiguous: true, reason: "unexpected_error" }); }
+    }
+    const sent = outcomes.some((outcome) => outcome.sent);
+    return { sent, duplicate: !sent && outcomes.some((outcome) => outcome.duplicate), outcomes };
   }
 
   async function runRecovery() {
@@ -137,11 +152,6 @@ function createNotificationDeliveryService({ database, emailNotificationService,
       retried += 1;
     }
     return { claimed: claim.rows.length, retried, markedAmbiguous: (stale.rowCount || stale.rows.length) + (expired.rowCount || expired.rows.length) };
-  }
-
-  async function sendWithoutTracking(eventType, appointment) {
-    try { return await emailNotificationService.sendAppointmentNotification(eventType.slice("appointment.".length), appointment); }
-    catch (_error) { logger.error("Appointment email notification failed", { eventType, reason: "unexpected_error" }); return { sent: false, error: true, reason: "unexpected_error", attempts: 0, untracked: true }; }
   }
 
   return { sendAppointmentNotification, runRecovery };

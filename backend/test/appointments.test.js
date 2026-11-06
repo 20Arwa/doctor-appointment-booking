@@ -394,23 +394,26 @@ describe("appointment workflows", () => {
     assert.equal(events[2].appointment.id, appointmentId);
   });
 
-  it("keeps cancellation successful and sends once when tracking record creation fails", async () => {
-    const database = createDatabase({ appointments: [makeAppointment()] });
-    const query = database.query.bind(database);
-    database.query = async (sql, values) => {
-      if (sql.startsWith("INSERT INTO notification_deliveries")) throw new Error("database unavailable");
-      return query(sql, values);
-    };
+  it("skips email and logs safely when tracking record creation fails", async () => {
+    const database = { async query() { throw new Error("database credentials and patient@example.test"); } };
+    const logs = [];
     let emailCalls = 0;
     const emailNotificationService = { async sendAppointmentNotification() { emailCalls += 1; return { sent: true, attempts: 1 }; } };
-    const notificationDeliveryService = createNotificationDeliveryService({ database, emailNotificationService, logger: { error() {} } });
-    const { app } = createTestApp({ database, emailNotificationService, notificationDeliveryService });
-    await withServer(app, async (url) => {
-      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" });
-      assert.equal(response.status, 200);
-      assert.equal((await response.json()).status, "cancelled");
+    const notificationDeliveryService = createNotificationDeliveryService({
+      database,
+      emailNotificationService,
+      logger: { error(...args) { logs.push(args); } },
     });
-    assert.equal(emailCalls, 1);
+    const result = await notificationDeliveryService.sendAppointmentNotification({
+      eventKey: "appointment.cancelled:test",
+      eventType: "appointment.cancelled",
+      appointment: { ...makeAppointment(), patient_user_id: patientUserId, patient_email: registeredPatientEmail },
+    });
+    assert.equal(result.sent, false);
+    assert.equal(result.outcomes[0].reason, "tracking_unavailable");
+    assert.equal(emailCalls, 0);
+    assert.deepEqual(logs, [["Notification delivery tracking failed", { operation: "create", reason: "database_error" }]]);
+    assert.doesNotMatch(JSON.stringify(logs), /credentials|patient@example\.test/);
   });
 
   it("rejects unpaid direct appointment creation without sending a booking notification", async () => {

@@ -1,7 +1,7 @@
 const appointmentService = require("./appointmentService");
 const { StripePaymentError } = require("./stripeService");
 const { createRefundService } = require("./refundService");
-const { appointmentEventKey } = require("./notificationDeliveryService");
+const { appointmentEventKey, createNotificationDeliveryService } = require("./notificationDeliveryService");
 
 const STRIPE_MIN_CHECKOUT_TTL_SECONDS = 30 * 60;
 const CHECKOUT_CREATION_SAFETY_SECONDS = 60;
@@ -141,6 +141,9 @@ function stripeReceiptUrl(value) {
 }
 
 function createPaymentService({ database, stripe, emailNotificationService, notificationDeliveryService, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now }) {
+  const notificationDeliveries = notificationDeliveryService || (emailNotificationService
+    ? createNotificationDeliveryService({ database, emailNotificationService, logger })
+    : null);
   const refundService = createRefundService({ database, stripe, logger, now });
   async function closePaymentWithoutSession(reservation, status = "failed") {
     await withTransaction(database, async (client) => {
@@ -416,17 +419,14 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
   }
 
   async function notifyNewAppointment(result) {
-    if (!result?.created || !result.appointment || !emailNotificationService) return result;
+    if (!result?.created || !result.appointment || !notificationDeliveries) return result;
     try {
-      if (notificationDeliveryService) {
-        await notificationDeliveryService.sendAppointmentNotification({
-          eventKey: appointmentEventKey("appointment.booked", result.appointment),
-          eventType: "appointment.booked",
-          appointment: result.appointment,
-        });
-      } else {
-        await emailNotificationService.sendAppointmentNotification("booked", result.appointment);
-      }
+      await notificationDeliveries.sendAppointmentNotification({
+        eventKey: appointmentEventKey("appointment.booked", result.appointment),
+        eventType: "appointment.booked",
+        appointment: result.appointment,
+        actorRole: "system",
+      });
     } catch (_error) {
       logger.error("Paid appointment confirmation email failed", { reason: "unexpected_error" });
     }
