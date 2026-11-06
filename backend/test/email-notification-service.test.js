@@ -24,7 +24,11 @@ describe("Brevo email notification service", () => {
     assert.deepEqual(body.sender, { email: config.BREVO_SENDER_EMAIL, name: config.BREVO_SENDER_NAME });
     assert.deepEqual(body.to, [{ email: appointment.patient_email }]);
     assert.equal(body.subject, "Appointment rescheduled");
-    assert.match(body.textContent, /2099-04-09 at 09:00 to 2099-04-10 at 10:00/);
+    assert.match(body.textContent, /Previous appointment: 2099-04-09 at 09:00/);
+    assert.match(body.textContent, /Date: 2099-04-10/);
+    assert.match(body.htmlContent, /#67465F/);
+    assert.match(body.htmlContent, /#30252D/);
+    assert.match(body.htmlContent, /Doctor/);
     assert.ok(request.options.signal instanceof AbortSignal);
   });
 
@@ -98,6 +102,17 @@ describe("Brevo email notification service", () => {
     assert.deepEqual(await service.sendAppointmentNotification("booked", appointment), { sent: true, attempts: 1, providerMessageId: null, status: 201 });
     assert.deepEqual(await service.sendAppointmentReminder("24h", appointment), { sent: true, attempts: 1, providerMessageId: null, status: 201 });
     assert.equal(count, 2);
+  });
+
+  it("renders recipient-appropriate doctor messages with HTML and text alternatives", async () => {
+    let body;
+    const service = createEmailNotificationService({ config, fetchImpl: async (_url, options) => { body = JSON.parse(options.body); return ok; } });
+    await service.sendAppointmentNotification("booked", { ...appointment, doctor_email: "doctor@example.test", patient_first_name: "Pia", patient_last_name: "Patient" }, "doctor");
+    assert.deepEqual(body.to, [{ email: "doctor@example.test" }]);
+    assert.equal(body.subject, "New appointment booking");
+    assert.match(body.textContent, /Patient: Pia Patient/);
+    assert.match(body.htmlContent, /Patient/);
+    assert.match(body.htmlContent, /2099-04-10/);
   });
 
   it("passes a stable Brevo idempotency key in the transactional email body headers", async () => {

@@ -4,6 +4,7 @@ const { createApp } = require("../src/app");
 const { createStripeService } = require("../src/services/stripeService");
 const { createPaymentService, PaymentError } = require("../src/services/paymentService");
 const { createPaymentOrderSchema } = require("../src/validators/paymentSchemas");
+const { createEmailNotificationService } = require("../src/services/emailNotificationService");
 
 const userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const patientId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -23,6 +24,7 @@ const appointment = {
   date: slot.date, start_time: slot.start_time, end_time: slot.end_time,
   doctor_id: doctorId, doctor_first_name: "Dara", doctor_last_name: "Doctor",
   specialty: "General Practice", patient_id: patientId,
+  patient_user_id: userId, doctor_user_id: otherUserId, doctor_email: "doctor@example.test",
   patient_first_name: "Pia", patient_last_name: "Patient", patient_email: "patient@example.test",
 };
 
@@ -164,6 +166,7 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
     appointment: null,
     competingBooking,
     events: new Set(),
+    notificationDeliveries: new Map(),
     reconciliation: new Map(),
     calls: [],
     sentEmails: [],
@@ -173,6 +176,18 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
   return {
     state,
     async query(sql, values = []) {
+      if (sql.startsWith("INSERT INTO notification_deliveries")) {
+        const [eventKey, eventType, appointmentRef, recipientUserId, payload, idempotencyKey, leaseToken] = values;
+        if (state.notificationDeliveries.has(eventKey)) return { rows: [] };
+        const record = { id: `delivery-${state.notificationDeliveries.size + 1}`, event_key: eventKey, event_type: eventType, appointment_id: appointmentRef, recipient_user_id: recipientUserId, payload: JSON.parse(payload), idempotency_key: idempotencyKey, lease_token: leaseToken };
+        state.notificationDeliveries.set(eventKey, record);
+        return { rows: [record] };
+      }
+      if (sql.startsWith("SELECT id FROM notification_deliveries")) {
+        const record = state.notificationDeliveries.get(values[0]);
+        return { rows: record ? [{ id: record.id }] : [] };
+      }
+      if (sql.startsWith("UPDATE notification_deliveries")) return { rows: [] };
       if (sql.includes("WHERE p.provider = 'stripe' AND p.provider_order_id")) return { rows: state.payment.provider_order_id === values[0] ? [row()] : [] };
       if (sql.includes("WHERE p.id = $1 AND COALESCE(h.patient_id, a.patient_id)")) return { rows: values[1] === userId ? [row()] : [] };
       if (sql.includes("FROM payment_capture_reconciliation WHERE payment_id")) return { rows: [...state.reconciliation.values()].filter((item) => item.payment_id === values[0]).map((item) => ({ id: item.id })) };
@@ -219,6 +234,8 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
           if (sql.startsWith("UPDATE payments SET status = 'pending'")) { state.payment.status = "pending"; state.payment.provider_payment_id ||= values[1]; return { rows: [] }; }
           if (sql.startsWith("UPDATE payments SET appointment_id")) { state.payment.appointment_id = values[1]; state.payment.slot_hold_id = null; return { rows: [] }; }
           if (sql.startsWith("UPDATE appointment_slot_holds SET status = 'consumed'")) { state.hold.status = "consumed"; return { rows: [] }; }
+          if (sql.includes("SELECT 1 FROM appointment_slot_holds") && sql.includes("status = 'consumed'")) return { rows: state.hold.status === "consumed" ? [{ id: holdId }] : [] };
+          if (sql.includes("COUNT(DISTINCT reservation.patient_id)")) return { rows: [{ occupied: 0 }] };
           if (sql.startsWith("UPDATE appointment_slot_holds SET status = 'expired'")) { state.hold.status = "expired"; return { rows: [] }; }
           if (sql.startsWith("UPDATE appointment_slot_holds SET status = $2")) { state.hold.status = values[1]; return { rows: [] }; }
           if (sql.startsWith("INSERT INTO payment_capture_reconciliation")) {
@@ -587,25 +604,53 @@ describe("Stripe appointment Checkout", () => {
 });
 
 describe("Stripe Checkout webhook and reconciliation", () => {
-  it("confirms once, sends one existing Brevo booking email, and ignores repeated/out-of-order success events", async () => {
+  it("sends tracked branded booking emails once to both recipients despite repeated/out-of-order success events", async () => {
     const database = createPaymentDatabase();
-    const stripe = { constructWebhookEvent(raw, signature) { assert.ok(Buffer.isBuffer(raw)); assert.equal(signature, "stripe-signature"); return JSON.parse(raw.toString("utf8")); } };
-    const deliveryEvents = [];
-    const emailNotificationService = { async sendAppointmentNotification(action, item) { database.state.sentEmails.push([action, item.id]); return { sent: true, attempts: 1, providerMessageId: "brevo-booking-id" }; } };
-    const service = createPaymentService({ database, stripe, timeZone: "Asia/Kolkata", emailNotificationService, notificationDeliveryService: { async sendAppointmentNotification(event) { deliveryEvents.push(event); return emailNotificationService.sendAppointmentNotification("booked", event.appointment); } } });
-    const first = await service.processWebhook(Buffer.from(JSON.stringify(createSessionEvent("checkout.session.completed", "evt_complete"))), "stripe-signature");
-    assert.equal(first.status, "confirmed");
+    const stripeService = { constructWebhookEvent(raw, signature) { assert.ok(Buffer.isBuffer(raw)); assert.equal(signature, "stripe-signature"); return JSON.parse(raw.toString("utf8")); } };
+    const emailNotificationService = createEmailNotificationService({
+      config: { BREVO_API_KEY: "mock-key", BREVO_SENDER_EMAIL: "sender@example.test", BREVO_SENDER_NAME: "Medrella" },
+      fetchImpl: async (_url, options) => {
+        database.state.sentEmails.push(JSON.parse(options.body));
+        return { ok: true, status: 201, async json() { return { messageId: "mock-booking-id" }; } };
+      },
+    });
+    const app = createApp({ database, frontendOrigin: "http://localhost:3000", applicationTimezone: "Asia/Kolkata", stripeService, emailNotificationService });
+    await withServer(app, async (url) => {
+      const postWebhook = (event) => fetch(`${url}/api/v1/payments/webhook`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "stripe-signature": "stripe-signature" },
+        body: JSON.stringify(event),
+      });
+      const firstResponse = await postWebhook(createSessionEvent("checkout.session.completed", "evt_complete"));
+      assert.equal(firstResponse.status, 200);
+      assert.equal((await firstResponse.json()).status, "confirmed");
+      const duplicateResponse = await postWebhook(createSessionEvent("checkout.session.completed", "evt_complete"));
+      assert.deepEqual(await duplicateResponse.json(), { duplicate: true });
+      const delayedResponse = await postWebhook(createSessionEvent("checkout.session.async_payment_succeeded", "evt_async_success"));
+      assert.equal((await delayedResponse.json()).status, "confirmed");
+    });
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.payment.provider_payment_id, intentId);
-    assert.equal(database.state.sentEmails.length, 1);
-    assert.equal(deliveryEvents.length, 1);
-    assert.equal(deliveryEvents[0].eventType, "appointment.booked");
-    assert.match(deliveryEvents[0].eventKey, /^appointment\.booked:/);
+    assert.equal(database.state.sentEmails.length, 2);
+    assert.deepEqual(database.state.sentEmails.map((mail) => mail.to[0].email), ["patient@example.test", "doctor@example.test"]);
+    for (const mail of database.state.sentEmails) {
+      assert.match(mail.htmlContent, /#67465F/);
+      assert.match(mail.htmlContent, /#30252D/);
+      assert.match(mail.textContent, /Date: 2099-04-10/);
+      assert.match(mail.textContent, /Time: 10:00/);
+    }
+    assert.match(database.state.sentEmails[0].textContent, /Your appointment with Dr\. Dara Doctor is confirmed/);
+    assert.match(database.state.sentEmails[1].textContent, /A patient booked an appointment with you/);
+    assert.equal(database.state.notificationDeliveries.size, 2);
+    assert.deepEqual([...database.state.notificationDeliveries.values()].map((delivery) => delivery.recipient_user_id), [userId, otherUserId]);
+    assert.deepEqual([...database.state.notificationDeliveries.values()].map((delivery) => delivery.payload.to), ["patient@example.test", "doctor@example.test"]);
+    for (const delivery of database.state.notificationDeliveries.values()) {
+      assert.match(delivery.payload.htmlContent, /#67465F/);
+      assert.match(delivery.payload.textContent, /Date: 2099-04-10/);
+    }
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
-    assert.deepEqual(await service.processWebhook(Buffer.from(JSON.stringify(createSessionEvent("checkout.session.completed", "evt_complete"))), "stripe-signature"), { duplicate: true });
-    const delayedSuccess = await service.processWebhook(Buffer.from(JSON.stringify(createSessionEvent("checkout.session.async_payment_succeeded", "evt_async_success"))), "stripe-signature");
-    assert.equal(delayedSuccess.status, "confirmed");
-    assert.equal(database.state.sentEmails.length, 1);
+    assert.equal(database.state.sentEmails.length, 2);
+    assert.equal(database.state.notificationDeliveries.size, 2);
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
   });
