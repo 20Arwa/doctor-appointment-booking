@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { CancellationRefundEstimate } from "@/components/cancellation-refund-estimate";
 import { notifyError, notifySuccess } from "@/lib/notifications";
 import { useAppointmentHistory } from "@/components/use-appointment-history";
+import { AppointmentAvailabilityCalendar } from "@/components/appointment-availability-calendar";
 import {
   cancelAppointment,
   getAppointmentCancellationRefundPreview,
@@ -29,7 +30,6 @@ import {
 } from "@/lib/profile-api";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
-const RESCHEDULE_WINDOW_DAYS = 30;
 
 function appointmentInstant(appointment: Pick<PatientAppointment, "date" | "start_time">) {
   const instant = new Date(`${appointment.date}T${appointment.start_time}+05:30`);
@@ -62,15 +62,9 @@ function todayInApplicationZone() {
   return `${values.year}-${values.month}-${values.day}`;
 }
 
-function rescheduleRange() {
-  const from = todayInApplicationZone();
-  const [year, month, day] = from.split("-").map(Number);
-  const to = new Date(Date.UTC(year, month - 1, day + RESCHEDULE_WINDOW_DAYS)).toISOString().slice(0, 10);
-  return { from, to };
-}
-
-function slotDate(slot: AvailabilitySlot) {
-  return appointmentDate(slot.date);
+function monthRange(month: string) {
+  const [year, monthNumber] = month.split("-").map(Number);
+  return { from: month, to: new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10) };
 }
 
 function statusClasses(status: PatientAppointment["status"]) {
@@ -98,6 +92,8 @@ export function PatientAppointmentsPage() {
   const [slotsLoading, setSlotsLoading] = useState(false);
   const [slotsError, setSlotsError] = useState<string | null>(null);
   const [selectedSlotId, setSelectedSlotId] = useState("");
+  const [rescheduleMonth, setRescheduleMonth] = useState(() => todayInApplicationZone().slice(0, 7));
+  const [rescheduleDate, setRescheduleDate] = useState(todayInApplicationZone());
   const [cancelTarget, setCancelTarget] = useState<PatientAppointment | null>(null);
   const [refundPreview, setRefundPreview] = useState<Awaited<ReturnType<typeof getAppointmentCancellationRefundPreview>> | null>(null);
   const [refundPreviewLoading, setRefundPreviewLoading] = useState(false);
@@ -163,9 +159,12 @@ export function PatientAppointmentsPage() {
     try {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please try again.");
-      const { from, to } = rescheduleRange();
+      const month = todayInApplicationZone().slice(0, 7);
+      setRescheduleMonth(month);
+      setRescheduleDate(todayInApplicationZone());
+      const { from, to } = monthRange(`${month}-01`);
       const result = await getDoctorSlots(token, appointment.doctor_id, from, to);
-      setSlots(result.filter((slot) => slot.id !== appointment.availability_id));
+      setSlots(result.filter((slot) => slot.id !== appointment.availability_id && (slot.mode === "wave" || slot.mode === "stream") && (slot.remaining_capacity ?? 0) > 0));
     } catch (error) {
       setSlotsError(error instanceof Error ? error.message : "We couldn't load replacement times.");
     } finally {
@@ -173,6 +172,23 @@ export function PatientAppointmentsPage() {
       setActiveRequest(null);
       requestLock.current = false;
     }
+  }
+
+  async function changeRescheduleMonth(appointment: PatientAppointment, nextMonth: string) {
+    setRescheduleMonth(nextMonth);
+    setRescheduleDate(`${nextMonth}-01`);
+    setSelectedSlotId("");
+    setSlotsLoading(true);
+    setSlotsError(null);
+    try {
+      const token = await getToken();
+      if (!token) throw new Error("Your session could not be verified. Please try again.");
+      const { from, to } = monthRange(`${nextMonth}-01`);
+      const result = await getDoctorSlots(token, appointment.doctor_id, from, to);
+      setSlots(result.filter((slot) => slot.id !== appointment.availability_id && (slot.mode === "wave" || slot.mode === "stream") && (slot.remaining_capacity ?? 0) > 0));
+    } catch (error) {
+      setSlotsError(error instanceof Error ? error.message : "We couldn't load replacement times.");
+    } finally { setSlotsLoading(false); }
   }
 
   async function cancel(appointment: PatientAppointment) {
@@ -251,13 +267,13 @@ export function PatientAppointmentsPage() {
       {!loading && !loadError ? (
         <>
           <AppointmentSection title="Upcoming appointments" empty="You have no upcoming appointments." appointments={upcoming}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} calendarMonth={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={(month) => void changeRescheduleMonth(appointment, month)} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
           <AppointmentSection title="Past appointments" empty="Your past appointments will appear here." appointments={past} hasMore={history.past.hasMore} loadingMore={history.past.loading} moreError={history.past.error} onShowMore={() => void loadMore("past")}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} calendarMonth={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={(month) => void changeRescheduleMonth(appointment, month)} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
           <AppointmentSection title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} hasMore={history.cancelled.hasMore} loadingMore={history.cancelled.loading} moreError={history.cancelled.error} onShowMore={() => void loadMore("cancelled")}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} calendarMonth={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={(month) => void changeRescheduleMonth(appointment, month)} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
         </>
       ) : null}
@@ -301,7 +317,7 @@ function AppointmentSection({ title, empty, appointments, children, hasMore = fa
   );
 }
 
-function AppointmentCard({ appointment, isPast, activeRequest, rescheduleId, slots, slotsLoading, slotsError, selectedSlotId, onCancel, onBeginReschedule, onSelectSlot, onConfirmReschedule, onCloseReschedule }: {
+function AppointmentCard({ appointment, isPast, activeRequest, rescheduleId, slots, slotsLoading, slotsError, selectedSlotId, calendarMonth, selectedDate, onSelectDate, onShiftMonth, onCancel, onBeginReschedule, onSelectSlot, onConfirmReschedule, onCloseReschedule }: {
   appointment: PatientAppointment;
   isPast: boolean;
   activeRequest: string | null;
@@ -310,6 +326,10 @@ function AppointmentCard({ appointment, isPast, activeRequest, rescheduleId, slo
   slotsLoading: boolean;
   slotsError: string | null;
   selectedSlotId: string;
+  calendarMonth: string;
+  selectedDate: string;
+  onSelectDate: (date: string) => void;
+  onShiftMonth: (month: string) => void;
   onCancel: () => void;
   onBeginReschedule: () => void;
   onSelectSlot: (slotId: string) => void;
@@ -318,6 +338,7 @@ function AppointmentCard({ appointment, isPast, activeRequest, rescheduleId, slo
 }) {
   const isBusy = activeRequest?.endsWith(appointment.id) ?? false;
   const rescheduling = rescheduleId === appointment.id;
+  const dateSlots = slots.filter((slot) => slot.date === selectedDate);
 
   return (
     <li className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6">
@@ -329,8 +350,9 @@ function AppointmentCard({ appointment, isPast, activeRequest, rescheduleId, slo
             <CalendarClock aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
             <span>{appointmentDate(appointment.date)} · {appointmentTime(appointment.start_time)}–{appointmentTime(appointment.end_time)} IST</span>
           </div>
+          {appointment.mode ? <p className="mt-2 text-sm text-muted-foreground">{appointment.mode === "wave" ? `Wave · ${Math.round((new Date(`1970-01-01T${appointment.end_time}Z`).getTime() - new Date(`1970-01-01T${appointment.start_time}Z`).getTime()) / 60_000)} minutes` : "Stream · continuous window"}</p> : null}
           {appointment.reason ? <p className="mt-3 text-sm leading-6 text-muted-foreground"><span className="font-medium text-foreground">Reason:</span> {appointment.reason}</p> : null}
-          <p className="mt-2 text-xs text-muted-foreground">Appointment ID: {appointment.id}</p>
+          {/* <p className="mt-2 text-xs text-muted-foreground">Appointment ID: {appointment.id}</p> */}
         </div>
         <span className={`inline-flex w-fit rounded-full px-3 py-1 text-xs font-semibold ${statusClasses(appointment.status)}`}>{appointment.status === "confirmed" && isPast ? "Awaiting completion" : appointment.status}</span>
       </div>
@@ -354,21 +376,12 @@ function AppointmentCard({ appointment, isPast, activeRequest, rescheduleId, slo
             <h3 className="font-semibold text-foreground">Choose a new time</h3>
             <button type="button" onClick={onCloseReschedule} className="rounded px-2 py-1 text-sm text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">Close</button>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">Available times over the next 30 days · IST</p>
+          <p className="mt-1 text-xs text-muted-foreground">Choose an available date, then select a time · IST</p>
           {slotsLoading ? <p className="mt-4 text-sm text-muted-foreground" role="status">Loading available times…</p> : null}
           {!slotsLoading && slotsError ? <div className="mt-4 rounded-lg bg-destructive/5 p-3" role="alert"><p className="text-sm text-foreground">{slotsError}</p><button type="button" onClick={onBeginReschedule} disabled={Boolean(activeRequest)} className="mt-3 inline-flex min-h-9 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-60"><RefreshCw aria-hidden="true" className="size-4" /> Refresh available times</button></div> : null}
           {!slotsLoading && !slotsError && slots.length === 0 ? <p className="mt-4 text-sm text-muted-foreground">No replacement times are available for this doctor.</p> : null}
-          {!slotsLoading && slots.length > 0 ? (
-            <fieldset className="mt-4 grid gap-2 sm:grid-cols-2">
-              <legend className="sr-only">Available replacement times</legend>
-              {slots.map((slot) => (
-                <label key={slot.id} className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 text-sm ${selectedSlotId === slot.id ? "border-primary bg-secondary/60" : "border-border hover:bg-muted/60"}`}>
-                  <input type="radio" name={`reschedule-${appointment.id}`} value={slot.id} checked={selectedSlotId === slot.id} onChange={() => onSelectSlot(slot.id)} className="size-4 accent-primary" />
-                  <span><span className="block font-medium text-foreground">{slotDate(slot)}</span><span className="text-muted-foreground">{appointmentTime(slot.start_time)}–{appointmentTime(slot.end_time)} IST</span></span>
-                </label>
-              ))}
-            </fieldset>
-          ) : null}
+          {!slotsLoading && !slotsError ? <AppointmentAvailabilityCalendar slots={slots} month={calendarMonth} selectedDate={selectedDate} onSelectDate={onSelectDate} onShiftMonth={onShiftMonth} /> : null}
+          {!slotsLoading && !slotsError && dateSlots.length > 0 ? <fieldset className="mt-4 grid gap-2 sm:grid-cols-2"><legend className="sr-only">Available replacement times</legend>{dateSlots.map((slot) => <label key={slot.id} className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 text-sm ${selectedSlotId === slot.id ? "border-primary bg-secondary/60" : "border-border hover:bg-muted/60"}`}><input type="radio" name={`reschedule-${appointment.id}`} value={slot.id} checked={selectedSlotId === slot.id} onChange={() => onSelectSlot(slot.id)} className="size-4 accent-primary" /><span><span className="block font-medium text-foreground">{slot.mode === "stream" ? "Stream · continuous window" : "Wave"}</span><span className="text-muted-foreground">{appointmentTime(slot.start_time)}–{appointmentTime(slot.end_time)} IST</span><span className="mt-1 block text-xs text-muted-foreground">{slot.remaining_capacity ?? 0} of {slot.capacity ?? 0} places remaining</span></span></label>)}</fieldset> : null}
           <Button type="button" size="compact" disabled={!selectedSlotId || Boolean(activeRequest)} onClick={onConfirmReschedule} className="mt-4">
             {activeRequest === `reschedule:${appointment.id}` ? "Rescheduling…" : <><CheckCircle2 aria-hidden="true" className="size-4" /> Confirm new time</>}
           </Button>

@@ -13,6 +13,7 @@ const localProfileSchema = z.object({
     specialty: z.string().optional(),
     bio: z.string().nullable().optional(),
     consultation_fee: z.number().optional(),
+    appointment_duration_minutes: z.number().int().optional(),
     date_of_birth: z.iso.date().nullable().optional(),
     gender: z.string().nullable().optional(),
   }),
@@ -25,6 +26,7 @@ const doctorSchema = z.object({
   specialty: z.string(),
   bio: z.string().nullable(),
   consultation_fee: z.number(),
+  appointment_duration_minutes: z.number().int().optional(),
 });
 
 const doctorPatientSchema = z.object({
@@ -40,6 +42,8 @@ const appointmentSchema = z.object({
   id: z.string().uuid(),
   status: z.enum(["confirmed", "cancelled", "completed"]),
   availability_id: z.string().uuid(),
+  mode: z.enum(["wave", "stream"]).nullable().optional(),
+  appointment_duration_minutes: z.number().int().positive().nullable().optional(),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   start_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
   end_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
@@ -63,6 +67,9 @@ const availabilitySlotSchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   start_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
   end_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
+  mode: z.enum(["wave", "stream"]).nullable().optional(),
+  capacity: z.number().int().nonnegative().nullable().optional(),
+  remaining_capacity: z.number().int().nonnegative().nullable().optional(),
   hold_status: z.literal("active").nullable().optional(),
   hold_expires_at: z.string().nullable().optional(),
 });
@@ -158,6 +165,10 @@ export type DirectoryDoctor = z.infer<typeof doctorSchema>;
 export type DoctorPatient = z.infer<typeof doctorPatientSchema>;
 export type PatientAppointment = z.infer<typeof appointmentSchema>;
 export type AvailabilitySlot = z.infer<typeof availabilitySlotSchema>;
+const scheduleDateSchema = z.union([z.iso.date(), z.iso.datetime()]).transform((value) => value.slice(0, 10));
+const schedulePeriodSchema = z.object({ weekday: z.number().int().min(0).max(6).nullable().optional(), service_date: scheduleDateSchema.nullable().optional(), start_time: z.string(), end_time: z.string() });
+const doctorScheduleSchema = z.object({ id: z.string().uuid(), mode: z.enum(["wave", "stream"]), recurrence_type: z.enum(["weekly", "specific_dates"]), visibility: z.enum(["public", "private"]), active: z.boolean(), starts_on: scheduleDateSchema.nullable(), ends_on: scheduleDateSchema.nullable(), wave_capacity_per_slot: z.number().int(), stream_capacity_per_window: z.number().int(), periods: z.array(schedulePeriodSchema) });
+export type DoctorSchedule = z.infer<typeof doctorScheduleSchema>;
 export type PaymentOrder = z.infer<typeof paymentOrderSchema>;
 export type PaymentStatus = z.infer<typeof paymentStatusSchema>;
 export type PatientPaymentHistoryItem = z.infer<typeof paymentHistoryItemSchema>;
@@ -267,13 +278,62 @@ export async function getDoctor(token: string, doctorId: string): Promise<Direct
   return parsed.data;
 }
 
-export async function getDoctorSlots(token: string, doctorId: string, from: string, to?: string): Promise<AvailabilitySlot[]> {
+export async function getDoctorSlots(token: string, doctorId: string, from: string, to?: string, excludeAppointmentId?: string): Promise<AvailabilitySlot[]> {
   const query = new URLSearchParams({ from });
   if (to) query.set("to", to);
+  if (excludeAppointmentId) query.set("exclude_appointment_id", excludeAppointmentId);
   const payload = await request<unknown>(token, `/doctors/${encodeURIComponent(doctorId)}/slots?${query.toString()}`);
   const parsed = z.array(availabilitySlotSchema).safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete availability list.");
   return parsed.data;
+}
+
+export async function getDoctorSchedules(token: string, doctorId: string): Promise<DoctorSchedule[]> {
+  const payload = await request<unknown>(token, `/doctors/${encodeURIComponent(doctorId)}/schedules`);
+  const parsed = z.array(doctorScheduleSchema).safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete schedule list.");
+  return parsed.data;
+}
+
+export async function createDoctorSchedule(token: string, doctorId: string, schedule: {
+  request_id?: string;
+  mode: "wave" | "stream"; recurrence_type: "weekly" | "specific_dates"; visibility: "public" | "private";
+  starts_on?: string; ends_on?: string; wave_capacity_per_slot: number; stream_capacity_per_window: number;
+  periods: { weekday?: number; service_date?: string; start_time: string; end_time: string }[];
+}): Promise<DoctorSchedule> {
+  const payload = await request<unknown>(token, `/doctors/${encodeURIComponent(doctorId)}/schedules`, { method: "POST", body: JSON.stringify(schedule) });
+  const parsed = doctorScheduleSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete schedule response.");
+  return parsed.data;
+}
+
+export async function createScheduleException(token: string, doctorId: string, scheduleId: string, exception: {
+  service_date: string; exception_type: "day_off" | "override" | "additional"; periods: { start_time: string; end_time: string }[];
+}): Promise<{ id: string; service_date: string; exception_type: "day_off" | "override" | "additional"; periods: { start_time: string; end_time: string }[]; generation?: { mode: "wave" | "stream"; generated_slots?: number; generated_windows?: number; skipped_conflicts?: number; skipped_conflict_details?: { date: string; start_time: string; end_time: string; reason: string }[] } }> {
+  const generationSchema = z.discriminatedUnion("mode", [
+    z.object({ schedule_id: z.string().uuid(), mode: z.literal("wave"), generated_slots: z.number().int().nonnegative(), skipped_conflicts: z.number().int().nonnegative().optional(), skipped_conflict_details: z.array(z.object({ date: z.string(), start_time: z.string(), end_time: z.string(), reason: z.string() })).optional() }),
+    z.object({ schedule_id: z.string().uuid(), mode: z.literal("stream"), generated_windows: z.number().int().nonnegative(), skipped_conflicts: z.number().int().nonnegative().optional(), skipped_conflict_details: z.array(z.object({ date: z.string(), start_time: z.string(), end_time: z.string(), reason: z.string() })).optional() }),
+  ]);
+  const schema = z.object({ id: z.string().uuid(), service_date: z.string(), exception_type: z.enum(["day_off", "override", "additional"]), periods: z.array(z.object({ start_time: z.string(), end_time: z.string() })), generation: generationSchema.optional() });
+  const payload = await request<unknown>(token, `/doctors/${encodeURIComponent(doctorId)}/schedules/${encodeURIComponent(scheduleId)}/exceptions`, { method: "POST", body: JSON.stringify(exception) });
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete schedule exception response.");
+  return parsed.data;
+}
+
+export async function generateDoctorAvailability(token: string, doctorId: string, scheduleId: string, from: string, to: string): Promise<{ schedule_id: string; mode: "wave" | "stream"; generated_slots?: number; generated_windows?: number; skipped_conflicts?: number; skipped_conflict_details?: { date: string; start_time: string; end_time: string; reason: string }[] }> {
+  const schema = z.discriminatedUnion("mode", [
+    z.object({ schedule_id: z.string().uuid(), mode: z.literal("wave"), generated_slots: z.number().int().nonnegative(), skipped_conflicts: z.number().int().nonnegative().optional(), skipped_conflict_details: z.array(z.object({ date: z.string(), start_time: z.string(), end_time: z.string(), reason: z.string() })).optional() }),
+    z.object({ schedule_id: z.string().uuid(), mode: z.literal("stream"), generated_windows: z.number().int().nonnegative(), skipped_conflicts: z.number().int().nonnegative().optional(), skipped_conflict_details: z.array(z.object({ date: z.string(), start_time: z.string(), end_time: z.string(), reason: z.string() })).optional() }),
+  ]);
+  const payload = await request<unknown>(token, `/doctors/${encodeURIComponent(doctorId)}/schedules/${encodeURIComponent(scheduleId)}/generate`, { method: "POST", body: JSON.stringify({ from, to }) });
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete availability generation response.");
+  return parsed.data;
+}
+
+export async function updateDoctorProfile(token: string, doctorId: string, update: { appointment_duration_minutes: number }): Promise<void> {
+  await request<unknown>(token, `/doctors/${encodeURIComponent(doctorId)}`, { method: "PUT", body: JSON.stringify(update) });
 }
 
 export async function createDoctorSlot(token: string, doctorId: string, slot: {
@@ -381,7 +441,7 @@ export async function rescheduleAppointment(token: string, appointmentId: string
   return parsed.data;
 }
 
-export async function doctorRescheduleAppointment(token: string, appointmentId: string, schedule: { date: string; start_time: string; end_time: string }): Promise<PatientAppointment> {
+export async function doctorRescheduleAppointment(token: string, appointmentId: string, schedule: { availability_id: string }): Promise<PatientAppointment> {
   const payload = await request<unknown>(token, `/appointments/${encodeURIComponent(appointmentId)}/reschedule`, {
     method: "PUT", body: JSON.stringify(schedule),
   });

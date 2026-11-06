@@ -18,7 +18,7 @@ function SelectValue(props: React.ComponentProps<typeof SelectPrimitive.Value>) 
 }
 
 function SelectTrigger({ className, size = "default", children, ...props }: React.ComponentProps<typeof SelectPrimitive.Trigger> & { size?: "sm" | "default" }) {
-  return <SelectPrimitive.Trigger data-slot="select-trigger" data-size={size} className={cn("flex min-h-11 w-full items-center justify-between gap-2 rounded-lg border border-input bg-background px-3.5 py-2.5 text-left text-sm text-foreground outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 data-[size=sm]:min-h-9", className)} {...props}>{children}<SelectPrimitive.Icon><ChevronDown aria-hidden="true" className="size-4 text-muted-foreground" /></SelectPrimitive.Icon></SelectPrimitive.Trigger>
+  return <SelectPrimitive.Trigger data-slot="select-trigger" data-size={size} className={cn("flex min-h-11 w-full items-center justify-between gap-2 rounded-lg border border-input bg-background px-3.5 py-2.5 text-left text-sm text-foreground outline-none transition-colors hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 data-[size=sm]:min-h-9", className)} {...props}>{children}<SelectPrimitive.Icon><ChevronDown aria-hidden="true" className="size-4 text-muted-foreground" /></SelectPrimitive.Icon></SelectPrimitive.Trigger>
 }
 
 function SelectContent({ className, children, position = "popper", ...props }: React.ComponentProps<typeof SelectPrimitive.Content>) {

@@ -31,7 +31,8 @@ function formatTime(value: Date) {
 
 function appointmentLabel(appointment: PatientAppointment) {
   const instant = appointmentStart(appointment);
-  return instant ? `${formatDate(instant)} · ${formatTime(instant)} IST` : "Time unavailable";
+  const mode = appointment.mode === "wave" ? `Wave · ${Math.round((new Date(`1970-01-01T${appointment.end_time}Z`).getTime() - new Date(`1970-01-01T${appointment.start_time}Z`).getTime()) / 60_000)} min` : appointment.mode === "stream" ? "Stream · continuous window" : "";
+  return `${instant ? `${formatDate(instant)} · ${formatTime(instant)} IST` : "Time unavailable"}${mode ? ` · ${mode}` : ""}`;
 }
 
 function appointmentStatusClass(status: PatientAppointment["status"]) {
@@ -107,7 +108,7 @@ export function DoctorDashboardPage() {
 
   const now = currentTime ?? 0;
   const today = currentTime === null ? null : applicationDate(new Date(currentTime));
-  const currentDateLabel = currentTime === null ? "Today · India Standard Time" : `${formatDate(new Date(currentTime))}`;
+  const currentDateLabel = currentTime === null ? "Today" : `${formatDate(new Date(currentTime))}`;
   const upcoming = useMemo(() => appointments.filter((appointment) => {
     const instant = appointmentStart(appointment);
     return appointment.status === "confirmed" && instant !== null && instant.getTime() > now;

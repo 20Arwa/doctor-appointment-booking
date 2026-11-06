@@ -33,7 +33,23 @@ async function getDoctorSlots(_request, response, next) {
     const ownership = await getOwnDoctorId(response);
     isOwnDoctorManagementView = !ownership.error && ownership.doctorId === id;
   }
-  const values = [id, now.date, now.time, response.locals.applicationTimezone, isOwnDoctorManagementView];
+  let excludedAppointmentId = null;
+  let excludedAllocationId = null;
+  if (response.locals.query.exclude_appointment_id) {
+    if (response.locals.user.role !== "doctor" || !isOwnDoctorManagementView) {
+      return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only the owning doctor can exclude an appointment while checking availability" } });
+    }
+    const excluded = await response.locals.database.query(
+      `SELECT a.id, a.allocation_id FROM appointments a
+       JOIN availability av ON av.id = a.availability_id
+       WHERE a.id = $1 AND av.doctor_id = $2 AND a.status = 'confirmed'`,
+      [response.locals.query.exclude_appointment_id, id],
+    );
+    if (!excluded.rows[0]) return response.status(404).json({ error: { code: "APPOINTMENT_NOT_FOUND", message: "Confirmed appointment not found" } });
+    excludedAppointmentId = excluded.rows[0].id;
+    excludedAllocationId = excluded.rows[0].allocation_id;
+  }
+  const values = [id, now.date, now.time, response.locals.applicationTimezone, isOwnDoctorManagementView, excludedAppointmentId, excludedAllocationId];
   const filters = ["doctor_id = $1", "deleted_at IS NULL", "(date > $2::date OR (date = $2::date AND start_time > $3::time))"];
   if (from) {
     values.push(from);
@@ -50,15 +66,32 @@ async function getDoctorSlots(_request, response, next) {
       `SELECT availability.id, availability.doctor_id, availability.date::text AS date,
               availability.start_time::text AS start_time, availability.end_time::text AS end_time,
               availability.mode, availability.capacity,
-              GREATEST(availability.capacity - COALESCE(occupancy.booked, 0) - COALESCE(occupancy.held, 0), 0)::int AS remaining_capacity,
+              GREATEST(availability.capacity - COALESCE(occupancy.occupied, 0), 0)::int AS remaining_capacity,
               availability.created_at, availability.updated_at,
               payment_hold.status AS hold_status, payment_hold.expires_at AS hold_expires_at
        FROM availability
        LEFT JOIN LATERAL (
-         SELECT COUNT(*) FILTER (WHERE allocation.status = 'confirmed' OR (allocation.status = 'held' AND allocation.expires_at > NOW()))::int AS booked,
-                (SELECT COUNT(*)::int FROM appointment_slot_holds hold
-                 WHERE hold.availability_id = availability.id AND hold.status = 'active' AND hold.expires_at > NOW()) AS held
-         FROM appointment_allocations allocation WHERE allocation.availability_id = availability.id
+         SELECT COUNT(DISTINCT reservation.patient_id)::int AS occupied
+         FROM (
+           SELECT allocation.patient_id FROM appointment_allocations allocation
+           WHERE allocation.availability_id = availability.id
+             AND (allocation.status = 'confirmed' OR (allocation.status = 'held' AND allocation.expires_at > NOW()))
+             AND allocation.id IS DISTINCT FROM $7::uuid
+           UNION
+           SELECT appointment.patient_id FROM appointments appointment
+           WHERE appointment.availability_id = availability.id AND appointment.status = 'confirmed'
+             AND appointment.id IS DISTINCT FROM $6::uuid
+             AND NOT EXISTS (
+               SELECT 1 FROM appointment_allocations allocation
+               WHERE allocation.id = appointment.allocation_id
+                 AND allocation.availability_id = availability.id
+                 AND (allocation.status = 'confirmed' OR (allocation.status = 'held' AND allocation.expires_at > NOW()))
+                 AND allocation.id IS DISTINCT FROM $7::uuid
+             )
+           UNION
+           SELECT hold.patient_id FROM appointment_slot_holds hold
+           WHERE hold.availability_id = availability.id AND hold.status = 'active' AND hold.expires_at > NOW()
+         ) reservation
        ) occupancy ON TRUE
        LEFT JOIN LATERAL (
          SELECT hold.id, hold.status, hold.expires_at
@@ -75,7 +108,7 @@ async function getDoctorSlots(_request, response, next) {
             WHERE appointment.availability_id = availability.id AND appointment.status = 'confirmed'
               AND ((appointment.scheduled_date + appointment.scheduled_end_time) AT TIME ZONE $4) > NOW()
           ))
-         AND (availability.mode IS NULL OR availability.capacity > COALESCE(occupancy.booked, 0) + COALESCE(occupancy.held, 0) OR $5::boolean)
+         AND (availability.mode IS NULL OR availability.capacity > COALESCE(occupancy.occupied, 0) OR $5::boolean)
           ${holdFilter}
        ORDER BY date, start_time`,
       values,
