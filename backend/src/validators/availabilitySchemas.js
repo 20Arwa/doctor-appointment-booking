@@ -5,7 +5,7 @@ const time = z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, "Time must use HH:m
 
 const doctorIdParamsSchema = z.object({ id: z.uuid() }).strict();
 const slotParamsSchema = z.object({ id: z.uuid(), slotId: z.uuid() }).strict();
-const slotQuerySchema = z.object({ from: date.optional(), to: date.optional() }).strict()
+const slotQuerySchema = z.object({ from: date.optional(), to: date.optional(), exclude_appointment_id: z.uuid().optional() }).strict()
   .refine((query) => !query.from || !query.to || query.from <= query.to, {
     path: ["to"],
     message: "to must be on or after from",

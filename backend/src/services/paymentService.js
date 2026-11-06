@@ -189,6 +189,27 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
         return { ...prior.rows[0], reused: true };
       }
 
+      const patientAlreadyHasOption = await client.query(
+        `SELECT 1
+         WHERE EXISTS (
+           SELECT 1 FROM appointments appointment
+           WHERE appointment.patient_id = $1 AND appointment.availability_id = $2
+             AND appointment.status = 'confirmed'
+         ) OR EXISTS (
+           SELECT 1 FROM appointment_allocations allocation
+           WHERE allocation.patient_id = $1 AND allocation.availability_id = $2
+             AND allocation.status IN ('held', 'confirmed')
+             AND (allocation.status <> 'held' OR allocation.expires_at > NOW())
+         ) OR EXISTS (
+           SELECT 1 FROM appointment_slot_holds hold
+           WHERE hold.patient_id = $1 AND hold.availability_id = $2
+             AND hold.status = 'active' AND hold.expires_at > NOW()
+         )`, [patientId, input.availability_id],
+      );
+      if (patientAlreadyHasOption.rows[0]) {
+        fail(409, "DUPLICATE_BOOKING", "You already have an active booking or pending checkout for this time slot.");
+      }
+
       const existing = await client.query(
         `SELECT p.id, p.status, p.provider_order_id, p.amount::text AS amount, p.currency,
                 h.expires_at, h.availability_id, h.id AS hold_id, av.doctor_id
@@ -200,18 +221,13 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
          ORDER BY p.created_at DESC LIMIT 1 FOR UPDATE OF p`,
         [patientId, input.availability_id],
       );
-      if (existing.rows[0]) return { ...existing.rows[0], reused: true };
+      if (existing.rows[0]) fail(409, "DUPLICATE_BOOKING", "You already have an active booking or pending checkout for this time slot.");
 
       const slotDateTime = new Date(`${slot.date}T${String(slot.start_time).slice(0, 8)}+05:30`);
       if (Number.isNaN(slotDateTime.getTime()) || slotDateTime <= new Date()) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer bookable");
       const amount = stripeMinorUnits(slot.fee);
-      const occupancy = await client.query(
-        `SELECT (SELECT COUNT(*) FROM appointment_allocations allocation WHERE allocation.availability_id = $1
-                   AND allocation.status IN ('held','confirmed') AND (allocation.status <> 'held' OR allocation.expires_at > NOW()))::int
-                + (SELECT COUNT(*) FROM appointment_slot_holds hold WHERE hold.availability_id = $1
-                   AND hold.status = 'active' AND hold.expires_at > NOW())::int AS occupied`, [input.availability_id],
-      );
-      if (Number(occupancy.rows[0]?.occupied || 0) >= Number(slot.capacity || 1)) fail(409, "SLOT_UNAVAILABLE", "The selected slot has reached its booking capacity");
+      const occupied = await appointmentService.countOccupiedPlaces(client, input.availability_id);
+      if (occupied >= Number(slot.capacity || 1)) fail(409, "SLOT_CAPACITY_REACHED", "The selected availability option has reached its booking capacity");
       if (!slot.mode && await scheduleConflict(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time, "00000000-0000-0000-0000-000000000000")) {
         fail(409, "SLOT_UNAVAILABLE", "The selected appointment time is already booked or reserved");
       }
@@ -386,7 +402,7 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
         consultationFee: current.amount,
         timeZone,
       }).catch(async (error) => {
-        if (!(error instanceof appointmentService.AppointmentError) || error.code !== "SLOT_UNAVAILABLE") throw error;
+        if (!(error instanceof appointmentService.AppointmentError) || !["SLOT_UNAVAILABLE", "SLOT_CAPACITY_REACHED"].includes(error.code)) throw error;
         await client.query("UPDATE appointment_slot_holds SET status = 'expired', updated_at = NOW() WHERE id = $1 AND status IN ('active', 'consumed')", [current.slot_hold_id]);
         const reconciliationId = await recordReconciliation(client, current, session, event?.id ?? null, "slot_unavailable");
         if (event) await client.query("UPDATE payment_provider_events SET processed_at = NOW() WHERE provider = 'stripe' AND provider_event_id = $1", [event.id]);

@@ -5,9 +5,20 @@ import Link from "next/link";
 import { CalendarClock, CheckCircle2, RefreshCw, CalendarPlus } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { completeDoctorAppointment, doctorRescheduleAppointment, ProfileApiError, type PatientAppointment } from "@/lib/profile-api";
+import { completeDoctorAppointment, doctorRescheduleAppointment, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type PatientAppointment } from "@/lib/profile-api";
 import { notifyError, notifySuccess } from "@/lib/notifications";
 import { useAppointmentHistory } from "@/components/use-appointment-history";
+import { AppointmentAvailabilityCalendar } from "@/components/appointment-availability-calendar";
+
+function todayInIndia() {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date()).map(({ type, value }) => [type, value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function monthRange(month: string) {
+  const [year, monthNumber] = month.split("-").map(Number);
+  return { from: `${month}-01`, to: new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10) };
+}
 
 function appointmentInstant(appointment: Pick<PatientAppointment, "date" | "end_time">) {
   const instant = new Date(`${appointment.date}T${appointment.end_time}+05:30`);
@@ -48,8 +59,11 @@ export function DoctorAppointmentsPage() {
   const [activeAppointment, setActiveAppointment] = useState<string | null>(null);
   const mutationLock = useRef(false);
   const [rescheduleId, setRescheduleId] = useState<string | null>(null);
-  const [newDate, setNewDate] = useState("");
-  const [newTime, setNewTime] = useState("");
+  const [rescheduleSlots, setRescheduleSlots] = useState<AvailabilitySlot[]>([]);
+  const [rescheduleSlotsLoading, setRescheduleSlotsLoading] = useState(false);
+  const [rescheduleMonth, setRescheduleMonth] = useState(() => todayInIndia().slice(0, 7));
+  const [rescheduleDate, setRescheduleDate] = useState(todayInIndia());
+  const [selectedSlotId, setSelectedSlotId] = useState("");
   const [rescheduleError, setRescheduleError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -72,6 +86,42 @@ export function DoctorAppointmentsPage() {
 
   function refreshAppointments() {
     retry();
+  }
+
+  function monthSlots(slots: AvailabilitySlot[], appointment: PatientAppointment) {
+    return slots.filter((slot) => slot.id !== appointment.availability_id
+      && (slot.mode === "wave" || slot.mode === "stream")
+      && (slot.remaining_capacity ?? 0) > 0);
+  }
+
+  async function loadRescheduleSlots(appointment: PatientAppointment, month: string) {
+    setRescheduleSlotsLoading(true);
+    setRescheduleError(null);
+    try {
+      const token = await getToken();
+      if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+      const range = monthRange(month);
+      const slots = await getDoctorSlots(token, appointment.doctor_id, range.from, range.to, appointment.id);
+      setRescheduleSlots(monthSlots(slots, appointment));
+    } catch (cause) {
+      setRescheduleError(cause instanceof Error ? cause.message : "We couldn't load replacement times.");
+    } finally { setRescheduleSlotsLoading(false); }
+  }
+
+  async function beginReschedule(appointment: PatientAppointment) {
+    setRescheduleId(appointment.id);
+    setSelectedSlotId("");
+    const month = todayInIndia().slice(0, 7);
+    setRescheduleMonth(month);
+    setRescheduleDate(todayInIndia());
+    await loadRescheduleSlots(appointment, month);
+  }
+
+  async function changeRescheduleMonth(appointment: PatientAppointment, month: string) {
+    setRescheduleMonth(month);
+    setRescheduleDate(`${month}-01`);
+    setSelectedSlotId("");
+    await loadRescheduleSlots(appointment, month);
   }
 
   async function markComplete(appointment: PatientAppointment) {
@@ -100,23 +150,17 @@ export function DoctorAppointmentsPage() {
   }
 
   async function reschedule(appointment: PatientAppointment) {
-    if (!newDate || !newTime || mutationLock.current) return;
+    if (!selectedSlotId || mutationLock.current) return;
     setRescheduleError(null);
     mutationLock.current = true;
     setActiveAppointment(appointment.id);
-    const [sh, sm] = appointment.start_time.split(":").map(Number);
-    const [eh, em] = appointment.end_time.split(":").map(Number);
-    const duration = eh * 60 + em - (sh * 60 + sm);
-    const start = newTime.split(":").map(Number);
-    const endMinutes = start[0] * 60 + start[1] + duration;
-    const endTime = `${String(Math.floor(endMinutes / 60) % 24).padStart(2, "0")}:${String(endMinutes % 60).padStart(2, "0")}`;
     try {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
-      const updated = await doctorRescheduleAppointment(token, appointment.id, { date: newDate, start_time: newTime, end_time: endTime });
+      const updated = await doctorRescheduleAppointment(token, appointment.id, { availability_id: selectedSlotId });
       setAppointments((current) => current.map((item) => item.id === appointment.id ? updated : item));
       setRescheduleId(null);
-      setNewDate(""); setNewTime("");
+      setRescheduleSlots([]); setSelectedSlotId("");
       setRescheduleError(null);
       notifySuccess("Appointment rescheduled.", `doctor-reschedule-${appointment.id}`);
     } catch (cause) {
@@ -146,16 +190,16 @@ export function DoctorAppointmentsPage() {
 
       {!loading && !error ? (
         <>
-          <AppointmentGroup title="Scheduled appointments" empty="You have no scheduled appointments." appointments={scheduled} now={now} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
-          <AppointmentGroup title="Past appointments" empty="Your past appointments will appear here." appointments={past} now={now} hasMore={history.past.hasMore} loadingMore={history.past.loading} moreError={history.past.error} onShowMore={() => void loadMore("past")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
-          <AppointmentGroup title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} now={now} hasMore={history.cancelled.hasMore} loadingMore={history.cancelled.loading} moreError={history.cancelled.error} onShowMore={() => void loadMore("cancelled")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} newDate={newDate} newTime={newTime} rescheduleError={rescheduleError} setRescheduleId={setRescheduleId} setNewDate={setNewDate} setNewTime={setNewTime} setRescheduleError={setRescheduleError} onReschedule={reschedule} />
+          <AppointmentGroup title="Scheduled appointments" empty="You have no scheduled appointments." appointments={scheduled} now={now} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} rescheduleSlots={rescheduleSlots} rescheduleSlotsLoading={rescheduleSlotsLoading} rescheduleMonth={rescheduleMonth} rescheduleDate={rescheduleDate} selectedSlotId={selectedSlotId} rescheduleError={rescheduleError} onBeginReschedule={beginReschedule} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={changeRescheduleMonth} onSelectSlot={setSelectedSlotId} onCloseReschedule={() => { setRescheduleId(null); setRescheduleError(null); }} onReschedule={reschedule} />
+          <AppointmentGroup title="Past appointments" empty="Your past appointments will appear here." appointments={past} now={now} hasMore={history.past.hasMore} loadingMore={history.past.loading} moreError={history.past.error} onShowMore={() => void loadMore("past")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} rescheduleSlots={rescheduleSlots} rescheduleSlotsLoading={rescheduleSlotsLoading} rescheduleMonth={rescheduleMonth} rescheduleDate={rescheduleDate} selectedSlotId={selectedSlotId} rescheduleError={rescheduleError} onBeginReschedule={beginReschedule} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={changeRescheduleMonth} onSelectSlot={setSelectedSlotId} onCloseReschedule={() => { setRescheduleId(null); setRescheduleError(null); }} onReschedule={reschedule} />
+          <AppointmentGroup title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} now={now} hasMore={history.cancelled.hasMore} loadingMore={history.cancelled.loading} moreError={history.cancelled.error} onShowMore={() => void loadMore("cancelled")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} rescheduleSlots={rescheduleSlots} rescheduleSlotsLoading={rescheduleSlotsLoading} rescheduleMonth={rescheduleMonth} rescheduleDate={rescheduleDate} selectedSlotId={selectedSlotId} rescheduleError={rescheduleError} onBeginReschedule={beginReschedule} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={changeRescheduleMonth} onSelectSlot={setSelectedSlotId} onCloseReschedule={() => { setRescheduleId(null); setRescheduleError(null); }} onReschedule={reschedule} />
         </>
       ) : null}
     </div>
   );
 }
 
-function AppointmentGroup({ title, empty, appointments, now, hasMore = false, loadingMore = false, moreError = null, onShowMore, onComplete, activeAppointment, rescheduleId, newDate, newTime, rescheduleError, setRescheduleId, setNewDate, setNewTime, setRescheduleError, onReschedule }: {
+function AppointmentGroup({ title, empty, appointments, now, hasMore = false, loadingMore = false, moreError = null, onShowMore, onComplete, activeAppointment, rescheduleId, rescheduleSlots, rescheduleSlotsLoading, rescheduleMonth, rescheduleDate, selectedSlotId, rescheduleError, onBeginReschedule, onSelectDate, onShiftMonth, onSelectSlot, onCloseReschedule, onReschedule }: {
   title: string;
   empty: string;
   appointments: PatientAppointment[];
@@ -166,10 +210,18 @@ function AppointmentGroup({ title, empty, appointments, now, hasMore = false, lo
   onShowMore?: () => void;
   onComplete: (appointment: PatientAppointment) => void;
   activeAppointment: string | null;
-  rescheduleId: string | null; newDate: string; newTime: string;
+  rescheduleId: string | null;
+  rescheduleSlots: AvailabilitySlot[];
+  rescheduleSlotsLoading: boolean;
+  rescheduleMonth: string;
+  rescheduleDate: string;
+  selectedSlotId: string;
   rescheduleError: string | null;
-  setRescheduleId: (id: string | null) => void; setNewDate: (value: string) => void; setNewTime: (value: string) => void;
-  setRescheduleError: (value: string | null) => void;
+  onBeginReschedule: (appointment: PatientAppointment) => void;
+  onSelectDate: (date: string) => void;
+  onShiftMonth: (appointment: PatientAppointment, month: string) => void;
+  onSelectSlot: (slotId: string) => void;
+  onCloseReschedule: () => void;
   onReschedule: (appointment: PatientAppointment) => void;
 }) {
   return (
@@ -178,6 +230,9 @@ function AppointmentGroup({ title, empty, appointments, now, hasMore = false, lo
       {appointments.length === 0 ? <p className="mt-4 rounded-xl bg-muted p-5 text-sm text-muted-foreground">{empty}</p> : (
         <ul className="mt-4 space-y-4">
           {appointments.map((appointment) => (
+            (() => {
+            const dateSlots = rescheduleSlots.filter((slot) => slot.date === rescheduleDate);
+            return (
             <li key={appointment.id} className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6">
               <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
                 <div>
@@ -190,8 +245,9 @@ function AppointmentGroup({ title, empty, appointments, now, hasMore = false, lo
                     <CalendarClock aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                     <span>{formatDate(appointment.date)} · {formatTime(appointment.start_time)}–{formatTime(appointment.end_time)} IST</span>
                   </div>
+                  {appointment.mode ? <p className="mt-2 text-sm text-muted-foreground">{appointment.mode === "wave" ? (appointment.appointment_duration_minutes ? `Wave · ${appointment.appointment_duration_minutes}-minute slot` : "Wave") : "Stream · Continuous window"}</p> : null}
                   {appointment.reason ? <p className="mt-3 text-sm leading-6 text-muted-foreground"><span className="font-medium text-foreground">Reason:</span> {appointment.reason}</p> : null}
-                  <p className="mt-2 text-xs text-muted-foreground">Appointment ID: {appointment.id}</p>
+                  {/* <p className="mt-2 text-xs text-muted-foreground">Appointment ID: {appointment.id}</p> */}
                 </div>
                 <span className={`inline-flex w-fit rounded-full px-3 py-1 text-xs font-semibold ${statusClasses(appointment.status)}`}>{appointment.status === "confirmed" && (appointmentInstant(appointment)?.getTime() ?? Infinity) <= now ? "Awaiting completion" : appointment.status}</span>
               </div>
@@ -203,11 +259,7 @@ function AppointmentGroup({ title, empty, appointments, now, hasMore = false, lo
                     size="sm"
                     variant="outline"
                     disabled={activeAppointment !== null}
-                    onClick={() =>
-                      setRescheduleId(
-                        rescheduleId === appointment.id ? null : appointment.id,
-                      )
-                    }
+                    onClick={() => { if (rescheduleId === appointment.id) onCloseReschedule(); else onBeginReschedule(appointment); }}
                   >
                     <CalendarPlus aria-hidden="true" className="size-4" />
                     Reschedule
@@ -228,45 +280,22 @@ function AppointmentGroup({ title, empty, appointments, now, hasMore = false, lo
                 </div>
 
                 {rescheduleId === appointment.id ? (
-                  <div className="mt-3 flex flex-wrap items-end gap-3">
-                    <label className="grid gap-1 text-sm text-muted-foreground">
-                      New date
-                      <input
-                        aria-label="New appointment date"
-                        type="date"
-                        value={newDate}
-                        onChange={(event) => { setNewDate(event.target.value); setRescheduleError(null); }}
-                        className="rounded-md border border-border bg-background px-3 py-2 text-foreground"
-                      />
-                    </label>
-
-                    <label className="grid gap-1 text-sm text-muted-foreground">
-                      New time
-                      <input
-                        aria-label="New appointment time"
-                        type="time"
-                        value={newTime}
-                        onChange={(event) => { setNewTime(event.target.value); setRescheduleError(null); }}
-                        className="rounded-md border border-border bg-background px-3 py-2 text-foreground"
-                      />
-                    </label>
-
-                    <Button
-                      type="button"
-                      size="sm"
-                      disabled={!newDate || !newTime || activeAppointment !== null}
-                      onClick={() => onReschedule(appointment)}
-                    >
-                      {activeAppointment === appointment.id
-                        ? "Updating…"
-                        : "Save new time"}
-                    </Button>
-                    {rescheduleError ? <p className="w-full text-sm text-destructive" role="alert">{rescheduleError}</p> : null}
+                  <div className="mt-3 rounded-xl border border-border bg-background p-4" aria-label="Choose a replacement appointment time">
+                    <div className="flex items-center justify-between gap-3"><h3 className="font-semibold text-foreground">Choose a new time</h3><button type="button" onClick={onCloseReschedule} className="rounded px-2 py-1 text-sm text-muted-foreground hover:bg-muted">Close</button></div>
+                    <p className="mt-1 text-xs text-muted-foreground">Choose an available date, then select a time · IST</p>
+                    {rescheduleSlotsLoading ? <p className="mt-4 text-sm text-muted-foreground" role="status">Loading available times…</p> : null}
+                    {!rescheduleSlotsLoading && rescheduleError ? <div className="mt-4 rounded-lg bg-destructive/5 p-3" role="alert"><p className="text-sm text-destructive">{rescheduleError}</p><button type="button" onClick={() => onBeginReschedule(appointment)} className="mt-3 inline-flex min-h-9 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted">Refresh available times</button></div> : null}
+                    {!rescheduleSlotsLoading && !rescheduleError && rescheduleSlots.length === 0 ? <p className="mt-4 text-sm text-muted-foreground">No replacement times are available for this doctor.</p> : null}
+                    {!rescheduleSlotsLoading && !rescheduleError ? <AppointmentAvailabilityCalendar slots={rescheduleSlots} month={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={onSelectDate} onShiftMonth={(month) => onShiftMonth(appointment, month)} /> : null}
+                    {!rescheduleSlotsLoading && !rescheduleError && dateSlots.length > 0 ? <fieldset className="mt-4 grid gap-2 sm:grid-cols-2"><legend className="sr-only">Available replacement times</legend>{dateSlots.map((slot) => <label key={slot.id} className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 text-sm ${selectedSlotId === slot.id ? "border-primary bg-secondary/60" : "border-border hover:bg-muted/60"}`}><input type="radio" name={`doctor-reschedule-${appointment.id}`} value={slot.id} checked={selectedSlotId === slot.id} onChange={() => onSelectSlot(slot.id)} className="size-4 accent-primary" /><span><span className="block font-medium text-foreground">{slot.mode === "stream" ? "Stream · Continuous window" : appointment.appointment_duration_minutes ? `Wave · ${appointment.appointment_duration_minutes}-minute slot` : "Wave"}</span><span className="text-muted-foreground">{formatTime(slot.start_time)}–{formatTime(slot.end_time)} IST</span><span className="mt-1 block text-xs text-muted-foreground">{slot.remaining_capacity ?? 0} of {slot.capacity ?? 0} places remaining</span></span></label>)}</fieldset> : null}
+                    <Button type="button" size="sm" disabled={!selectedSlotId || activeAppointment !== null || rescheduleSlotsLoading} onClick={() => onReschedule(appointment)} className="mt-4">{activeAppointment === appointment.id ? "Updating…" : "Save new time"}</Button>
                   </div>
                 ) : null}
               </div>
             ) : null}
             </li>
+            );
+            })()
           ))}
         </ul>
       )}

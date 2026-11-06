@@ -4,6 +4,7 @@ const time = z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/);
 const period = z.object({ weekday: z.number().int().min(0).max(6).optional(), service_date: z.iso.date().optional(), start_time: time, end_time: time })
   .strict().refine((value) => value.end_time > value.start_time, { path: ["end_time"], message: "End time must be after start time" });
 const createScheduleSchema = z.object({
+  request_id: z.uuid().optional(),
   mode: z.enum(["wave", "stream"]), recurrence_type: z.enum(["weekly", "specific_dates"]),
   visibility: z.enum(["public", "private"]).default("public"), starts_on: z.iso.date().optional(), ends_on: z.iso.date().optional(),
   wave_capacity_per_slot: z.number().int().min(0).max(500).default(0),
