@@ -10,6 +10,7 @@ const appointmentRoutes = require("./routes/appointmentRoutes");
 const { getClerkProfile } = require("./middleware/auth");
 const env = require("./config/env");
 const { createEmailNotificationService } = require("./services/emailNotificationService");
+const { createSmsNotificationService } = require("./services/smsNotificationService");
 const { createAppointmentReminderService } = require("./services/appointmentReminderService");
 const reminderRoutes = require("./routes/reminderRoutes");
 const paymentRoutes = require("./routes/paymentRoutes");
@@ -18,14 +19,14 @@ const { createPaymentService } = require("./services/paymentService");
 const { createNotificationDeliveryService } = require("./services/notificationDeliveryService");
 const notificationRecoveryRoutes = require("./routes/notificationRecoveryRoutes");
 
-function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), notificationDeliveryService, reminderService, reminderSecret = env.REMINDER_CRON_SECRET, notificationRecoverySecret = env.NOTIFICATION_RECOVERY_CRON_SECRET, stripeService, paymentService, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
+function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), smsNotificationService = createSmsNotificationService({ config: env }), notificationDeliveryService, reminderService, reminderSecret = env.REMINDER_CRON_SECRET, notificationRecoverySecret = env.NOTIFICATION_RECOVERY_CRON_SECRET, stripeService, paymentService, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("A PostgreSQL database pool is required");
   }
 
   const app = express();
   const stripe = stripeService || createStripeService({ config: paymentConfig });
-  const notificationDeliveries = notificationDeliveryService || createNotificationDeliveryService({ database, emailNotificationService });
+  const notificationDeliveries = notificationDeliveryService || createNotificationDeliveryService({ database, emailNotificationService, smsNotificationService });
   const payments = paymentService || createPaymentService({
     database,
     stripe,
@@ -50,7 +51,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
   });
   app.use("/api/v1", healthRoutes);
   app.use("/api/v1/internal/reminders", reminderRoutes({
-    service: reminderService || createAppointmentReminderService({ database, emailNotificationService, timeZone: applicationTimezone || "Asia/Kolkata" }),
+    service: reminderService || createAppointmentReminderService({ database, emailNotificationService, notificationDeliveryService: notificationDeliveries, timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata" }),
     secret: reminderSecret,
   }));
   app.use("/api/v1/internal/notification-deliveries", notificationRecoveryRoutes({ service: notificationDeliveries, secret: notificationRecoverySecret }));

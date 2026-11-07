@@ -114,6 +114,14 @@ function createDatabase({
           if (sql === "SELECT id FROM patients WHERE user_id = $1") {
             return { rows: values[0] === patientUserId ? [{ id: patientId }] : [] };
           }
+          if (sql.startsWith("SELECT id, doctor_id FROM availability")) {
+            const ids = new Set(values[0]);
+            return { rows: state.slots.filter((slot) => ids.has(slot.id)).map(({ id, doctor_id }) => ({ id, doctor_id })) };
+          }
+          if (sql.includes("SELECT a.availability_id FROM appointments a JOIN patients p")) {
+            const appointment = txAppointments.find((row) => row.id === values[0] && values[1] === patientUserId && row.patient_id === patientId);
+            return { rows: appointment ? [{ availability_id: appointment.availability_id }] : [] };
+          }
           if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
           if (sql.includes("FROM appointment_slot_holds h") && sql.includes("h.expires_at > NOW()")) return { rows: [] };
           if (sql.startsWith("SELECT id, deleted_at FROM availability")) {
@@ -136,6 +144,10 @@ function createDatabase({
             const [id, ownerId] = values;
             const appointment = txAppointments.find((row) => row.id === id && ownerId === patientUserId && row.patient_id === patientId);
             return { rows: appointment ? [{ ...appointment }] : [] };
+          }
+          if (sql.includes("FROM appointments a JOIN patients p") && sql.includes("FOR UPDATE OF a")) {
+            const appointment = txAppointments.find((row) => row.id === values[0] && values[1] === patientUserId && row.patient_id === patientId);
+            return { rows: appointment ? [{ id: appointment.id, status: appointment.status, availability_id: appointment.availability_id }] : [] };
           }
           if (sql.startsWith("SELECT id, status") && sql.includes("JOIN availability av")) {
             const [id, ownerDoctorId] = values;
@@ -189,6 +201,7 @@ function createDatabase({
             if (appointment) Object.assign(appointment, { status: "cancelled", cancelled_at: "2099-02-01T00:00:00.000Z", updated_at: "2099-02-01T00:00:00.000Z" });
             return { rows: [] };
           }
+          if (sql.startsWith("UPDATE appointment_allocations SET status = 'released'")) return { rows: [] };
           if (sql.startsWith("UPDATE appointments SET status = 'completed'")) {
             const appointment = txAppointments.find((row) => row.id === values[0]);
             if (appointment) Object.assign(appointment, { status: "completed", updated_at: "2099-02-01T00:00:00.000Z" });
@@ -275,7 +288,7 @@ describe("appointment schemas and migration", () => {
     const directory = path.join(__dirname, "..", "migrations");
     const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(files.length, 14);
+    assert.equal(files.length, 24);
     assert.match(files[3], /^004_.*\.sql$/);
     assert.equal(files[4], "005_appointment_schedule_snapshot.sql");
     assert.equal(files[5], "006_doctor_consultation_fee.sql");
@@ -286,7 +299,14 @@ describe("appointment schemas and migration", () => {
     assert.equal(files[10], "011_availability_soft_delete.sql");
     assert.equal(files[11], "012_appointment_consultation_fee_snapshot.sql");
     assert.equal(files[12], "013_notification_deliveries.sql");
-    assert.equal(files[13], "014_notification_delivery_recovery.sql");
+    assert.equal(files[13], "013_weekly_doctor_scheduling.sql");
+    assert.equal(files[14], "014_notification_delivery_recovery.sql");
+    assert.equal(files[18], "018_notification_delivery_channels.sql");
+    assert.equal(files[19], "019_user_sms_consent.sql");
+    assert.equal(files[20], "020_notification_sms_consent_reason.sql");
+    assert.equal(files[21], "021_notification_reminder_sms_events.sql");
+    assert.equal(files[22], "022_notification_phone_changed_reason.sql");
+    assert.equal(files[23], "023_notification_sms_provider_identifiers.sql");
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);
@@ -392,6 +412,17 @@ describe("appointment workflows", () => {
     assert.match(events[1].eventKey, /^appointment\.rescheduled:/);
     assert.equal(events[1].appointment.id, secondAppointmentId);
     assert.equal(events[2].appointment.id, appointmentId);
+  });
+
+  it("keeps cancellation successful when notification delivery fails", async () => {
+    const failingNotifications = { async sendAppointmentNotification() { throw new Error("SMS provider unavailable"); } };
+    const cancellation = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), notificationDeliveryService: failingNotifications });
+    await withServer(cancellation.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" });
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).status, "cancelled");
+    });
+
   });
 
   it("skips email and logs safely when tracking record creation fails", async () => {

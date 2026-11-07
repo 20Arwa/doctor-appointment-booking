@@ -20,6 +20,7 @@ const envSchema = z.object({
   BREVO_API_KEY: z.string().optional(),
   BREVO_SENDER_EMAIL: z.string().optional(),
   BREVO_SENDER_NAME: z.string().optional(),
+  SMS_PROVIDER: z.enum(["mock"]).default("mock"),
   REMINDER_CRON_SECRET: z.string().min(32).optional(),
   NOTIFICATION_RECOVERY_CRON_SECRET: z.string().min(32).optional(),
   STRIPE_SECRET_KEY: z.string().optional().refine((value) => !value || value.startsWith("sk_test_"), "STRIPE_SECRET_KEY must be a Stripe Test Mode key"),

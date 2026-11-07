@@ -6,6 +6,7 @@ const localProfileSchema = z.object({
   last_name: z.string(),
   email: z.string().email(),
   phone: z.string().nullable(),
+  sms_consent: z.boolean(),
   role: z.enum(["patient", "doctor"]),
   is_active: z.boolean(),
   profile: z.object({
@@ -476,6 +477,7 @@ export async function updateUserDetails(token: string, body: {
   first_name: string;
   last_name: string;
   phone: string | null;
+  sms_consent: boolean;
 }) {
   await request<unknown>(token, "/users/me", {
     method: "PATCH",

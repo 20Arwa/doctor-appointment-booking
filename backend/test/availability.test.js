@@ -240,7 +240,7 @@ describe("availability validation", () => {
   it("confirms the new migration follows Phase 1", () => {
     const migrationFiles = fs.readdirSync(path.join(__dirname, "..", "migrations")).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(migrationFiles.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(migrationFiles.length, 14);
+    assert.equal(migrationFiles.length, 24);
     assert.match(migrationFiles[3], /^004_.*\.sql$/);
     assert.equal(migrationFiles[4], "005_appointment_schedule_snapshot.sql");
     assert.equal(migrationFiles[5], "006_doctor_consultation_fee.sql");
@@ -251,7 +251,14 @@ describe("availability validation", () => {
     assert.equal(migrationFiles[10], "011_availability_soft_delete.sql");
     assert.equal(migrationFiles[11], "012_appointment_consultation_fee_snapshot.sql");
     assert.equal(migrationFiles[12], "013_notification_deliveries.sql");
-    assert.equal(migrationFiles[13], "014_notification_delivery_recovery.sql");
+    assert.equal(migrationFiles[13], "013_weekly_doctor_scheduling.sql");
+    assert.equal(migrationFiles[14], "014_notification_delivery_recovery.sql");
+    assert.equal(migrationFiles[18], "018_notification_delivery_channels.sql");
+    assert.equal(migrationFiles[19], "019_user_sms_consent.sql");
+    assert.equal(migrationFiles[20], "020_notification_sms_consent_reason.sql");
+    assert.equal(migrationFiles[21], "021_notification_reminder_sms_events.sql");
+    assert.equal(migrationFiles[22], "022_notification_phone_changed_reason.sql");
+    assert.equal(migrationFiles[23], "023_notification_sms_provider_identifiers.sql");
     const sql = fs.readFileSync(path.join(__dirname, "..", "migrations", "002_doctor_availability.sql"), "utf8");
     assert.match(sql, /CREATE TABLE availability/i);
     assert.match(sql, /doctor_id UUID NOT NULL REFERENCES doctors\(id\) ON DELETE RESTRICT/i);
