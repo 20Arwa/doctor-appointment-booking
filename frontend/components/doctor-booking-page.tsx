@@ -17,7 +17,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { notifySuccess } from "@/lib/notifications";
+import { notifyInAppNotificationsChanged, notifySuccess } from "@/lib/notifications";
 import { AppShellLoading } from "@/components/app-shell-loading";
 import { CheckoutReturnNotice, type CheckoutReturnState } from "@/components/checkout-return-notice";
 import { cancelAppointmentPaymentOrder, createAppointmentPaymentOrder, getAppointmentPaymentStatus, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
@@ -144,6 +144,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   useEffect(() => {
     if (!confirmation || announcedConfirmation.current === confirmation.id) return;
     announcedConfirmation.current = confirmation.id;
+    notifyInAppNotificationsChanged();
     notifySuccess("Appointment booked successfully!", `appointment-booked-${confirmation.id}`);
   }, [confirmation]);
 

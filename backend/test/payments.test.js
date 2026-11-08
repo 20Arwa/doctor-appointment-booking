@@ -614,7 +614,8 @@ describe("Stripe Checkout webhook and reconciliation", () => {
         return { ok: true, status: 201, async json() { return { messageId: "mock-booking-id" }; } };
       },
     });
-    const app = createApp({ database, frontendOrigin: "http://localhost:3000", applicationTimezone: "Asia/Kolkata", stripeService, emailNotificationService });
+    let inAppAttempts = 0;
+    const app = createApp({ database, frontendOrigin: "http://localhost:3000", applicationTimezone: "Asia/Kolkata", stripeService, emailNotificationService, inAppNotificationService: { async sendAppointmentNotification() { inAppAttempts += 1; throw new Error("storage unavailable"); } } });
     await withServer(app, async (url) => {
       const postWebhook = (event) => fetch(`${url}/api/v1/payments/webhook`, {
         method: "POST",
@@ -632,6 +633,7 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.payment.provider_payment_id, intentId);
     assert.equal(database.state.sentEmails.length, 2);
+    assert.equal(inAppAttempts, 1);
     assert.deepEqual(database.state.sentEmails.map((mail) => mail.to[0].email), ["patient@example.test", "doctor@example.test"]);
     for (const mail of database.state.sentEmails) {
       assert.match(mail.htmlContent, /#67465F/);

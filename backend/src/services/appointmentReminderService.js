@@ -2,7 +2,7 @@ const CANDIDATE_SQL = `
   SELECT a.id, a.scheduled_date::text AS date,
          a.scheduled_start_time::text AS start_time,
          d.id AS doctor_id, du.first_name AS doctor_first_name, du.last_name AS doctor_last_name,
-         p.id AS patient_id, pu.email AS patient_email
+         p.id AS patient_id, p.user_id AS patient_user_id, pu.email AS patient_email
   FROM appointments a
   JOIN availability av ON av.id = a.availability_id
   JOIN doctors d ON d.id = av.doctor_id
@@ -35,7 +35,7 @@ async function claimReminder(database, appointment, reminderType, lead, timeZone
   return result.rows[0]?.id ?? null;
 }
 
-function createAppointmentReminderService({ database, emailNotificationService, timeZone, logger = console }) {
+function createAppointmentReminderService({ database, emailNotificationService, inAppNotificationService, timeZone, logger = console }) {
   return {
     async run() {
       // The database clock drives eligibility and leases to keep all scheduler instances consistent.
@@ -45,6 +45,12 @@ function createAppointmentReminderService({ database, emailNotificationService, 
         const candidates = await database.query(CANDIDATE_SQL, [timeZone, lead, window]);
         for (const appointment of candidates.rows) {
           counts.considered += 1;
+          // In-App reminders use their own idempotency record and never depend on the Email claim.
+          try {
+            await inAppNotificationService?.sendReminder(type, appointment);
+          } catch (_error) {
+            logger.error("In-App appointment reminder failed", { reminderType: type, reason: "unexpected_error" });
+          }
           const claimId = await claimReminder(database, appointment, type, lead, timeZone, window);
           if (!claimId) { counts.skipped += 1; continue; }
           let outcome;
