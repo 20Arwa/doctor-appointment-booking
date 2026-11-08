@@ -5,6 +5,8 @@ const { describe, it } = require("node:test");
 const { createApp } = require("../src/app");
 const { createEmailNotificationService } = require("../src/services/emailNotificationService");
 const { createNotificationDeliveryService } = require("../src/services/notificationDeliveryService");
+const appointmentService = require("../src/services/appointmentService");
+const { cancelAppointment } = require("../src/controllers/appointmentController");
 const {
   appointmentQuerySchema,
   createAppointmentSchema,
@@ -300,6 +302,32 @@ describe("appointment schemas and migration", () => {
 });
 
 describe("appointment workflows", () => {
+  it("keeps cancellation and Email successful when awaited In-App persistence fails", async () => {
+    const events = [];
+    const originalCancel = appointmentService.cancelAppointment;
+    appointmentService.cancelAppointment = async () => { events.push("appointment"); return makeAppointment({ status: "cancelled" }); };
+    const response = {
+      locals: {
+        user: patientUser,
+        params: { id: appointmentId },
+        database: {},
+        paymentService: { async refundCancelledAppointment() { return { status: "not_applicable" }; } },
+        notificationDeliveryService: { async sendAppointmentNotification() { events.push("email"); } },
+        inAppNotificationService: { async sendAppointmentNotification() { events.push("in-app"); throw new Error("storage unavailable"); } },
+      },
+      status(statusCode) { this.statusCode = statusCode; return this; },
+      json(body) { this.body = body; return this; },
+    };
+    try {
+      await cancelAppointment({}, response, (error) => { throw error; });
+    } finally {
+      appointmentService.cancelAppointment = originalCancel;
+    }
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.status, "cancelled");
+    assert.deepEqual(events, ["appointment", "email", "in-app"]);
+  });
+
   it("paginates past and cancelled appointment history on the server", async () => {
     const slots = Array.from({ length: 7 }, (_, index) => makeSlot(`55555555-5555-4555-8555-${String(index + 1).padStart(12, "0")}`, "10:00", "2000-04-10"));
     const appointments = slots.map((slot, index) => ({

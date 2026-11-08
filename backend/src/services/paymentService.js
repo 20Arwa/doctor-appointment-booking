@@ -140,7 +140,7 @@ function stripeReceiptUrl(value) {
   }
 }
 
-function createPaymentService({ database, stripe, emailNotificationService, notificationDeliveryService, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now }) {
+function createPaymentService({ database, stripe, emailNotificationService, notificationDeliveryService, inAppNotificationService, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now }) {
   const notificationDeliveries = notificationDeliveryService || (emailNotificationService
     ? createNotificationDeliveryService({ database, emailNotificationService, logger })
     : null);
@@ -419,17 +419,20 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
   }
 
   async function notifyNewAppointment(result) {
-    if (!result?.created || !result.appointment || !notificationDeliveries) return result;
-    try {
-      await notificationDeliveries.sendAppointmentNotification({
-        eventKey: appointmentEventKey("appointment.booked", result.appointment),
-        eventType: "appointment.booked",
-        appointment: result.appointment,
-        actorRole: "system",
-      });
-    } catch (_error) {
-      logger.error("Paid appointment confirmation email failed", { reason: "unexpected_error" });
-    }
+    if (!result?.created || !result.appointment || (!notificationDeliveries && !inAppNotificationService)) return result;
+    const eventKey = appointmentEventKey("appointment.booked", result.appointment);
+    await Promise.all([
+      (async () => {
+        try {
+          await notificationDeliveries?.sendAppointmentNotification({ eventKey, eventType: "appointment.booked", appointment: result.appointment, actorRole: "system" });
+        } catch (_error) { logger.error("Paid appointment confirmation email failed", { reason: "unexpected_error" }); }
+      })(),
+      (async () => {
+        try {
+          await inAppNotificationService?.sendAppointmentNotification({ eventKey, eventType: "appointment.booked", appointment: result.appointment, actorRole: "system" });
+        } catch (_error) { logger.error("Paid appointment In-App notification failed", { reason: "unexpected_error" }); }
+      })(),
+    ]);
     return result;
   }
 
