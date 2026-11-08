@@ -17,18 +17,21 @@ const recipientUserId = "33333333-3333-4333-8333-333333333333";
 function createDatabase({ failInsert = false } = {}) {
   const records = new Map();
   let nextId = 1;
+  let insertSql;
   return {
     records,
     async query(sql, values = []) {
       if (sql.startsWith("INSERT INTO notification_deliveries")) {
+        insertSql = sql;
         if (failInsert) throw new Error("database credentials or private details");
         const [eventKey, eventType, appointmentId] = values;
         if (records.has(eventKey)) return { rows: [] };
-        const record = { id: nextId++, event_key: eventKey, event_type: eventType, appointment_id: appointmentId, recipient_user_id: recipientUserId, status: "processing", attempt_count: 0 };
+        const record = { id: nextId++, event_key: eventKey, channel: "email", event_type: eventType, appointment_id: appointmentId, recipient_user_id: recipientUserId, status: "processing", attempt_count: 0 };
         records.set(eventKey, record);
         return { rows: [{ id: record.id }] };
       }
       if (sql.startsWith("SELECT id FROM notification_deliveries")) {
+        assert.match(sql, /event_key = \$1 AND channel = 'email'/i);
         const record = records.get(values[0]);
         return { rows: record ? [{ id: record.id }] : [] };
       }
@@ -40,6 +43,7 @@ function createDatabase({ failInsert = false } = {}) {
       }
       throw new Error(`Unexpected query: ${sql}`);
     },
+    get insertSql() { return insertSql; },
   };
 }
 
@@ -271,6 +275,9 @@ describe("notification delivery persistence", () => {
     assert.equal(record.provider_http_status, 201);
     assert.equal(record.completed, true);
     assert.equal(record.recipient_user_id, recipientUserId);
+    assert.equal(record.channel, "email");
+    assert.match(harness.database.insertSql, /ON CONFLICT \(event_key, channel\) DO NOTHING/i);
+    assert.match(harness.database.insertSql, /SELECT \$1, 'email', \$2/i);
   });
 
   it("records failed and skipped outcomes with sanitized reasons and status", async () => {

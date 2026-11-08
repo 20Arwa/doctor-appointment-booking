@@ -34,15 +34,15 @@ function createNotificationDeliveryService({ database, emailNotificationService,
       : appointmentPayload(eventType, appointment, recipient.type);
     const idempotencyKey = randomUUID();
     const inserted = await database.query(
-      `INSERT INTO notification_deliveries (event_key, event_type, appointment_id, recipient_user_id, payload, idempotency_key, last_attempt_at, lease_token, lease_expires_at)
-       SELECT $1, $2, $3, recipient.user_id, $5::jsonb, $6, NOW(), $7, NOW() + ($8 * INTERVAL '1 millisecond')
+      `INSERT INTO notification_deliveries (event_key, channel, event_type, appointment_id, recipient_user_id, payload, idempotency_key, last_attempt_at, lease_token, lease_expires_at)
+       SELECT $1, 'email', $2, $3, recipient.user_id, $5::jsonb, $6, NOW(), $7, NOW() + ($8 * INTERVAL '1 millisecond')
        FROM (SELECT $4::uuid AS user_id) recipient WHERE $4::uuid IS NOT NULL
-       ON CONFLICT (event_key) DO NOTHING RETURNING id, idempotency_key, payload, lease_token`,
+       ON CONFLICT (event_key, channel) DO NOTHING RETURNING id, idempotency_key, payload, lease_token`,
       [eventKey, eventType, appointment.id, recipient.userId, JSON.stringify(payload), idempotencyKey, randomUUID(), PROCESSING_LEASE_MS],
     );
     if (inserted.rows[0]) return { ...inserted.rows[0], created: true };
     let existing;
-    try { existing = await database.query("SELECT id FROM notification_deliveries WHERE event_key = $1", [eventKey]); }
+    try { existing = await database.query("SELECT id FROM notification_deliveries WHERE event_key = $1 AND channel = 'email'", [eventKey]); }
     catch (_error) { return { created: false, duplicate: true, lookupFailed: true }; }
     if (existing.rows[0]) return { id: existing.rows[0].id, created: false };
     return null;
