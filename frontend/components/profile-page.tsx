@@ -42,27 +42,6 @@ function FieldLabel({ label, icon: Icon, htmlFor }: { label: string; icon: Lucid
     : <p className="inline-flex items-center gap-2 text-sm font-medium text-foreground">{content}</p>;
 }
 
-function SmsConsentControl({ checked, onChange }: { checked: boolean; onChange: (checked: boolean) => void }) {
-  return (
-    <div className="mt-6 border-t border-border pt-5">
-      <label htmlFor="profile-sms-consent" className="flex cursor-pointer items-start gap-3">
-        <input
-          id="profile-sms-consent"
-          name="sms_consent"
-          type="checkbox"
-          checked={checked}
-          onChange={(event) => onChange(event.target.checked)}
-          className="mt-1 size-4 shrink-0 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
-        />
-        <span>
-          <span className="block text-sm font-medium text-foreground">SMS appointment notifications</span>
-          <span className="mt-1 block text-sm leading-6 text-muted-foreground">I agree to receive transactional text messages about my appointments. This optional preference can be changed at any time.</span>
-        </span>
-      </label>
-    </div>
-  );
-}
-
 function valuesFromProfile(profile: LocalProfile): ProfileValues {
   return {
     first_name: profile.first_name,
@@ -238,7 +217,6 @@ export function ProfilePage() {
                 {errors.gender ? <p id="profile-gender-error" className="mt-1.5 text-sm text-destructive" role="alert">{errors.gender}</p> : null}
               </div>
             </div>
-            <SmsConsentControl checked={values.sms_consent} onChange={(checked) => setValues((current) => ({ ...current, sms_consent: checked }))} />
           </section>
         ) : (
           <section className="rounded-3xl border border-border bg-card p-6 shadow-sm sm:p-8" aria-labelledby="doctor-details-title">
@@ -264,7 +242,6 @@ export function ProfilePage() {
               </div>
               {textArea("bio", "About you", "Share a short professional introduction. This may appear in the doctor directory.")}
             </div>
-            <SmsConsentControl checked={values.sms_consent} onChange={(checked) => setValues((current) => ({ ...current, sms_consent: checked }))} />
           </section>
         )}
 
