@@ -2,16 +2,18 @@ const appointmentService = require("../services/appointmentService");
 const { appointmentEventKey } = require("../services/notificationDeliveryService");
 
 async function notify(response, eventType, appointment) {
-  try {
-    await response.locals.notificationDeliveryService.sendAppointmentNotification({
-      eventKey: appointmentEventKey(eventType, appointment),
-      eventType,
-      appointment,
-      actorRole: response.locals.user.role,
-    });
-  } catch (_error) {
-    console.error("Appointment email notification failed", { eventType, reason: "unexpected_error" });
-  }
+  const eventKey = appointmentEventKey(eventType, appointment);
+  const actorRole = response.locals.user.role;
+  await Promise.all([
+    (async () => {
+      try { await response.locals.notificationDeliveryService.sendAppointmentNotification({ eventKey, eventType, appointment, actorRole }); }
+      catch (_error) { console.error("Appointment email notification failed", { eventType, reason: "unexpected_error" }); }
+    })(),
+    (async () => {
+      try { await response.locals.inAppNotificationService.sendAppointmentNotification({ eventKey, eventType, appointment, actorRole }); }
+      catch (_error) { console.error("In-App appointment notification failed", { eventType, reason: "unexpected_error" }); }
+    })(),
+  ]);
 }
 
 function handle(operation) {
