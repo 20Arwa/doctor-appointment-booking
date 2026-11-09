@@ -12,6 +12,7 @@ const sampleUser = {
   last_name: "Patient",
   email: "sam@example.com",
   phone: null,
+  sms_consent: false,
   role: "patient",
   is_active: true,
 };
@@ -56,6 +57,10 @@ describe("profile request validation", () => {
 
   it("blocks role and identity fields on user updates", () => {
     assert.equal(userPatchSchema.safeParse({ first_name: "Sam" }).success, true);
+    assert.equal(userPatchSchema.safeParse({ sms_consent: true }).success, true);
+    assert.equal(userPatchSchema.safeParse({ sms_consent: false }).success, true);
+    assert.equal(userPatchSchema.safeParse({ sms_consent: "true" }).success, false);
+    assert.equal(userPatchSchema.safeParse({ sms_consent: null }).success, false);
     assert.equal(userPatchSchema.safeParse({ role: "doctor" }).success, false);
     assert.equal(userPatchSchema.safeParse({ clerk_user_id: "another-user" }).success, false);
   });
@@ -106,6 +111,14 @@ describe("Phase 1 database migration", () => {
   });
 });
 
+describe("SMS consent migration", () => {
+  it("adds explicit opt-in defaulting to false for existing and new users", () => {
+    const migration = fs.readFileSync(path.join(__dirname, "..", "migrations", "019_user_sms_consent.sql"), "utf8");
+    assert.match(migration, /ALTER TABLE users\s+ADD COLUMN sms_consent BOOLEAN NOT NULL DEFAULT FALSE/i);
+    assert.doesNotMatch(migration, /UPDATE users|DROP\s+TABLE|TRUNCATE/i);
+  });
+});
+
 describe("profile authorization", () => {
   it("reads Clerk's function-valued request auth before serving the current profile", async () => {
     const patientProfile = { id: "22222222-2222-4222-8222-222222222222", date_of_birth: "1990-02-03", gender: null };
@@ -122,9 +135,107 @@ describe("profile authorization", () => {
 
       assert.equal(response.status, 200);
       assert.equal(body.id, sampleUser.id);
+      assert.equal(body.sms_consent, false);
       assert.equal(body.profile.id, patientProfile.id);
       assert.equal(body.profile.date_of_birth, "1990-02-03");
       assert.match(profileQuery, /date_of_birth::text AS date_of_birth/i);
+    });
+  });
+
+  it("resets consent when the phone number changes, including a same-request opt-in", async () => {
+    const user = { ...sampleUser, phone: "+15550000001", sms_consent: true };
+    let updateSql = "";
+    let updateValues = [];
+    const databaseQuery = async (sql, values = []) => {
+      if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [user] };
+      if (sql.startsWith("UPDATE users SET")) {
+        updateSql = sql;
+        updateValues = values;
+        const assignments = sql.split(" SET ")[1].split(", updated_at")[0].split(", ");
+        assignments.forEach((assignment, index) => { user[assignment.split(" = ")[0]] = values[index]; });
+        return { rows: [{ ...user }] };
+      }
+      if (sql.includes("FROM patients WHERE user_id")) return { rows: [{ id: "22222222-2222-4222-8222-222222222222" }] };
+      return { rows: [] };
+    };
+    const app = testApp({ databaseQuery });
+
+    await withServer(app, async (url) => {
+      const update = (body) => fetch(`${url}/api/v1/users/me`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      });
+
+      const response = await update({ phone: "+15551234567", sms_consent: true, first_name: "Samuel" });
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).sms_consent, false);
+      assert.match(updateSql, /phone = \$1, sms_consent = \$2, first_name = \$3/);
+      assert.deepEqual(updateValues, ["+15551234567", false, "Samuel", sampleUser.id]);
+    });
+  });
+
+  it("resets consent when the phone number is removed", async () => {
+    const user = { ...sampleUser, phone: "+15551234567", sms_consent: true };
+    const databaseQuery = async (sql, values = []) => {
+      if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [user] };
+      if (sql.startsWith("UPDATE users SET")) {
+        const assignments = sql.split(" SET ")[1].split(", updated_at")[0].split(", ");
+        assignments.forEach((assignment, index) => { user[assignment.split(" = ")[0]] = values[index]; });
+        return { rows: [{ ...user }] };
+      }
+      return { rows: [] };
+    };
+    await withServer(testApp({ databaseQuery }), async (url) => {
+      const response = await fetch(`${url}/api/v1/users/me`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ phone: null }),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.phone, null);
+      assert.equal(body.sms_consent, false);
+    });
+  });
+
+  it("preserves consent when the phone number remains unchanged", async () => {
+    const user = { ...sampleUser, phone: "+15551234567", sms_consent: true };
+    const databaseQuery = async (sql, values = []) => {
+      if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [user] };
+      if (sql.startsWith("UPDATE users SET")) {
+        const assignments = sql.split(" SET ")[1].split(", updated_at")[0].split(", ");
+        assignments.forEach((assignment, index) => { user[assignment.split(" = ")[0]] = values[index]; });
+        return { rows: [{ ...user }] };
+      }
+      return { rows: [] };
+    };
+    await withServer(testApp({ databaseQuery }), async (url) => {
+      const response = await fetch(`${url}/api/v1/users/me`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ phone: "+15551234567", first_name: "Samuel" }),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.sms_consent, true);
+      assert.equal(body.first_name, "Samuel");
+    });
+  });
+
+  it("preserves consent when another profile field is updated without a phone number", async () => {
+    const user = { ...sampleUser, phone: "+15551234567", sms_consent: true };
+    const databaseQuery = async (sql, values = []) => {
+      if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [user] };
+      if (sql.startsWith("UPDATE users SET")) {
+        const assignments = sql.split(" SET ")[1].split(", updated_at")[0].split(", ");
+        assignments.forEach((assignment, index) => { user[assignment.split(" = ")[0]] = values[index]; });
+        return { rows: [{ ...user }] };
+      }
+      return { rows: [] };
+    };
+    await withServer(testApp({ databaseQuery }), async (url) => {
+      const response = await fetch(`${url}/api/v1/users/me`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ first_name: "Samuel" }),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.first_name, "Samuel");
+      assert.equal(body.sms_consent, true);
     });
   });
 
@@ -193,7 +304,7 @@ describe("profile authorization", () => {
       query: async (sql, values = []) => {
         statements.push(sql);
         if (sql.startsWith("INSERT INTO users")) {
-          return { rows: [{ ...sampleUser, role: values[5] }] };
+          return { rows: [{ ...sampleUser, role: values[5], sms_consent: false }] };
         }
         if (sql.startsWith("INSERT INTO doctors")) return { rows: [{ id: "33333333-3333-4333-8333-333333333333", specialty: values[1], consultation_fee: 500 }] };
         if (sql.startsWith("INSERT INTO patients")) return { rows: [{ id: "44444444-4444-4444-8444-444444444444" }] };
@@ -214,6 +325,7 @@ describe("profile authorization", () => {
       assert.equal(response.status, 201);
       const body = await response.json();
       assert.equal(body.role, "doctor");
+      assert.equal(body.sms_consent, false);
       assert.equal(body.profile.specialty, "Cardiology");
       assert.equal(body.profile.consultation_fee, 500);
       assert.equal(statements[0], "BEGIN");
