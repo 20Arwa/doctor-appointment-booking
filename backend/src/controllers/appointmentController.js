@@ -7,6 +7,7 @@ async function notify(response, eventType, appointment) {
       eventKey: appointmentEventKey(eventType, appointment),
       eventType,
       appointment,
+      actorRole: response.locals.user.role,
     });
   } catch (_error) {
     console.error("Appointment email notification failed", { eventType, reason: "unexpected_error" });

@@ -7,6 +7,7 @@ const { appointmentEventKey, createNotificationDeliveryService } = require("../s
 const appointment = {
   id: "11111111-1111-4111-8111-111111111111",
   patient_id: "22222222-2222-4222-8222-222222222222",
+  patient_user_id: "33333333-3333-4333-8333-333333333333", patient_email: "patient@example.test",
   updated_at: "2099-01-01T00:00:00.000Z",
   date: "2099-04-10", start_time: "10:00:00",
   previous_date: "2099-04-09", previous_start_time: "09:00:00",
@@ -16,18 +17,21 @@ const recipientUserId = "33333333-3333-4333-8333-333333333333";
 function createDatabase({ failInsert = false } = {}) {
   const records = new Map();
   let nextId = 1;
+  let insertSql;
   return {
     records,
     async query(sql, values = []) {
       if (sql.startsWith("INSERT INTO notification_deliveries")) {
+        insertSql = sql;
         if (failInsert) throw new Error("database credentials or private details");
         const [eventKey, eventType, appointmentId] = values;
         if (records.has(eventKey)) return { rows: [] };
-        const record = { id: nextId++, event_key: eventKey, event_type: eventType, appointment_id: appointmentId, recipient_user_id: recipientUserId, status: "processing", attempt_count: 0 };
+        const record = { id: nextId++, event_key: eventKey, channel: "email", event_type: eventType, appointment_id: appointmentId, recipient_user_id: recipientUserId, status: "processing", attempt_count: 0 };
         records.set(eventKey, record);
         return { rows: [{ id: record.id }] };
       }
       if (sql.startsWith("SELECT id FROM notification_deliveries")) {
+        assert.match(sql, /event_key = \$1 AND channel = 'email'/i);
         const record = records.get(values[0]);
         return { rows: record ? [{ id: record.id }] : [] };
       }
@@ -39,6 +43,7 @@ function createDatabase({ failInsert = false } = {}) {
       }
       throw new Error(`Unexpected query: ${sql}`);
     },
+    get insertSql() { return insertSql; },
   };
 }
 
@@ -262,7 +267,7 @@ describe("notification delivery persistence", () => {
   it("records accepted deliveries, message IDs, and actual transport attempt counts", async () => {
     const harness = createHarness({ outcome: { sent: true, attempts: 2, providerMessageId: "brevo-accepted-id", status: 201 } });
     const result = await harness.service.sendAppointmentNotification({ eventKey: "booked:key", eventType: "appointment.booked", appointment });
-    const record = harness.database.records.get("booked:key");
+    const record = harness.database.records.get(`booked:key:patient:${appointment.patient_user_id}`);
     assert.equal(result.sent, true);
     assert.equal(record.status, "accepted");
     assert.equal(record.attempt_count, 2);
@@ -270,12 +275,15 @@ describe("notification delivery persistence", () => {
     assert.equal(record.provider_http_status, 201);
     assert.equal(record.completed, true);
     assert.equal(record.recipient_user_id, recipientUserId);
+    assert.equal(record.channel, "email");
+    assert.match(harness.database.insertSql, /ON CONFLICT \(event_key, channel\) DO NOTHING/i);
+    assert.match(harness.database.insertSql, /SELECT \$1, 'email', \$2/i);
   });
 
   it("records failed and skipped outcomes with sanitized reasons and status", async () => {
     const failed = createHarness({ outcome: { sent: false, error: true, reason: "provider_error", attempts: 2, status: 503 } });
     await failed.service.sendAppointmentNotification({ eventKey: "failed:key", eventType: "appointment.cancelled", appointment });
-    const failedRecord = failed.database.records.get("failed:key");
+    const failedRecord = failed.database.records.get(`failed:key:patient:${appointment.patient_user_id}`);
     assert.equal(failedRecord.status, "failed");
     assert.equal(failedRecord.reason, "provider_error");
     assert.equal(failedRecord.provider_http_status, 503);
@@ -283,7 +291,7 @@ describe("notification delivery persistence", () => {
 
     const skipped = createHarness({ outcome: { sent: false, skipped: true, reason: "missing_configuration", attempts: 0 } });
     await skipped.service.sendAppointmentNotification({ eventKey: "skipped:key", eventType: "appointment.rescheduled", appointment });
-    const skippedRecord = skipped.database.records.get("skipped:key");
+    const skippedRecord = skipped.database.records.get(`skipped:key:patient:${appointment.patient_user_id}`);
     assert.equal(skippedRecord.status, "skipped");
     assert.equal(skippedRecord.reason, "missing_configuration");
     assert.equal(skippedRecord.attempt_count, 0);
@@ -292,7 +300,7 @@ describe("notification delivery persistence", () => {
   it("prevents duplicate sends for existing records in processing and finalized states", async () => {
     for (const status of ["processing", "accepted", "failed", "skipped"]) {
       const harness = createHarness();
-      harness.database.records.set("same:event", { id: status, status });
+      harness.database.records.set(`same:event:patient:${appointment.patient_user_id}`, { id: status, status });
       const result = await harness.service.sendAppointmentNotification({ eventKey: "same:event", eventType: "appointment.booked", appointment });
       assert.equal(result.duplicate, true);
       assert.equal(harness.sent.length, 0);
@@ -310,12 +318,11 @@ describe("notification delivery persistence", () => {
     assert.equal(outcomes.filter(({ duplicate }) => duplicate).length, 1);
   });
 
-  it("falls back to one untracked email when delivery record creation fails", async () => {
+  it("does not send an untracked email when delivery record creation fails", async () => {
     const harness = createHarness({ failInsert: true });
     const result = await harness.service.sendAppointmentNotification({ eventKey: "untracked:event", eventType: "appointment.booked", appointment });
-    assert.equal(result.sent, true);
-    assert.equal(result.sent, true);
-    assert.equal(harness.sent.length, 1);
+    assert.equal(result.sent, false);
+    assert.equal(harness.sent.length, 0);
     assert.deepEqual(harness.logs[0], ["Notification delivery tracking failed", { operation: "create", reason: "database_error" }]);
   });
 
@@ -325,5 +332,26 @@ describe("notification delivery persistence", () => {
     const later = { ...appointment, updated_at: "2099-01-02T00:00:00.000Z", previous_date: appointment.date, previous_start_time: appointment.start_time, date: "2099-04-11", start_time: "11:00:00" };
     assert.notEqual(appointmentEventKey("appointment.rescheduled", later), firstKey);
     assert.equal(appointmentEventKey("appointment.booked", appointment), appointmentEventKey("appointment.booked", appointment));
+  });
+
+  it("selects recipients and deduplicates every booking, cancellation, and rescheduling event", async () => {
+    const bothRecipients = { ...appointment, doctor_user_id: "44444444-4444-4444-8444-444444444444", doctor_email: "doctor@example.test" };
+    for (const eventType of ["appointment.booked", "appointment.cancelled", "appointment.rescheduled"]) {
+      const harness = createHarness();
+      const eventKey = appointmentEventKey(eventType, bothRecipients);
+      await harness.service.sendAppointmentNotification({ eventKey, eventType, appointment: bothRecipients, actorRole: "patient" });
+      assert.equal(harness.database.records.size, 2, `${eventType} should persist one delivery per recipient`);
+      assert.ok(harness.database.records.has(`${eventKey}:patient:${bothRecipients.patient_user_id}`));
+      assert.ok(harness.database.records.has(`${eventKey}:doctor:${bothRecipients.doctor_user_id}`));
+      assert.equal(harness.sent.length, 2);
+      await harness.service.sendAppointmentNotification({ eventKey, eventType, appointment: bothRecipients, actorRole: "patient" });
+      assert.equal(harness.sent.length, 2, `${eventType} duplicate must not send again`);
+    }
+
+    const doctorReschedule = createHarness();
+    await doctorReschedule.service.sendAppointmentNotification({ eventKey: "doctor-reschedule", eventType: "appointment.rescheduled", appointment: bothRecipients, actorRole: "doctor" });
+    assert.equal(doctorReschedule.database.records.size, 1);
+    assert.ok(doctorReschedule.database.records.has(`doctor-reschedule:patient:${bothRecipients.patient_user_id}`));
+    assert.equal(doctorReschedule.sent.length, 1);
   });
 });
