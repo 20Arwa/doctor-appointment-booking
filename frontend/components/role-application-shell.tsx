@@ -5,6 +5,7 @@ import {
   CalendarDays,
   CalendarPlus,
   CalendarRange,
+  Bell,
   HeartPulse,
   LayoutDashboard,
   Menu,
@@ -19,6 +20,7 @@ import { getCurrentProfile, ProfileApiError, type LocalProfile } from "@/lib/pro
 import { dashboardPath, type AppRole } from "@/lib/roles";
 import { AppShellLoading } from "@/components/app-shell-loading";
 import { HomepageSectionNavigation } from "@/components/homepage-section-navigation";
+import { NotificationBell } from "@/components/notification-bell";
 
 type AppNavigationItem = {
   label: string;
@@ -30,6 +32,7 @@ const patientNavigation: AppNavigationItem[] = [
   { label: "Dashboard", href: "/patient/dashboard", icon: LayoutDashboard },
   { label: "Book Appointment", href: "/patient/book-appointment", icon: CalendarPlus },
   { label: "My Appointments", href: "/patient/appointments", icon: CalendarDays },
+  { label: "Notifications", href: "/patient/notifications", icon: Bell },
   { label: "Payment History", href: "/patient/payments", icon: ReceiptText },
   { label: "Profile", href: "/patient/profile", icon: UserRound },
 ];
@@ -37,6 +40,7 @@ const patientNavigation: AppNavigationItem[] = [
 const doctorNavigation: AppNavigationItem[] = [
   { label: "Dashboard", href: "/doctor/dashboard", icon: LayoutDashboard },
   { label: "My Appointments", href: "/doctor/appointments", icon: CalendarDays },
+  { label: "Notifications", href: "/doctor/notifications", icon: Bell },
   { label: "Manage Availability", href: "/doctor/availability", icon: CalendarRange },
   { label: "Profile", href: "/doctor/profile", icon: UserRound },
 ];
@@ -152,6 +156,7 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
             <p className="hidden text-sm font-medium text-muted-foreground md:block">{roleLabel}</p>
           <HomepageSectionNavigation role={requiredRole} />
             <div className="ml-auto flex items-center gap-3">
+              <NotificationBell role={requiredRole} />
               <span className="hidden max-w-64 truncate text-sm font-medium text-foreground sm:block">{displayName}</span>
               <details className="group relative md:hidden" ref={mobileNavigation}>
                 <summary aria-label="Toggle application navigation" className="flex size-11 cursor-pointer list-none items-center justify-center rounded-lg border border-border text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">

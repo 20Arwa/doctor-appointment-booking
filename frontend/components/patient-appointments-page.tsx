@@ -2,7 +2,7 @@
 
 import { useAuth } from "@clerk/nextjs";
 import { CalendarClock, CheckCircle2, RefreshCw, XCircle } from "lucide-react";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import {
   AlertDialog,
@@ -16,11 +16,12 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { CancellationRefundEstimate } from "@/components/cancellation-refund-estimate";
-import { notifyError, notifySuccess } from "@/lib/notifications";
+import { notifyError, notifyInAppNotificationsChanged, notifySuccess } from "@/lib/notifications";
 import { useAppointmentHistory } from "@/components/use-appointment-history";
 import { AppointmentAvailabilityCalendar } from "@/components/appointment-availability-calendar";
 import {
   cancelAppointment,
+  getAppointment,
   getAppointmentCancellationRefundPreview,
   getDoctorSlots,
   ProfileApiError,
@@ -83,7 +84,14 @@ function conflictMessage(error: unknown, fallback: string) {
 export function PatientAppointmentsPage() {
   const { getToken } = useAuth();
   const pathname = usePathname();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const appointmentFromNotification = searchParams.get("appointment");
   const { appointments, setAppointments, loading, error: loadError, history, retry: retryAppointments, loadMore } = useAppointmentHistory();
+  const requestedNotificationAppointment = useRef<string | null>(null);
+  const notificationRequestInFlight = useRef<{ appointmentId: string } | null>(null);
+  const pendingNotificationScroll = useRef<string | null>(null);
+  const [notificationFocusId, setNotificationFocusId] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState<number | null>(null);
   const [activeRequest, setActiveRequest] = useState<string | null>(null);
   const requestLock = useRef(false);
@@ -110,6 +118,58 @@ export function PatientAppointmentsPage() {
     const timer = window.setInterval(() => setCurrentTime(Date.now()), 30_000);
     return () => { window.clearTimeout(initialTime); window.clearInterval(timer); };
   }, []);
+
+  useEffect(() => {
+    if (!appointmentFromNotification) {
+      requestedNotificationAppointment.current = null;
+      return;
+    }
+    if (loading) return;
+    if (requestedNotificationAppointment.current === appointmentFromNotification
+      || notificationRequestInFlight.current?.appointmentId === appointmentFromNotification) return;
+    const request = { appointmentId: appointmentFromNotification };
+    notificationRequestInFlight.current = request;
+    let active = true;
+    void (async () => {
+      try {
+        const token = await getToken();
+        if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+        const appointment = await getAppointment(token, appointmentFromNotification);
+        if (!active) return;
+        requestedNotificationAppointment.current = appointmentFromNotification;
+        pendingNotificationScroll.current = appointment.id;
+        setAppointments((current) => current.some((item) => item.id === appointment.id)
+          ? current.map((item) => item.id === appointment.id ? appointment : item)
+          : [...current, appointment]);
+      } catch { /* The authorized appointment route remains the source of truth. */ }
+      finally {
+        if (notificationRequestInFlight.current === request) notificationRequestInFlight.current = null;
+      }
+    })();
+    return () => {
+      active = false;
+      if (notificationRequestInFlight.current === request) notificationRequestInFlight.current = null;
+    };
+  }, [appointmentFromNotification, getToken, loading, setAppointments]);
+
+  useEffect(() => {
+    const appointmentId = pendingNotificationScroll.current;
+    if (!appointmentId || !appointments.some((appointment) => appointment.id === appointmentId)) return;
+    const currentUrl = new URL(window.location.href);
+    if (currentUrl.searchParams.get("appointment") !== appointmentId) return;
+    const card = document.getElementById(`appointment-${appointmentId}`);
+    if (!card) return;
+    card.scrollIntoView({ block: "center" });
+    setNotificationFocusId(appointmentId);
+    pendingNotificationScroll.current = null;
+    currentUrl.searchParams.delete("appointment");
+    router.replace(`${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`, { scroll: false });
+  }, [appointments, loadError, loading, router]);
+
+  function clearNotificationFocus() {
+    pendingNotificationScroll.current = null;
+    setNotificationFocusId(null);
+  }
 
   useEffect(() => {
     if (!cancelTarget) return;
@@ -144,10 +204,12 @@ export function PatientAppointmentsPage() {
   const cancelled = ordered.filter((appointment) => appointment.status === "cancelled");
 
   function retryList() {
+    clearNotificationFocus();
     retryAppointments();
   }
 
   async function beginReschedule(appointment: PatientAppointment) {
+    clearNotificationFocus();
     if (requestLock.current) return;
     requestLock.current = true;
     setActiveRequest(`slots:${appointment.id}`);
@@ -192,6 +254,7 @@ export function PatientAppointmentsPage() {
   }
 
   async function cancel(appointment: PatientAppointment) {
+    clearNotificationFocus();
     if (requestLock.current) return;
     requestLock.current = true;
     setActiveRequest(`cancel:${appointment.id}`);
@@ -199,6 +262,7 @@ export function PatientAppointmentsPage() {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
       const updated = await cancelAppointment(token, appointment.id);
+      notifyInAppNotificationsChanged();
       setAppointments((current) => current.map((item) => item.id === appointment.id ? updated : item));
       setCancelTarget(null);
       notifySuccess("Appointment cancelled.", `patient-cancel-${appointment.id}`);
@@ -214,6 +278,7 @@ export function PatientAppointmentsPage() {
   }
 
   function openCancellationDialog(appointment: PatientAppointment) {
+    clearNotificationFocus();
     setRefundPreview(null);
     setRefundPreviewError(null);
     setRefundPreviewLoading(true);
@@ -222,12 +287,14 @@ export function PatientAppointmentsPage() {
 
   async function confirmReschedule(appointment: PatientAppointment) {
     if (!selectedSlotId || requestLock.current) return;
+    clearNotificationFocus();
     requestLock.current = true;
     setActiveRequest(`reschedule:${appointment.id}`);
     try {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
       const replacement = await rescheduleAppointment(token, appointment.id, selectedSlotId);
+      notifyInAppNotificationsChanged();
       setAppointments((current) => [...current.map((item) => item.id === appointment.id ? { ...item, status: "cancelled" as const } : item), replacement]);
       setRescheduleId(null);
       setSlots([]);
@@ -267,13 +334,13 @@ export function PatientAppointmentsPage() {
       {!loading && !loadError ? (
         <>
           <AppointmentSection title="Upcoming appointments" empty="You have no upcoming appointments." appointments={upcoming}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} calendarMonth={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={(month) => void changeRescheduleMonth(appointment, month)} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} highlighted={notificationFocusId === appointment.id} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} calendarMonth={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={(month) => void changeRescheduleMonth(appointment, month)} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
           <AppointmentSection title="Past appointments" empty="Your past appointments will appear here." appointments={past} hasMore={history.past.hasMore} loadingMore={history.past.loading} moreError={history.past.error} onShowMore={() => void loadMore("past")}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} calendarMonth={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={(month) => void changeRescheduleMonth(appointment, month)} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} highlighted={notificationFocusId === appointment.id} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} calendarMonth={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={(month) => void changeRescheduleMonth(appointment, month)} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
           <AppointmentSection title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} hasMore={history.cancelled.hasMore} loadingMore={history.cancelled.loading} moreError={history.cancelled.error} onShowMore={() => void loadMore("cancelled")}>
-            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} calendarMonth={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={(month) => void changeRescheduleMonth(appointment, month)} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
+            {(appointment) => <AppointmentCard key={appointment.id} appointment={appointment} highlighted={notificationFocusId === appointment.id} isPast={(appointmentEndInstant(appointment)?.getTime() ?? Infinity) <= now} activeRequest={activeRequest} rescheduleId={rescheduleId} slots={slots} slotsLoading={slotsLoading} slotsError={slotsError} selectedSlotId={selectedSlotId} calendarMonth={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={(month) => void changeRescheduleMonth(appointment, month)} onCancel={() => openCancellationDialog(appointment)} onBeginReschedule={() => void beginReschedule(appointment)} onSelectSlot={setSelectedSlotId} onConfirmReschedule={() => void confirmReschedule(appointment)} onCloseReschedule={() => { setRescheduleId(null); setSlotsError(null); }} />}
           </AppointmentSection>
         </>
       ) : null}
@@ -317,8 +384,9 @@ function AppointmentSection({ title, empty, appointments, children, hasMore = fa
   );
 }
 
-function AppointmentCard({ appointment, isPast, activeRequest, rescheduleId, slots, slotsLoading, slotsError, selectedSlotId, calendarMonth, selectedDate, onSelectDate, onShiftMonth, onCancel, onBeginReschedule, onSelectSlot, onConfirmReschedule, onCloseReschedule }: {
+function AppointmentCard({ appointment, highlighted, isPast, activeRequest, rescheduleId, slots, slotsLoading, slotsError, selectedSlotId, calendarMonth, selectedDate, onSelectDate, onShiftMonth, onCancel, onBeginReschedule, onSelectSlot, onConfirmReschedule, onCloseReschedule }: {
   appointment: PatientAppointment;
+  highlighted: boolean;
   isPast: boolean;
   activeRequest: string | null;
   rescheduleId: string | null;
@@ -341,7 +409,7 @@ function AppointmentCard({ appointment, isPast, activeRequest, rescheduleId, slo
   const dateSlots = slots.filter((slot) => slot.date === selectedDate);
 
   return (
-    <li className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6">
+    <li id={`appointment-${appointment.id}`} className={`rounded-2xl border bg-card p-5 shadow-sm sm:p-6 ${highlighted ? "border-primary" : "border-border"}`}>
       <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
         <div>
           <p className="font-semibold text-card-foreground">Dr. {appointment.doctor_first_name} {appointment.doctor_last_name}</p>

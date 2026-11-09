@@ -104,6 +104,12 @@ const paymentHistoryRefundSchema = z.object({
   processed_at: z.string().nullable(),
 });
 
+const inAppNotificationSchema = z.object({
+  id: z.string().uuid(), appointment_id: z.string().uuid(), event_type: z.string(), title: z.string(),
+  message: z.string(), created_at: z.string(), read_at: z.string().nullable(),
+});
+export type InAppNotification = z.infer<typeof inAppNotificationSchema>;
+
 const paymentHistoryAppointmentSchema = z.object({
   id: z.string().uuid().nullable().optional(),
   status: z.enum(["confirmed", "cancelled", "completed"]).nullable().optional(),
@@ -247,6 +253,24 @@ export async function getCurrentProfile(token: string): Promise<LocalProfile> {
   const parsed = localProfileSchema.safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete profile response.");
   return parsed.data;
+}
+
+export async function getInAppNotifications(token: string, limit = 20, offset = 0) {
+  const payload = await request<unknown>(token, `/notifications?limit=${limit}&offset=${offset}`);
+  const parsed = z.object({ notifications: z.array(inAppNotificationSchema), unreadCount: z.number().int(), totalCount: z.number().int() }).safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete notification list.");
+  return parsed.data;
+}
+
+export async function markInAppNotificationRead(token: string, id: string) {
+  const payload = await request<unknown>(token, `/notifications/${encodeURIComponent(id)}/read`, { method: "PATCH" });
+  const parsed = inAppNotificationSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete notification.");
+  return parsed.data;
+}
+
+export async function markAllInAppNotificationsRead(token: string) {
+  return request<{ updated: number }>(token, "/notifications/read-all", { method: "PATCH" });
 }
 
 export async function getDoctors(token?: string): Promise<DirectoryDoctor[]> {
@@ -405,6 +429,13 @@ export async function getAppointments(token: string): Promise<PatientAppointment
   const payload = await request<unknown>(token, "/appointments");
   const parsed = z.array(appointmentSchema).safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete appointment list.");
+  return parsed.data;
+}
+
+export async function getAppointment(token: string, appointmentId: string): Promise<PatientAppointment> {
+  const payload = await request<unknown>(token, `/appointments/${encodeURIComponent(appointmentId)}`);
+  const parsed = appointmentSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete appointment.");
   return parsed.data;
 }
 
