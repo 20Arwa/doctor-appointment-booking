@@ -5,6 +5,8 @@ const { describe, it } = require("node:test");
 const { createApp } = require("../src/app");
 const { createEmailNotificationService } = require("../src/services/emailNotificationService");
 const { createNotificationDeliveryService } = require("../src/services/notificationDeliveryService");
+const appointmentService = require("../src/services/appointmentService");
+const { cancelAppointment } = require("../src/controllers/appointmentController");
 const {
   appointmentQuerySchema,
   createAppointmentSchema,
@@ -105,6 +107,17 @@ function createDatabase({
       let txAppointments;
       let pendingLocks = [];
       let heldLocks = false;
+      const heldAvailabilityIds = new Set();
+      async function lockAvailability(slotId) {
+        if (heldAvailabilityIds.has(slotId)) return;
+        const previous = lockTails.get(slotId) || Promise.resolve();
+        let release;
+        lockTails.set(slotId, new Promise((resolve) => { release = resolve; }));
+        await previous;
+        pendingLocks.push(release);
+        heldAvailabilityIds.add(slotId);
+        heldLocks = true;
+      }
       const client = {
         async query(sql, values = []) {
           if (sql === "BEGIN") {
@@ -116,6 +129,22 @@ function createDatabase({
           }
           if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
           if (sql.includes("FROM appointment_slot_holds h") && sql.includes("h.expires_at > NOW()")) return { rows: [] };
+          if (sql.includes("SELECT id, doctor_id FROM availability")) {
+            const ids = values[0] || [];
+            for (const id of ids) await lockAvailability(id);
+            const rows = ids.map((id) => state.slots.find((slot) => slot.id === id)).filter(Boolean);
+            return { rows: rows.map(({ id, doctor_id }) => ({ id, doctor_id })) };
+          }
+          if (sql.includes("SELECT id FROM availability WHERE doctor_id = $1 AND date = $2::date")) {
+            const [ownerDoctorId, date, start, end] = values;
+            const slot = state.slots.find((item) => item.doctor_id === ownerDoctorId && item.date === date && item.start_time === start && item.end_time === end && !item.deleted_at);
+            return { rows: slot ? [{ id: slot.id }] : [] };
+          }
+          if (sql.includes("SELECT id FROM availability WHERE id = $1 AND doctor_id = $2")) {
+            const [slotId, ownerDoctorId] = values;
+            const slot = state.slots.find((item) => item.id === slotId && item.doctor_id === ownerDoctorId && !item.deleted_at);
+            return { rows: slot ? [{ id: slot.id }] : [] };
+          }
           if (sql.startsWith("SELECT id, deleted_at FROM availability")) {
             const [ownerDoctorId, date, start, end] = values;
             const slot = state.slots.find((item) => item.doctor_id === ownerDoctorId && item.date === date && item.start_time === start && item.end_time === end);
@@ -123,12 +152,7 @@ function createDatabase({
           }
           if (sql.includes("FROM availability av") && sql.includes("FOR UPDATE OF av")) {
             const [slotId] = values;
-            const previous = lockTails.get(slotId) || Promise.resolve();
-            let release;
-            lockTails.set(slotId, new Promise((resolve) => { release = resolve; }));
-            await previous;
-            pendingLocks.push(release);
-            heldLocks = true;
+            await lockAvailability(slotId);
             const slot = state.slots.find((item) => item.id === slotId && item.doctor_active);
             return { rows: slot ? [{ ...slot }] : [] };
           }
@@ -189,6 +213,7 @@ function createDatabase({
             if (appointment) Object.assign(appointment, { status: "cancelled", cancelled_at: "2099-02-01T00:00:00.000Z", updated_at: "2099-02-01T00:00:00.000Z" });
             return { rows: [] };
           }
+          if (sql.startsWith("UPDATE appointment_allocations SET status = 'released'")) return { rows: [] };
           if (sql.startsWith("UPDATE appointments SET status = 'completed'")) {
             const appointment = txAppointments.find((row) => row.id === values[0]);
             if (appointment) Object.assign(appointment, { status: "completed", updated_at: "2099-02-01T00:00:00.000Z" });
@@ -197,6 +222,17 @@ function createDatabase({
           if (sql.includes("FROM appointments a") && sql.includes("WHERE a.id = $1")) {
             const appointment = txAppointments.find((row) => row.id === values[0]);
             return { rows: appointment ? [details(appointment)] : [] };
+          }
+          if (sql.includes("COUNT(DISTINCT reservation.patient_id)::int AS occupied")) {
+            const [availabilityId, , excludedAppointmentId] = values;
+            const occupiedPatients = new Set(txAppointments
+              .filter((row) => row.availability_id === availabilityId && row.status === "confirmed" && row.id !== excludedAppointmentId)
+              .map((row) => row.patient_id));
+            return { rows: [{ occupied: occupiedPatients.size }] };
+          }
+          if (sql.includes("SELECT id, deleted_at, mode, capacity, date::text AS date") && sql.includes("FROM availability WHERE id = $1")) {
+            const slot = state.slots.find((item) => item.id === values[0]);
+            return { rows: slot ? [{ ...slot }] : [] };
           }
           if (sql === "COMMIT") {
             state.appointments.splice(0, state.appointments.length, ...txAppointments);
@@ -216,6 +252,7 @@ function createDatabase({
         if (!heldLocks) return;
         for (const release of pendingLocks) release();
         pendingLocks = [];
+        heldAvailabilityIds.clear();
         heldLocks = false;
       }
       return client;
@@ -275,18 +312,27 @@ describe("appointment schemas and migration", () => {
     const directory = path.join(__dirname, "..", "migrations");
     const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.equal(files.length, 14);
-    assert.match(files[3], /^004_.*\.sql$/);
-    assert.equal(files[4], "005_appointment_schedule_snapshot.sql");
-    assert.equal(files[5], "006_doctor_consultation_fee.sql");
-    assert.equal(files[6], "007_appointment_reminders.sql");
-    assert.equal(files[7], "008_payment_refund_schema.sql");
-    assert.equal(files[8], "009_payment_booking_reason.sql");
-    assert.equal(files[9], "010_payment_capture_reconciliation.sql");
-    assert.equal(files[10], "011_availability_soft_delete.sql");
-    assert.equal(files[11], "012_appointment_consultation_fee_snapshot.sql");
-    assert.equal(files[12], "013_notification_deliveries.sql");
-    assert.equal(files[13], "014_notification_delivery_recovery.sql");
+    assert.deepEqual(files, [
+      "001_users_patients_doctors.sql",
+      "002_doctor_availability.sql",
+      "003_appointments.sql",
+      "004_remove_rescheduled_from_appointment_id.sql",
+      "005_appointment_schedule_snapshot.sql",
+      "006_doctor_consultation_fee.sql",
+      "007_appointment_reminders.sql",
+      "008_payment_refund_schema.sql",
+      "009_payment_booking_reason.sql",
+      "010_payment_capture_reconciliation.sql",
+      "011_availability_soft_delete.sql",
+      "012_appointment_consultation_fee_snapshot.sql",
+      "013_notification_deliveries.sql",
+      "013_weekly_doctor_scheduling.sql",
+      "014_notification_delivery_recovery.sql",
+      "015_wave_stream_scheduling.sql",
+      "016_wave_stream_capacity_indexes.sql",
+      "017_stream_window_capacity.sql",
+      "024_in_app_notifications.sql",
+    ]);
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);
@@ -300,6 +346,32 @@ describe("appointment schemas and migration", () => {
 });
 
 describe("appointment workflows", () => {
+  it("keeps cancellation and Email successful when awaited In-App persistence fails", async () => {
+    const events = [];
+    const originalCancel = appointmentService.cancelAppointment;
+    appointmentService.cancelAppointment = async () => { events.push("appointment"); return makeAppointment({ status: "cancelled" }); };
+    const response = {
+      locals: {
+        user: patientUser,
+        params: { id: appointmentId },
+        database: {},
+        paymentService: { async refundCancelledAppointment() { return { status: "not_applicable" }; } },
+        notificationDeliveryService: { async sendAppointmentNotification() { events.push("email"); } },
+        inAppNotificationService: { async sendAppointmentNotification() { events.push("in-app"); throw new Error("storage unavailable"); } },
+      },
+      status(statusCode) { this.statusCode = statusCode; return this; },
+      json(body) { this.body = body; return this; },
+    };
+    try {
+      await cancelAppointment({}, response, (error) => { throw error; });
+    } finally {
+      appointmentService.cancelAppointment = originalCancel;
+    }
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.status, "cancelled");
+    assert.deepEqual(events, ["appointment", "email", "in-app"]);
+  });
+
   it("paginates past and cancelled appointment history on the server", async () => {
     const slots = Array.from({ length: 7 }, (_, index) => makeSlot(`55555555-5555-4555-8555-${String(index + 1).padStart(12, "0")}`, "10:00", "2000-04-10"));
     const appointments = slots.map((slot, index) => ({

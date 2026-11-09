@@ -48,6 +48,21 @@ describe("appointment reminders", () => {
     assert.deepEqual([...database.state.deliveries.values()].map(({ status }) => status), ["sent", "sent"]);
   });
 
+  it("waits for independent In-App reminder persistence and continues Email after persistence failure", async () => {
+    const database = mockDatabase();
+    const steps = [];
+    const service = createAppointmentReminderService({
+      database,
+      timeZone: "Asia/Kolkata",
+      logger: { error() {} },
+      inAppNotificationService: { async sendReminder(type) { steps.push(`in-app:${type}`); await new Promise((resolve) => setTimeout(resolve, 5)); throw new Error("storage unavailable"); } },
+      emailNotificationService: { async sendAppointmentReminder(type) { steps.push(`email:${type}`); return { sent: true }; } },
+    });
+    const result = await service.run();
+    assert.deepEqual(steps, ["in-app:24h", "email:24h", "in-app:1h", "email:1h"]);
+    assert.equal(result.sent, 2);
+  });
+
   it("excludes cancelled and completed appointments", async () => {
     const database = mockDatabase([
       { ...appointment, id: "cancelled", status: "cancelled" },

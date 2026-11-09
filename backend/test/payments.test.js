@@ -75,7 +75,7 @@ function createIdempotentStripeClient({ loseFirstResponse = false } = {}) {
 }
 
 function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 60 * 1000).toISOString(), failPersistOrder = false, slotDeleted = false, competingHold = false } = {}) {
-  const state = { payment: null, hold: null, calls: [], holdCount: 0, paymentCount: 0, appointmentCount: 0, competingHold };
+  const state = { payment: null, hold: null, appointments: [], allocations: [], calls: [], holdCount: 0, paymentCount: 0, appointmentCount: 0, competingHold };
   let shouldFailPersistOrder = failPersistOrder;
   const reservationRow = () => state.payment && state.hold ? [{
     id: state.payment.id,
@@ -117,6 +117,19 @@ function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 
             await previous;
             heldLocks.push(unlock);
             return { rows: [] };
+          }
+          if (sql.includes("SELECT 1") && sql.includes("FROM appointments appointment")
+              && sql.includes("FROM appointment_allocations allocation") && sql.includes("FROM appointment_slot_holds hold")) {
+            const [patientId, availabilityId] = values;
+            const now = Date.now();
+            const hasAppointment = state.appointments.some((appointment) => appointment.patient_id === patientId
+              && appointment.availability_id === availabilityId && appointment.status === "confirmed");
+            const hasAllocation = state.allocations.some((allocation) => allocation.patient_id === patientId
+              && allocation.availability_id === availabilityId
+              && (allocation.status === "confirmed" || allocation.status === "held" && new Date(allocation.expires_at).getTime() > now));
+            const hasActiveHold = state.hold?.patient_id === patientId && state.hold.availability_id === availabilityId
+              && state.hold.status === "active" && new Date(state.hold.expires_at).getTime() > now;
+            return { rows: hasAppointment || hasAllocation || hasActiveHold ? [{ "?column?": 1 }] : [] };
           }
           if (sql.includes("p.idempotency_key = $1")) return { rows: state.payment?.idempotency_key === values[0] ? reservationRow() : [] };
           if (sql.includes("FROM payments p JOIN appointment_slot_holds h")) {
@@ -614,7 +627,8 @@ describe("Stripe Checkout webhook and reconciliation", () => {
         return { ok: true, status: 201, async json() { return { messageId: "mock-booking-id" }; } };
       },
     });
-    const app = createApp({ database, frontendOrigin: "http://localhost:3000", applicationTimezone: "Asia/Kolkata", stripeService, emailNotificationService });
+    let inAppAttempts = 0;
+    const app = createApp({ database, frontendOrigin: "http://localhost:3000", applicationTimezone: "Asia/Kolkata", stripeService, emailNotificationService, inAppNotificationService: { async sendAppointmentNotification() { inAppAttempts += 1; throw new Error("storage unavailable"); } } });
     await withServer(app, async (url) => {
       const postWebhook = (event) => fetch(`${url}/api/v1/payments/webhook`, {
         method: "POST",
@@ -632,6 +646,7 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.payment.provider_payment_id, intentId);
     assert.equal(database.state.sentEmails.length, 2);
+    assert.equal(inAppAttempts, 1);
     assert.deepEqual(database.state.sentEmails.map((mail) => mail.to[0].email), ["patient@example.test", "doctor@example.test"]);
     for (const mail of database.state.sentEmails) {
       assert.match(mail.htmlContent, /#67465F/);
@@ -681,7 +696,7 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     assert.equal(database.state.payment.status, "captured");
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.hold.status, "consumed");
-    assert.equal(database.state.sentEmails.length, 1);
+    assert.equal(database.state.sentEmails.length, 2);
     assert.equal(database.state.reconciliation.size, 0);
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
   });
@@ -701,7 +716,7 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO appointments")).length, 1);
     assert.equal(database.state.events.size, 2);
     assert.equal(database.state.reconciliation.size, 0);
-    assert.equal(database.state.sentEmails.length, 1);
+    assert.equal(database.state.sentEmails.length, 2);
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
   });
 
