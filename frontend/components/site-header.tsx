@@ -1,13 +1,17 @@
 "use client";
 
 import Link from "next/link";
+import { useAuth } from "@clerk/nextjs";
 import { HeartPulse } from "lucide-react";
 import { SiteAuthActions } from "@/components/site-auth-actions";
 import { useHomepageRole } from "@/components/homepage-role-provider";
 import { HomepageSectionNavigation } from "@/components/homepage-section-navigation";
+import { NotificationBell } from "@/components/notification-bell";
 
 export function SiteHeader() {
   const role = useHomepageRole();
+  const { isLoaded, isSignedIn } = useAuth();
+  const notificationRole = role === "patient" || role === "doctor" ? role : null;
 
   return (
     <header className="sticky top-0 z-20 border-b border-border bg-background/90 backdrop-blur">
@@ -31,6 +35,7 @@ export function SiteHeader() {
         </Link>
         <div className="ml-auto flex items-center gap-2 md:ml-0 md:gap-5">
           <HomepageSectionNavigation role={role} />
+          {isLoaded && isSignedIn && role !== "unknown" && <NotificationBell role={notificationRole} />}
           <SiteAuthActions />
         </div>
       </div>
