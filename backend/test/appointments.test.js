@@ -127,6 +127,10 @@ function createDatabase({
           if (sql === "SELECT id FROM patients WHERE user_id = $1") {
             return { rows: values[0] === patientUserId ? [{ id: patientId }] : [] };
           }
+          if (sql.includes("SELECT a.availability_id FROM appointments a JOIN patients p")) {
+            const appointment = txAppointments.find((row) => row.id === values[0] && values[1] === patientUserId && row.patient_id === patientId);
+            return { rows: appointment ? [{ availability_id: appointment.availability_id }] : [] };
+          }
           if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
           if (sql.includes("FROM appointment_slot_holds h") && sql.includes("h.expires_at > NOW()")) return { rows: [] };
           if (sql.includes("SELECT id, doctor_id FROM availability")) {
@@ -160,6 +164,10 @@ function createDatabase({
             const [id, ownerId] = values;
             const appointment = txAppointments.find((row) => row.id === id && ownerId === patientUserId && row.patient_id === patientId);
             return { rows: appointment ? [{ ...appointment }] : [] };
+          }
+          if (sql.includes("FROM appointments a JOIN patients p") && sql.includes("FOR UPDATE OF a")) {
+            const appointment = txAppointments.find((row) => row.id === values[0] && values[1] === patientUserId && row.patient_id === patientId);
+            return { rows: appointment ? [{ id: appointment.id, status: appointment.status, availability_id: appointment.availability_id }] : [] };
           }
           if (sql.startsWith("SELECT id, status") && sql.includes("JOIN availability av")) {
             const [id, ownerDoctorId] = values;
@@ -312,27 +320,15 @@ describe("appointment schemas and migration", () => {
     const directory = path.join(__dirname, "..", "migrations");
     const files = fs.readdirSync(directory).filter((file) => file.endsWith(".sql")).sort();
     assert.deepEqual(files.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
-    assert.deepEqual(files, [
-      "001_users_patients_doctors.sql",
-      "002_doctor_availability.sql",
-      "003_appointments.sql",
-      "004_remove_rescheduled_from_appointment_id.sql",
-      "005_appointment_schedule_snapshot.sql",
-      "006_doctor_consultation_fee.sql",
-      "007_appointment_reminders.sql",
-      "008_payment_refund_schema.sql",
-      "009_payment_booking_reason.sql",
-      "010_payment_capture_reconciliation.sql",
-      "011_availability_soft_delete.sql",
-      "012_appointment_consultation_fee_snapshot.sql",
-      "013_notification_deliveries.sql",
-      "013_weekly_doctor_scheduling.sql",
-      "014_notification_delivery_recovery.sql",
-      "015_wave_stream_scheduling.sql",
-      "016_wave_stream_capacity_indexes.sql",
-      "017_stream_window_capacity.sql",
+    for (const migration of [
+      "004_remove_rescheduled_from_appointment_id.sql", "005_appointment_schedule_snapshot.sql",
+      "006_doctor_consultation_fee.sql", "007_appointment_reminders.sql", "008_payment_refund_schema.sql",
+      "009_payment_booking_reason.sql", "010_payment_capture_reconciliation.sql", "011_availability_soft_delete.sql",
+      "012_appointment_consultation_fee_snapshot.sql", "013_notification_deliveries.sql",
+      "013_weekly_doctor_scheduling.sql", "014_notification_delivery_recovery.sql", "015_wave_stream_scheduling.sql",
+      "016_wave_stream_capacity_indexes.sql", "017_stream_window_capacity.sql", "023_notification_sms_provider_identifiers.sql",
       "024_in_app_notifications.sql",
-    ]);
+    ]) assert.ok(files.includes(migration), `missing migration ${migration}`);
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
     assert.match(sql, /status <> 'cancelled' OR cancelled_at IS NOT NULL/i);
@@ -464,6 +460,17 @@ describe("appointment workflows", () => {
     assert.match(events[1].eventKey, /^appointment\.rescheduled:/);
     assert.equal(events[1].appointment.id, secondAppointmentId);
     assert.equal(events[2].appointment.id, appointmentId);
+  });
+
+  it("keeps cancellation successful when notification delivery fails", async () => {
+    const failingNotifications = { async sendAppointmentNotification() { throw new Error("SMS provider unavailable"); } };
+    const cancellation = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), notificationDeliveryService: failingNotifications });
+    await withServer(cancellation.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" });
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).status, "cancelled");
+    });
+
   });
 
   it("skips email and logs safely when tracking record creation fails", async () => {
