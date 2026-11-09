@@ -2,7 +2,8 @@ const CANDIDATE_SQL = `
   SELECT a.id, a.scheduled_date::text AS date,
          a.scheduled_start_time::text AS start_time,
          d.id AS doctor_id, du.first_name AS doctor_first_name, du.last_name AS doctor_last_name,
-         p.id AS patient_id, p.user_id AS patient_user_id, pu.email AS patient_email
+         p.id AS patient_id, pu.id AS patient_user_id, pu.email AS patient_email,
+         pu.phone AS patient_phone, pu.sms_consent AS patient_sms_consent
   FROM appointments a
   JOIN availability av ON av.id = a.availability_id
   JOIN doctors d ON d.id = av.doctor_id
@@ -35,7 +36,13 @@ async function claimReminder(database, appointment, reminderType, lead, timeZone
   return result.rows[0]?.id ?? null;
 }
 
-function createAppointmentReminderService({ database, emailNotificationService, inAppNotificationService, timeZone, logger = console }) {
+function reminderSmsMessage(reminderType, appointment) {
+  const lead = reminderType === "24h" ? "24-hour" : "1-hour";
+  const doctor = `Dr. ${[appointment.doctor_first_name, appointment.doctor_last_name].filter(Boolean).join(" ")}`;
+  return `Reminder: your ${lead} appointment with ${doctor} is ${appointment.date} at ${String(appointment.start_time || "").slice(0, 5)}.`;
+}
+
+function createAppointmentReminderService({ database, emailNotificationService, inAppNotificationService, notificationDeliveryService, timeZone = "Asia/Kolkata", logger = console }) {
   return {
     async run() {
       // The database clock drives eligibility and leases to keep all scheduler instances consistent.
@@ -53,28 +60,45 @@ function createAppointmentReminderService({ database, emailNotificationService, 
           }
           const claimId = await claimReminder(database, appointment, type, lead, timeZone, window);
           if (!claimId) { counts.skipped += 1; continue; }
-          let outcome;
+
+          let emailOutcome;
+          let emailThrew = false;
           try {
-            outcome = await emailNotificationService.sendAppointmentReminder(type, appointment);
+            emailOutcome = await emailNotificationService.sendAppointmentReminder(type, appointment);
           } catch (error) {
+            emailThrew = true;
             await database.query("DELETE FROM appointment_reminder_deliveries WHERE id = $1 AND status = 'processing'", [claimId]);
             counts.failed += 1;
             logger.error("Appointment reminder delivery failed", { appointmentId: appointment.id, reminderType: type, message: error.message });
-            continue;
           }
-          if (outcome?.sent) {
+          if (emailOutcome?.sent) {
             await database.query(
               "UPDATE appointment_reminder_deliveries SET status = 'sent', sent_at = NOW() WHERE id = $1 AND status = 'processing'",
               [claimId],
             );
             counts.sent += 1;
-          } else if (outcome?.skipped) {
+          } else if (!emailOutcome?.sent && emailOutcome?.skipped) {
             await database.query("DELETE FROM appointment_reminder_deliveries WHERE id = $1 AND status = 'processing'", [claimId]);
             counts.skipped += 1;
-          } else {
+          } else if (!emailThrew) {
             await database.query("DELETE FROM appointment_reminder_deliveries WHERE id = $1 AND status = 'processing'", [claimId]);
             counts.failed += 1;
             logger.error("Appointment reminder will be retried by the next scheduler run", { appointmentId: appointment.id, reminderType: type });
+          }
+
+          if (notificationDeliveryService?.sendSmsDelivery && appointment.patient_user_id) {
+            try {
+              await notificationDeliveryService.sendSmsDelivery({
+                eventKey: `appointment.reminder:${appointment.id}:${type}:${appointment.date}:${appointment.start_time}`,
+                eventType: `appointment.reminder_${type}`,
+                appointment: { id: appointment.id, date: appointment.date, start_time: appointment.start_time },
+                recipient: { type: "patient", userId: appointment.patient_user_id },
+                message: reminderSmsMessage(type, appointment),
+                payloadExtra: { reminder_type: type, scheduled_date: appointment.date, scheduled_start_time: String(appointment.start_time).slice(0, 8) },
+              });
+            } catch (error) {
+              logger.error("Appointment SMS reminder delivery failed", { appointmentId: appointment.id, reminderType: type, message: error.message });
+            }
           }
         }
       }
@@ -83,4 +107,4 @@ function createAppointmentReminderService({ database, emailNotificationService, 
   };
 }
 
-module.exports = { createAppointmentReminderService };
+module.exports = { createAppointmentReminderService, reminderSmsMessage };
