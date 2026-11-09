@@ -21,6 +21,7 @@ const profileSchema = z.object({
   first_name: z.string().trim().min(1, "Enter your first name.").max(100, "Use 100 characters or fewer."),
   last_name: z.string().trim().min(1, "Enter your last name.").max(100, "Use 100 characters or fewer."),
   phone: z.string().trim().max(40, "Use 40 characters or fewer."),
+  sms_consent: z.boolean(),
   date_of_birth: z.string().refine((value) => value === "" || z.iso.date().safeParse(value).success, "Enter a valid date."),
   gender: z.string().trim().max(40, "Use 40 characters or fewer."),
   specialty: z.string().trim().max(150, "Use 150 characters or fewer."),
@@ -29,6 +30,7 @@ const profileSchema = z.object({
 
 type ProfileValues = z.infer<typeof profileSchema>;
 type ProfileField = keyof ProfileValues;
+type TextProfileField = Exclude<ProfileField, "sms_consent">;
 type ProfileErrors = Partial<Record<ProfileField, string>>;
 
 const fieldClassName = "mt-2 min-h-11 w-full rounded-lg border border-input bg-background px-3 py-2 text-foreground shadow-sm outline-none transition-colors placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring";
@@ -45,6 +47,7 @@ function valuesFromProfile(profile: LocalProfile): ProfileValues {
     first_name: profile.first_name,
     last_name: profile.last_name,
     phone: profile.phone ?? "",
+    sms_consent: profile.sms_consent ?? false,
     date_of_birth: profile.role === "patient" ? profile.profile.date_of_birth ?? "" : "",
     gender: profile.role === "patient" ? profile.profile.gender ?? "" : "",
     specialty: profile.role === "doctor" ? profile.profile.specialty ?? "" : "",
@@ -114,6 +117,7 @@ export function ProfilePage() {
         first_name: parsed.data.first_name,
         last_name: parsed.data.last_name,
         phone: parsed.data.phone.trim() || null,
+        sms_consent: parsed.data.sms_consent,
       });
       if (profile.role === "patient") {
         await updateRoleProfile(token, profile, {
@@ -141,11 +145,11 @@ export function ProfilePage() {
     }
   }
 
-  function inputChange(field: ProfileField) {
+  function inputChange(field: TextProfileField) {
     return (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => updateField(field, event.target.value);
   }
 
-  function textField(field: ProfileField, label: string, options: { type?: string; autoComplete?: string; max?: string } = {}) {
+  function textField(field: TextProfileField, label: string, options: { type?: string; autoComplete?: string; max?: string } = {}) {
     const id = `profile-${field}`;
     const icon = field === "first_name" || field === "last_name" ? UserRound : field === "phone" ? Phone : field === "date_of_birth" ? CalendarDays : FileText;
     return (
@@ -157,7 +161,7 @@ export function ProfilePage() {
     );
   }
 
-  function textArea(field: ProfileField, label: string, hint: string) {
+  function textArea(field: TextProfileField, label: string, hint: string) {
     const id = `profile-${field}`;
     return (
       <div className="sm:col-span-2">
