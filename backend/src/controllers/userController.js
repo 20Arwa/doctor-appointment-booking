@@ -41,7 +41,7 @@ async function createMe(_request, response, next) {
       });
     }
     const created = await client.query(
-      "INSERT INTO users (clerk_user_id, first_name, last_name, email, phone, role) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, first_name, last_name, email, phone, role, is_active, created_at, updated_at",
+      "INSERT INTO users (clerk_user_id, first_name, last_name, email, phone, role) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, first_name, last_name, email, phone, sms_consent, role, is_active, created_at, updated_at",
       [response.locals.clerkUserId, firstName, lastName, clerkProfile.email, clerkProfile.phone, body.role],
     );
     const user = created.rows[0];
@@ -60,14 +60,16 @@ async function createMe(_request, response, next) {
 }
 
 async function patchMe(request, response, next) {
-  const fields = response.locals.body;
+  const fields = { ...response.locals.body };
+  const phoneChanged = Object.hasOwn(fields, "phone") && fields.phone !== response.locals.user.phone;
+  if (phoneChanged) fields.sms_consent = false;
   const columns = Object.keys(fields);
   const values = columns.map((column) => fields[column]);
   const assignments = columns.map((column, index) => `${column} = $${index + 1}`);
   values.push(response.locals.user.id);
   try {
     const result = await response.locals.database.query(
-      `UPDATE users SET ${assignments.join(", ")}, updated_at = NOW() WHERE id = $${values.length} RETURNING id, first_name, last_name, email, phone, role, is_active, created_at, updated_at`,
+      `UPDATE users SET ${assignments.join(", ")}, updated_at = NOW() WHERE id = $${values.length} RETURNING id, first_name, last_name, email, phone, sms_consent, role, is_active, created_at, updated_at`,
       values,
     );
     return response.json(result.rows[0]);
