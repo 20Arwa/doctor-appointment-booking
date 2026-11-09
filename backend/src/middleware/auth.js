@@ -30,7 +30,7 @@ async function getClerkProfile(clerkUserId) {
 async function requireLocalUser(request, response, next) {
   try {
     const result = await response.locals.database.query(
-      "SELECT id, first_name, last_name, email, phone, role, is_active, created_at, updated_at FROM users WHERE clerk_user_id = $1",
+      "SELECT id, first_name, last_name, email, phone, sms_consent, role, is_active, created_at, updated_at FROM users WHERE clerk_user_id = $1",
       [response.locals.clerkUserId],
     );
     const user = result.rows[0];

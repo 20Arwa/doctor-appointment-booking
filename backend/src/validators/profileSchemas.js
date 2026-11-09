@@ -14,7 +14,7 @@ const onboardingSchema = z.object({
   }
 });
 
-const userPatchSchema = z.object({ first_name: name.optional(), last_name: name.optional(), phone }).strict()
+const userPatchSchema = z.object({ first_name: name.optional(), last_name: name.optional(), phone, sms_consent: z.boolean().optional() }).strict()
   .refine((body) => Object.keys(body).length > 0, "At least one permitted field is required");
 const patientUpdateSchema = z.object({
   date_of_birth: z.iso.date().nullable().optional(),
