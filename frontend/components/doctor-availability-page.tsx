@@ -37,7 +37,7 @@ function formatDate(date: string) {
 }
 
 function formatScheduleDate(date: string | null) {
-  return date ? formatDateOnly(date) : "Not set";
+  return date ? formatDate(date) : "Not set";
 }
 
 function groupByDate<T extends { date: string }>(items: T[]) {
