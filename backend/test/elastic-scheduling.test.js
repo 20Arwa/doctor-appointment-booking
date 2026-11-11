@@ -28,6 +28,38 @@ const window = (start_time, end_time) => ({ date, start_time, end_time });
 const weeklyInput = (periods) => ({ starts_on: date, ends_on: date, periods });
 
 describe("Elastic Scheduling", () => {
+  it("returns the stored committed result when a schedule update is retried", async () => {
+    const statements = [];
+    const storedResult = { schedule_id: "schedule-1", batch_id: "batch-1", added_count: 2 };
+    const client = { async query(sql) {
+      statements.push(sql);
+      if (sql === "BEGIN" || sql === "ROLLBACK") return { rows: [] };
+      if (sql.includes("FROM doctor_schedules") && sql.includes("FOR UPDATE")) return { rows: [{ id: "schedule-1", doctor_id: "doctor-1" }] };
+      if (sql.includes("FROM doctor_schedules") && sql.includes("updated_at")) return { rows: [
+        { id: "schedule-1", doctor_id: "doctor-1", mode: "wave", recurrence_type: "weekly", updated_at: "2026-10-01T00:00:00.000000Z" },
+      ] };
+      if (sql.includes("FROM doctor_schedule_periods")) return { rows: [] };
+      if (sql.includes("FROM assisted_reschedule_batches")) return { rows: [{
+        id: "batch-1", request_fingerprint: require("../src/services/assistedRescheduleService").scheduleRequestFingerprint(input), result: storedResult,
+      }] };
+      throw new Error(`Unexpected retry query: ${sql}`);
+    }, release() {} };
+    const input = { mode: "wave", expected_updated_at: "2026-10-01T00:00:00.000000Z", starts_on: date, ends_on: date, periods: [period("09:00", "10:00")] };
+    const response = {
+      locals: { user: { id: "user-1", role: "doctor" }, params: { id: "doctor-1", scheduleId: "schedule-1" }, body: input,
+        database: {
+          async query() { return { rows: [{ id: "doctor-1", appointment_duration_minutes: 30 }] }; },
+          async connect() { return client; },
+        } },
+      status(code) { this.statusCode = code; return this; },
+      json(value) { this.body = value; return value; },
+    };
+    await updateSchedule({}, response, (error) => { throw error; });
+    assert.deepEqual(response.body, { ...storedResult, idempotent: true });
+    assert.ok(statements.includes("ROLLBACK"));
+    assert.ok(!statements.includes("COMMIT"));
+  });
+
   it("rejects a weekly shrink affecting an appointment within six hours before writing schedule data", async () => {
     const appointment = {
       id: "appointment-protected", appointment_id: "appointment-protected", availability_id: "availability-retired",
@@ -303,6 +335,9 @@ describe("Elastic Scheduling", () => {
       statements.push({ sql, values });
       if (sql === "BEGIN" || sql === "ROLLBACK") return { rows: [] };
       if (sql === "COMMIT") { committed = true; return { rows: [] }; }
+      if (sql.includes("FROM assisted_reschedule_batches")) return { rows: [] };
+      if (sql.startsWith("INSERT INTO assisted_reschedule_batches")) return { rows: [{ id: "batch-1" }] };
+      if (sql.startsWith("UPDATE assisted_reschedule_batches SET result")) return { rows: [] };
       if (sql.includes("FROM doctor_schedules")) return { rows: [{ ...schedule }] };
       if (sql.includes("FROM doctor_schedule_periods existing_period")) return { rows: [] };
       if (sql.includes("FROM doctor_schedule_periods WHERE schedule_id")) return { rows: [] };
@@ -329,6 +364,7 @@ describe("Elastic Scheduling", () => {
       if (sql.startsWith("DELETE FROM doctor_schedule_periods")) return { rows: [] };
       if (sql.startsWith("INSERT INTO doctor_schedule_periods")) return { rows: [] };
       if (sql.startsWith("UPDATE doctor_schedules SET starts_on")) return { rows: [] };
+      if (sql.includes("FROM assisted_reschedule_requests request") && sql.includes("JOIN appointments appointment")) return { rows: [] };
       if (sql.startsWith("SELECT av.id FROM availability")) return { rows: [] };
       if (sql.startsWith("SELECT pg_advisory_xact_lock")) return { rows: [] };
       throw new Error(`Unexpected Stream update query: ${sql}`);
@@ -391,7 +427,7 @@ describe("Elastic Scheduling", () => {
   it("reports confirmed appointments, active holds, and allocations separately for removed availability", async () => {
     const retire = [{ id: "old-stream", date, start_time: "10:00:00", end_time: "14:00:00" }];
     const database = { async query(sql) {
-      if (sql.includes("FROM appointments a WHERE")) return { rows: [{ id: "appointment-1", availability_id: "old-stream", allocation_id: "allocation-1", status: "confirmed", date, start_time: "11:00:00", end_time: "14:00:00" }] };
+      if (sql.includes("FROM appointments a JOIN availability av")) return { rows: [{ id: "appointment-1", availability_id: "old-stream", allocation_id: "allocation-1", status: "confirmed", date, start_time: "11:00:00", end_time: "14:00:00", appointment_updated_at: "2026-11-01T00:00:00Z", doctor_id: "doctor-1", mode: "stream", patient_id: "patient-1" }] };
       if (sql.includes("FROM appointment_slot_holds h JOIN availability")) return { rows: [{ id: "hold-1", availability_id: "old-stream", date, start_time: "10:00:00", end_time: "14:00:00", expires_at: "2099-01-01T00:00:00Z" }] };
       if (sql.includes("FROM appointment_allocations allocation JOIN availability")) return { rows: [
         { id: "allocation-1", availability_id: "old-stream", status: "confirmed", expires_at: null, date, start_time: "10:00:00", end_time: "14:00:00" },
@@ -513,6 +549,12 @@ describe("Elastic Scheduling", () => {
     const valid = { mode: "wave", expected_updated_at: "2026-10-01T00:00:00.000Z", starts_on: date, ends_on: date, periods: [period("09:00", "10:00")] };
     assert.equal(elasticScheduleSchema.safeParse(valid).success, true);
     assert.equal(elasticScheduleSchema.safeParse({ ...valid, unexpected: true }).success, false);
+    const overlapping = elasticScheduleSchema.safeParse({ ...valid, periods: [
+      { weekday: 1, start_time: "09:00", end_time: "10:00" },
+      { weekday: 1, start_time: "09:30", end_time: "10:30" },
+    ] });
+    assert.equal(overlapping.success, false);
+    assert.equal(overlapping.error.issues[0].path[0], "periods");
     assert.equal(isStaleScheduleVersion("2026-10-02T00:00:00.000Z", valid.expected_updated_at), true);
     assert.equal(isStaleScheduleVersion(valid.expected_updated_at, valid.expected_updated_at), false);
   });
@@ -590,6 +632,10 @@ describe("Elastic Scheduling", () => {
           schedule.starts_on = values[1]; schedule.ends_on = values[2]; schedule.updated_at = "2026-10-02T00:00:00.000000Z";
           return { rows: [] };
         }
+      if (sql.includes("FROM assisted_reschedule_requests request") && sql.includes("JOIN appointments appointment")) return { rows: [] };
+      if (sql.includes("FROM assisted_reschedule_batches")) return { rows: [] };
+      if (sql.startsWith("INSERT INTO assisted_reschedule_batches")) return { rows: [{ id: "batch-1" }] };
+      if (sql.startsWith("UPDATE assisted_reschedule_batches SET result")) return { rows: [] };
         if (sql.startsWith("SELECT av.id FROM availability")) return { rows: [] };
         if (sql.startsWith("SELECT pg_advisory_xact_lock")) return { rows: [] };
         throw new Error(`Unexpected update query: ${sql}`);

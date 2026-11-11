@@ -2,6 +2,13 @@ const { localDateTime } = require("../utils/schedulingTime");
 const { eachDateInclusive } = require("../utils/dateOnly");
 const { findSchedulePeriodOverlaps } = require("../services/schedulePeriodConflictService");
 const { failForProtectedAppointments, findProtectedAppointmentsByIds } = require("../services/scheduleProtectionService");
+const {
+  createRequestsForAffectedAppointments,
+  findScheduleUpdateBatch,
+  scheduleRequestFingerprint,
+  appointmentCoveredBySchedule,
+  supersedeCoveredRequestsForScheduleChange,
+} = require("../services/assistedRescheduleService");
 
 function fail(response, status, code, message) {
   return response.status(status).json({ error: { code, message } });
@@ -235,26 +242,18 @@ function reconcileStreamCapacity(candidate, configuredCapacity, occupiedPlaces) 
   return { ...candidate, capacity: Math.max(configuredCapacity - occupiedPlaces, 0) };
 }
 
-function appointmentCoveredBySchedule(appointment, input, exceptions) {
-  const exception = exceptions.get(appointment.date);
-  if (exception?.exception_type === "day_off") return false;
-  const weekday = new Date(`${appointment.date}T00:00:00.000Z`).getUTCDay();
-  let periods = input.periods.filter((period) => period.weekday === weekday);
-  if (exception?.exception_type === "override") periods = exception.periods;
-  if (exception?.exception_type === "additional") periods = [...periods, ...exception.periods];
-  const appointmentStart = appointment.start_time.slice(0, 5);
-  const appointmentEnd = appointment.end_time.slice(0, 5);
-  return periods.some((period) => period.start_time <= appointmentStart && period.end_time >= appointmentEnd);
-}
-
 async function inspectRemovedReservations(database, retire, input, exceptions) {
   const ids = retire.map((row) => row.id);
   if (!ids.length) return { affectedAppointments: [], activePaymentHolds: [], activeAllocations: [] };
   const [appointments, holds, allocations] = await Promise.all([
     database.query(
-      `SELECT a.id, a.availability_id, a.allocation_id, a.status, a.scheduled_date::text AS date,
-              a.scheduled_start_time::text AS start_time, a.scheduled_end_time::text AS end_time
-       FROM appointments a WHERE a.availability_id = ANY($1::uuid[]) AND a.status = 'confirmed'
+      `SELECT a.id, a.availability_id, a.allocation_id, a.status,
+              a.updated_at::text AS appointment_updated_at,
+              a.scheduled_date::text AS date,
+              a.scheduled_start_time::text AS start_time, a.scheduled_end_time::text AS end_time,
+              av.doctor_id, av.mode, a.patient_id
+       FROM appointments a JOIN availability av ON av.id = a.availability_id
+       WHERE a.availability_id = ANY($1::uuid[]) AND a.status = 'confirmed'
        ORDER BY a.scheduled_date, a.scheduled_start_time`, [ids],
     ),
     database.query(
@@ -470,14 +469,14 @@ async function previewScheduleUpdate(_request, response, next) {
       resized_availability: diff.resized,
       blocked_availability: blocked,
       saved_schedule_period_conflicts: savedScheduleConflicts,
-      can_update: savedScheduleConflicts.length === 0 && activePaymentHolds.length === 0,
-      ...(activePaymentHolds.length ? { update_block_reason: "ACTIVE_PAYMENT_HOLD" } : {}),
       removed_availability: diff.affected,
       affected_appointments: affectedAppointments,
       active_payment_holds: activePaymentHolds,
       active_allocations: activeAllocations,
       unchanged_count: diff.kept,
       exceptions_preserved: true,
+      can_update: savedScheduleConflicts.length === 0 && activePaymentHolds.length === 0,
+      ...(activePaymentHolds.length ? { update_block_reason: "ACTIVE_PAYMENT_HOLD" } : {}),
     });
   } catch (error) { return next(error); }
 }
@@ -502,6 +501,16 @@ async function updateSchedule(_request, response, next) {
       await client.query("ROLLBACK");
       return fail(response, 409, "SCHEDULE_MODE_CONFLICT", "This endpoint updates an existing weekly schedule without changing its mode");
     }
+    const fingerprint = scheduleRequestFingerprint(input);
+    const previousBatch = await findScheduleUpdateBatch(client, scheduleId, input.expected_updated_at);
+    if (previousBatch) {
+      if (previousBatch.request_fingerprint !== fingerprint || !previousBatch.result) {
+        await client.query("ROLLBACK");
+        return fail(response, 409, "SCHEDULE_PREVIEW_STALE", "This schedule revision was already used for a different or incomplete update.");
+      }
+      await client.query("ROLLBACK");
+      return response.json({ ...previousBatch.result, idempotent: true });
+    }
     if (isStaleScheduleVersion(current.updated_at, input.expected_updated_at)) {
       await client.query("ROLLBACK");
       return fail(response, 409, "SCHEDULE_PREVIEW_STALE", "The saved schedule changed after preview. Refresh and preview again.");
@@ -522,13 +531,20 @@ async function updateSchedule(_request, response, next) {
     if (loaded.error) { await client.query("ROLLBACK"); return fail(response, 409, "SCHEDULE_PREVIEW_STALE", "The saved schedule could not be reloaded; preview the change again."); }
     const { schedule, doctor, desired, diff, savedScheduleConflicts, blocked, additions } = loaded;
     const protectedAppointments = await findProtectedAppointmentsByIds(
-      client, loaded.affectedAppointments.map((appointment) => appointment.id),
+      client,
+      loaded.affectedAppointments.map((appointment) => appointment.id),
       response.locals.applicationTimezone || "Asia/Kolkata",
     );
-    if (failForProtectedAppointments(response, protectedAppointments)) { await client.query("ROLLBACK"); return; }
+    if (failForProtectedAppointments(response, protectedAppointments)) {
+      await client.query("ROLLBACK");
+      return;
+    }
     if (loaded.activePaymentHolds.length) {
       await client.query("ROLLBACK");
-      return response.status(409).json({ error: { code: "ACTIVE_PAYMENT_HOLD", message: "An active payment hold uses availability that this update would retire. Wait for payment to finish or expire, then preview the schedule again." }, active_payment_holds: loaded.activePaymentHolds });
+      return response.status(409).json({
+        error: { code: "ACTIVE_PAYMENT_HOLD", message: "An active payment hold uses availability that this update would retire. Wait for payment to finish or expire, then preview the schedule again." },
+        active_payment_holds: loaded.activePaymentHolds,
+      });
     }
     if (savedScheduleConflicts.length) {
       await client.query("ROLLBACK");
@@ -537,6 +553,13 @@ async function updateSchedule(_request, response, next) {
         conflicts: savedScheduleConflicts,
       });
     }
+
+    const batchResult = await client.query(
+      `INSERT INTO assisted_reschedule_batches (schedule_id, source_schedule_updated_at, request_fingerprint)
+       VALUES ($1,$2::timestamptz,$3) RETURNING id`,
+      [scheduleId, input.expected_updated_at, fingerprint],
+    );
+    const batchId = batchResult.rows[0].id;
 
     for (const row of diff.retire) {
       await client.query("UPDATE availability SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL", [row.id]);
@@ -581,9 +604,19 @@ async function updateSchedule(_request, response, next) {
       `UPDATE doctor_schedules SET starts_on = $2::date, ends_on = $3::date, updated_at = NOW()
        WHERE id = $1`, [scheduleId, input.starts_on, input.ends_on],
     );
-    await client.query("COMMIT");
-    return response.json({
+    await supersedeCoveredRequestsForScheduleChange(client, {
+      scheduleId,
+      input,
+      exceptions: loaded.exceptions,
+    });
+    const assistedRequests = await createRequestsForAffectedAppointments(client, {
+      batchId,
+      affectedAppointments: loaded.affectedAppointments,
+      timeZone: response.locals.applicationTimezone || "Asia/Kolkata",
+    });
+    const result = {
       schedule_id: scheduleId,
+      batch_id: batchId,
       generated,
       added_count: generated.length,
       resized_count: diff.resized.length,
@@ -593,7 +626,11 @@ async function updateSchedule(_request, response, next) {
       blocked_availability: blocked,
       wave_appointment_duration_minutes: schedule.mode === "wave" ? doctor.appointment_duration_minutes : null,
       exceptions_preserved: true,
-    });
+      assisted_reschedule_requests: assistedRequests,
+    };
+    await client.query("UPDATE assisted_reschedule_batches SET result = $2::jsonb WHERE id = $1", [batchId, JSON.stringify(result)]);
+    await client.query("COMMIT");
+    return response.json(result);
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     if (error.code === "23P01" || error.code === "23505") return fail(response, 409, "SCHEDULE_CONFLICT", "The updated schedule overlaps existing availability");

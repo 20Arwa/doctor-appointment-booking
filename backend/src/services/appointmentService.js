@@ -70,7 +70,7 @@ async function requireOwnDoctorId(database, user) {
 
 async function lockBookableSlot(client, availabilityId, now, { allowDeleted = false } = {}) {
   const result = await client.query(
-    `SELECT av.id, av.doctor_id, av.deleted_at, av.date::text AS date,
+    `SELECT av.id, av.doctor_id, av.deleted_at, av.booking_visibility, av.date::text AS date,
             av.start_time::text AS start_time, av.end_time::text AS end_time,
             av.mode, av.capacity
      FROM availability av
@@ -136,6 +136,45 @@ async function countOccupiedPlaces(client, availabilityId, { excludedAppointment
   return Number(result.rows[0]?.occupied || 0);
 }
 
+async function countOccupiedPlacesForSlots(client, availabilityIds) {
+  const ids = [...new Set(availabilityIds)];
+  if (!ids.length) return new Map();
+  const result = await client.query(
+    `SELECT reservation.availability_id,
+            COUNT(DISTINCT reservation.patient_id)::int AS occupied
+     FROM (
+       SELECT allocation.availability_id, allocation.patient_id
+       FROM appointment_allocations allocation
+       WHERE allocation.availability_id = ANY($1::uuid[])
+         AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
+           OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
+             WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+             (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
+       UNION
+       SELECT appointment.availability_id, appointment.patient_id
+       FROM appointments appointment
+       WHERE appointment.availability_id = ANY($1::uuid[]) AND appointment.status = 'confirmed'
+         AND NOT EXISTS (
+           SELECT 1 FROM appointment_allocations allocation
+           WHERE allocation.id = appointment.allocation_id
+             AND allocation.availability_id = appointment.availability_id
+             AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
+               OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
+                 WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                 (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
+         )
+       UNION
+       SELECT hold.availability_id, hold.patient_id
+       FROM appointment_slot_holds hold
+       WHERE hold.availability_id = ANY($1::uuid[])
+         AND hold.status = 'active' AND hold.expires_at > NOW()
+     ) reservation
+     GROUP BY reservation.availability_id`,
+    [ids],
+  );
+  return new Map(result.rows.map((row) => [row.availability_id, Number(row.occupied)]));
+}
+
 async function ensureNoActivePaymentHold(client, doctorId, date, startTime, endTime, excludedHoldId = null) {
   const held = await client.query(
     `SELECT 1 FROM appointment_slot_holds h
@@ -189,12 +228,27 @@ async function createPaymentAppointment(client, { availabilityId, patientId, rea
      VALUES ($1, $2, $3, 'confirmed', $4, $5::date, $6::time, $7::time, $8::numeric) RETURNING id`,
     [patientId, availabilityId, allocation.rows[0].id, reason, slot.date, slot.start_time, slot.end_time, consultationFee],
   );
-  return readDetails(client, created.rows[0].id);
+  const appointment = await readDetails(client, created.rows[0].id);
+  return appointment;
 }
 
 async function readDetails(client, appointmentId) {
   const result = await client.query(`${APPOINTMENT_DETAILS} WHERE a.id = $1`, [appointmentId]);
   return result.rows[0];
+}
+
+async function readAcceptedAssistedAppointment(client, appointmentId, suggestion, { requestId, suggestionId }) {
+  const appointment = await readDetails(client, appointmentId);
+  const matchesSuggestion = appointment
+    && appointment.availability_id === suggestion.availability_id
+    && appointment.mode === suggestion.mode
+    && appointment.date === suggestion.date
+    && appointment.start_time?.slice(0, 8) === suggestion.start_time?.slice(0, 8)
+    && appointment.end_time?.slice(0, 8) === suggestion.end_time?.slice(0, 8);
+  if (!matchesSuggestion) {
+    fail(409, "ASSISTED_RESCHEDULE_ACCEPTED_STATE_CONFLICT", "This request is marked accepted, but the appointment does not match its confirmed suggestion. Contact support before trying again.");
+  }
+  return appointment;
 }
 
 async function listAppointments(database, user, filters, timeZone = "Asia/Kolkata") {
@@ -352,7 +406,9 @@ async function cancelAppointment(database, user, appointmentId) {
       [appointmentId],
     );
     await client.query("UPDATE appointment_allocations SET status = 'released', updated_at = NOW() WHERE id = (SELECT allocation_id FROM appointments WHERE id = $1) AND status = 'confirmed'", [appointmentId]);
-    return readDetails(client, appointmentId);
+    await supersedeOpenAssistedRescheduleRequests(client, appointmentId);
+    const appointment = await readDetails(client, appointmentId);
+    return appointment;
   });
 }
 
@@ -410,9 +466,222 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
        VALUES ($1,$2,$3,$4,$5,$6::date,$7::time,$8::time,$9,$10,$11::date,$12::time,$13::time)`,
       [appointmentId, original.patient_id, user.id, original.allocation_id, original.availability_id, previousAppointment.date, previousAppointment.start_time, previousAppointment.end_time, newAllocation.rows[0].id, newAvailabilityId, slot.date, slot.start_time, slot.end_time],
     );
+    await supersedeOpenAssistedRescheduleRequests(client, appointmentId);
     const appointment = await readDetails(client, created.rows[0].id);
-    return { ...appointment, previous_date: previousAppointment.date, previous_start_time: previousAppointment.start_time };
+    const result = { ...appointment, previous_date: previousAppointment.date, previous_start_time: previousAppointment.start_time };
+    return result;
   });
+}
+
+async function supersedeOpenAssistedRescheduleRequests(client, appointmentId, exceptRequestId = null) {
+  await client.query(
+    `UPDATE assisted_reschedule_requests
+     SET status = 'superseded',
+         notification_status = CASE WHEN notification_status IN ('pending', 'processing', 'failed') THEN 'not_required' ELSE notification_status END,
+         notification_next_attempt_at = NULL, notification_lease_token = NULL, notification_lease_expires_at = NULL,
+         updated_at = NOW(), responded_at = COALESCE(responded_at, NOW())
+     WHERE appointment_id = $1 AND status IN ('pending_patient', 'no_alternatives')
+       AND ($2::uuid IS NULL OR id <> $2::uuid)`,
+    [appointmentId, exceptRequestId],
+  );
+}
+
+async function expireAssistedRescheduleRequest(client, requestId) {
+  await client.query(
+    `UPDATE assisted_reschedule_requests
+     SET status = 'expired',
+         notification_status = CASE WHEN notification_status IN ('pending', 'processing', 'failed') THEN 'not_required' ELSE notification_status END,
+         notification_next_attempt_at = NULL, notification_lease_token = NULL, notification_lease_expires_at = NULL,
+         updated_at = NOW(), responded_at = COALESCE(responded_at, NOW())
+     WHERE id = $1 AND status IN ('pending_patient', 'no_alternatives')
+       AND expires_at <= clock_timestamp()`, [requestId],
+  );
+}
+
+async function getOwnedAssistedRequest(client, requestId, patientUserId, lock = false) {
+  const result = await client.query(
+    `SELECT request.id, request.appointment_id, request.doctor_id, request.patient_id,
+            request.source_availability_id, request.appointment_updated_at,
+            request.mode, request.status, request.selected_availability_id,
+            request.expires_at, request.expires_at <= clock_timestamp() AS request_expired,
+            appointment.status AS appointment_status, appointment.availability_id AS current_availability_id,
+            appointment.allocation_id AS current_allocation_id, appointment.patient_id AS current_patient_id,
+            appointment.reason, appointment.consultation_fee,
+            appointment.scheduled_date::text AS current_date,
+            appointment.scheduled_start_time::text AS current_start_time,
+            appointment.scheduled_end_time::text AS current_end_time,
+            current_av.mode AS current_mode, current_av.doctor_id AS current_doctor_id,
+            (appointment.updated_at = request.appointment_updated_at) AS snapshot_matches
+     FROM assisted_reschedule_requests request
+     JOIN appointments appointment ON appointment.id = request.appointment_id
+     JOIN availability current_av ON current_av.id = appointment.availability_id
+     JOIN patients patient ON patient.id = request.patient_id
+     WHERE request.id = $1 AND patient.user_id = $2
+     ${lock ? "FOR UPDATE OF request, appointment" : ""}`,
+    [requestId, patientUserId],
+  );
+  return result.rows[0];
+}
+
+function failForClosedAssistedRequest(request) {
+  if (request.status === "declined") {
+    fail(409, "ASSISTED_RESCHEDULE_REQUEST_DECLINED", "You declined this assisted rescheduling request");
+  }
+  if (request.status === "superseded") {
+    fail(409, "ASSISTED_RESCHEDULE_REQUEST_SUPERSEDED", "This request was replaced by a newer schedule change");
+  }
+  if (request.status === "expired" && request.request_expired === true) {
+    fail(409, "ASSISTED_RESCHEDULE_REQUEST_EXPIRED", "This assisted rescheduling request has expired");
+  }
+  fail(409, "ASSISTED_RESCHEDULE_REQUEST_CLOSED", "This assisted rescheduling request is no longer open");
+}
+
+async function confirmAssistedReschedule(database, user, timeZone, requestId, suggestionId) {
+  if (user.role !== "patient") fail(403, "FORBIDDEN", "Only the owning patient may confirm assisted rescheduling");
+  const now = timeContext(timeZone);
+  const result = await withTransaction(database, async (client) => {
+    const initial = await getOwnedAssistedRequest(client, requestId, user.id);
+    if (!initial) fail(404, "ASSISTED_RESCHEDULE_REQUEST_NOT_FOUND", "Assisted rescheduling request not found");
+    const suggestionResult = await client.query(
+      `SELECT suggestion.id, suggestion.availability_id, suggestion.mode,
+              suggestion.service_date::text AS date, suggestion.start_time::text AS start_time,
+              suggestion.end_time::text AS end_time
+       FROM assisted_reschedule_suggestions suggestion
+       WHERE suggestion.id = $1 AND suggestion.request_id = $2`,
+      [suggestionId, requestId],
+    );
+    const suggestion = suggestionResult.rows[0];
+    if (!suggestion) fail(404, "ASSISTED_RESCHEDULE_SUGGESTION_NOT_FOUND", "Suggested alternative not found for this request");
+    if (initial.status === "accepted") {
+      if (initial.selected_availability_id !== suggestion.availability_id) {
+        fail(409, "ASSISTED_RESCHEDULE_ALREADY_ACCEPTED", "A different alternative has already been confirmed");
+      }
+      return readAcceptedAssistedAppointment(client, initial.appointment_id, suggestion, { requestId, suggestionId });
+    }
+    if (initial.status !== "pending_patient") {
+      failForClosedAssistedRequest(initial);
+    }
+    await lockAvailabilityRowsAndDoctors(client, [initial.current_availability_id, suggestion.availability_id]);
+    const request = await getOwnedAssistedRequest(client, requestId, user.id, true);
+    if (!request) fail(404, "ASSISTED_RESCHEDULE_REQUEST_NOT_FOUND", "Assisted rescheduling request not found");
+    if (request.status === "accepted") {
+      if (request.selected_availability_id !== suggestion.availability_id) fail(409, "ASSISTED_RESCHEDULE_ALREADY_ACCEPTED", "A different alternative has already been confirmed");
+      return readAcceptedAssistedAppointment(client, request.appointment_id, suggestion, { requestId, suggestionId });
+    }
+    if (request.status !== "pending_patient") {
+      failForClosedAssistedRequest(request);
+    }
+    if (request.request_expired === true) {
+      await expireAssistedRescheduleRequest(client, requestId);
+      return { assistedRequestExpired: true };
+    }
+    if (request.appointment_status !== "confirmed" || !request.snapshot_matches
+        || request.current_availability_id !== initial.current_availability_id
+        || request.current_patient_id !== request.patient_id
+        || request.current_doctor_id !== request.doctor_id || request.current_mode !== request.mode) {
+      fail(409, "ASSISTED_RESCHEDULE_REQUEST_STALE", "The appointment changed after this alternative was suggested");
+    }
+    if (request.current_availability_id === suggestion.availability_id) fail(409, "SLOT_UNAVAILABLE", "Choose a different availability option");
+    const slot = await lockBookableSlot(client, suggestion.availability_id, now);
+    if (slot.doctor_id !== request.doctor_id || slot.mode !== request.mode || suggestion.mode !== request.mode
+        || slot.booking_visibility !== "public" || slot.date !== suggestion.date
+        || slot.start_time.slice(0, 5) !== suggestion.start_time.slice(0, 5)
+        || slot.end_time.slice(0, 5) !== suggestion.end_time.slice(0, 5)) {
+      fail(409, "SLOT_UNAVAILABLE", "The suggested availability has changed and is no longer bookable");
+    }
+    if (!slotStartsInFuture(slot, now)) fail(409, "SLOT_UNAVAILABLE", "The suggested appointment time has passed");
+    if (!request.current_allocation_id) fail(409, "APPOINTMENT_ALLOCATION_MISSING", "The appointment allocation is no longer available for rescheduling");
+    const occupied = await countOccupiedPlaces(client, slot.id);
+    if (occupied >= Number(slot.capacity || 1)) fail(409, "SLOT_CAPACITY_REACHED", "The selected availability option has reached its booking capacity");
+    const accepted = await client.query(
+      `UPDATE assisted_reschedule_requests
+       SET status = 'accepted', selected_availability_id = $2,
+           notification_status = CASE WHEN notification_status IN ('pending', 'processing', 'failed') THEN 'not_required' ELSE notification_status END,
+           notification_next_attempt_at = NULL, notification_lease_token = NULL, notification_lease_expires_at = NULL,
+           updated_at = NOW(), responded_at = NOW()
+       WHERE id = $1 AND status = 'pending_patient' AND expires_at > clock_timestamp()
+       RETURNING id`, [requestId, slot.id],
+    );
+    if (!accepted.rows[0]) {
+      const latestResult = await client.query(
+        `SELECT status, selected_availability_id, expires_at <= clock_timestamp() AS request_expired
+         FROM assisted_reschedule_requests WHERE id = $1 FOR UPDATE`, [requestId],
+      );
+      const latest = latestResult.rows[0];
+      if (!latest) fail(404, "ASSISTED_RESCHEDULE_REQUEST_NOT_FOUND", "Assisted rescheduling request not found");
+      if (latest.status === "pending_patient" && latest.request_expired === true) {
+        await expireAssistedRescheduleRequest(client, requestId);
+        return { assistedRequestExpired: true };
+      }
+      if (latest.status === "accepted") {
+        if (latest.selected_availability_id === suggestion.availability_id) {
+          return readAcceptedAssistedAppointment(client, request.appointment_id, suggestion, { requestId, suggestionId });
+        }
+        fail(409, "ASSISTED_RESCHEDULE_ALREADY_ACCEPTED", "A different alternative has already been confirmed");
+      }
+      if (latest.status !== "pending_patient") failForClosedAssistedRequest(latest);
+      fail(409, "ASSISTED_RESCHEDULE_REQUEST_CONFLICT", "The request changed while confirming. Reload it and try again.");
+    }
+    const allocation = await client.query(
+      `INSERT INTO appointment_allocations (availability_id, mode, patient_id, status)
+       VALUES ($1,$2,$3,'confirmed') RETURNING id`, [slot.id, request.mode, request.patient_id],
+    );
+    const updated = await client.query(
+      `UPDATE appointments SET availability_id = $2, allocation_id = $3,
+       scheduled_date = $4::date, scheduled_start_time = $5::time, scheduled_end_time = $6::time,
+       updated_at = NOW() WHERE id = $1 AND status = 'confirmed' RETURNING id`,
+      [request.appointment_id, slot.id, allocation.rows[0].id, slot.date, slot.start_time, slot.end_time],
+    );
+    if (!updated.rows[0]) fail(409, "APPOINTMENT_STATE_CONFLICT", "Only confirmed appointments can be rescheduled");
+    await client.query(
+      "UPDATE appointment_allocations SET status = 'released', updated_at = NOW() WHERE id = $1 AND status = 'confirmed'",
+      [request.current_allocation_id],
+    );
+    await client.query(
+      `INSERT INTO appointment_reschedule_history (appointment_id, patient_id, changed_by_user_id,
+        previous_allocation_id, previous_availability_id, previous_date, previous_start_time, previous_end_time,
+        new_allocation_id, new_availability_id, new_date, new_start_time, new_end_time)
+       VALUES ($1,$2,$3,$4,$5,$6::date,$7::time,$8::time,$9,$10,$11::date,$12::time,$13::time)`,
+      [request.appointment_id, request.patient_id, user.id, request.current_allocation_id,
+        request.current_availability_id, request.current_date, request.current_start_time, request.current_end_time,
+        allocation.rows[0].id, slot.id, slot.date, slot.start_time, slot.end_time],
+    );
+    await supersedeOpenAssistedRescheduleRequests(client, request.appointment_id, requestId);
+    return readDetails(client, request.appointment_id);
+  });
+  if (result?.assistedRequestExpired) fail(409, "ASSISTED_RESCHEDULE_REQUEST_EXPIRED", "This assisted rescheduling request has expired");
+  return result;
+}
+
+async function declineAssistedReschedule(database, user, requestId) {
+  if (user.role !== "patient") fail(403, "FORBIDDEN", "Only the owning patient may decline assisted rescheduling");
+  const result = await withTransaction(database, async (client) => {
+    const initial = await getOwnedAssistedRequest(client, requestId, user.id);
+    if (!initial) fail(404, "ASSISTED_RESCHEDULE_REQUEST_NOT_FOUND", "Assisted rescheduling request not found");
+    await lockAvailabilityRowsAndDoctors(client, [initial.current_availability_id]);
+    const request = await getOwnedAssistedRequest(client, requestId, user.id, true);
+    if (!request) fail(404, "ASSISTED_RESCHEDULE_REQUEST_NOT_FOUND", "Assisted rescheduling request not found");
+    if (request.status === "declined") return { request_id: requestId, status: "declined", idempotent: true };
+    if (request.status !== "pending_patient") fail(409, "ASSISTED_RESCHEDULE_REQUEST_CLOSED", "This assisted rescheduling request is no longer open");
+    if (request.request_expired === true) {
+      await expireAssistedRescheduleRequest(client, requestId);
+      return { assistedRequestExpired: true };
+    }
+    if (request.appointment_status !== "confirmed" || !request.snapshot_matches) {
+      fail(409, "ASSISTED_RESCHEDULE_REQUEST_STALE", "The appointment changed after this request was created");
+    }
+    const result = await client.query(
+      `UPDATE assisted_reschedule_requests SET status = 'declined',
+       notification_status = CASE WHEN notification_status IN ('pending', 'processing', 'failed') THEN 'not_required' ELSE notification_status END,
+       notification_next_attempt_at = NULL, notification_lease_token = NULL, notification_lease_expires_at = NULL,
+       updated_at = NOW(), responded_at = NOW()
+       WHERE id = $1 AND status = 'pending_patient' AND expires_at > clock_timestamp() RETURNING id`, [requestId],
+    );
+    if (!result.rows[0]) fail(409, "ASSISTED_RESCHEDULE_REQUEST_EXPIRED", "This assisted rescheduling request expired before it could be declined");
+    return { request_id: requestId, status: "declined" };
+  });
+  if (result?.assistedRequestExpired) fail(409, "ASSISTED_RESCHEDULE_REQUEST_EXPIRED", "This assisted rescheduling request has expired");
+  return result;
 }
 
 async function doctorRescheduleAppointment(database, user, timeZone, appointmentId, input) {
@@ -496,19 +765,26 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
        VALUES ($1,$2,$3,$4,$5,$6::date,$7::time,$8::time,$9,$10,$11::date,$12::time,$13::time)`,
       [appointmentId, original.patient_id, user.id, original.allocation_id, original.availability_id, original.date, original.start_time, original.end_time, allocationId, availabilityId, targetDate, targetStart, targetEnd],
     );
+    await supersedeOpenAssistedRescheduleRequests(client, appointmentId);
     const appointment = await readDetails(client, updated.rows[0].id);
-    return {
+    const result = {
       ...appointment,
       previous_date: original.date,
       previous_start_time: original.start_time,
       reschedule_version: updated.rows[0].reschedule_version,
     };
+    return result;
   });
 }
 
 async function completeAppointment(database, user, appointmentId) {
   const doctorId = await requireOwnDoctorId(database, user);
   return withTransaction(database, async (client) => {
+    await client.query(
+      `SELECT id FROM assisted_reschedule_requests
+       WHERE appointment_id = $1 AND status IN ('pending_patient', 'no_alternatives')
+       FOR UPDATE`, [appointmentId],
+    );
     const owned = await client.query(
       `SELECT a.id, a.status
        FROM appointments a
@@ -520,6 +796,7 @@ async function completeAppointment(database, user, appointmentId) {
     if (!owned.rows[0]) fail(404, "APPOINTMENT_NOT_FOUND", "Appointment not found");
     if (owned.rows[0].status !== "confirmed") fail(409, "APPOINTMENT_STATE_CONFLICT", "Only confirmed appointments can be completed");
     await client.query("UPDATE appointments SET status = 'completed', updated_at = NOW() WHERE id = $1", [appointmentId]);
+    await supersedeOpenAssistedRescheduleRequests(client, appointmentId);
     return readDetails(client, appointmentId);
   });
 }
@@ -527,7 +804,10 @@ async function completeAppointment(database, user, appointmentId) {
 module.exports = {
   AppointmentError,
   countOccupiedPlaces,
+  countOccupiedPlacesForSlots,
   cancelAppointment,
+  confirmAssistedReschedule,
+  declineAssistedReschedule,
   completeAppointment,
   createPaymentAppointment,
   doctorRescheduleAppointment,
