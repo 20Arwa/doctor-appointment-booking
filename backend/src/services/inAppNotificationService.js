@@ -45,6 +45,29 @@ function createInAppNotificationService({ database, logger = console }) {
     catch (_error) { logger.error("In-App appointment reminder failed", { reminderType, reason: "storage_error" }); }
   }
 
+  async function sendAssistedRescheduleRequested({ eventKey, appointment, recipientUserId, requestId }) {
+    if (!recipientUserId) throw new Error("Assisted rescheduling notification recipient is missing");
+    const eventType = "appointment.assisted_reschedule_requested";
+    const title = "Choose a new appointment time";
+    const doctor = `Dr. ${[appointment.doctor_first_name, appointment.doctor_last_name].filter(Boolean).join(" ")}`;
+    const message = `Your appointment with ${doctor} is affected by a schedule change. Review the suggested alternatives, then choose and confirm a new time. It will not change until you confirm it.`;
+    const result = await database.query(
+      `INSERT INTO in_app_notifications (recipient_user_id, appointment_id, event_key, event_type, title, message)
+       SELECT $1, $2, $3, $4, $5, $6
+       WHERE EXISTS (
+         SELECT 1 FROM assisted_reschedule_requests request
+         JOIN appointments appointment ON appointment.id = request.appointment_id
+         JOIN patients patient ON patient.id = request.patient_id
+         WHERE request.id = $7 AND request.appointment_id = $2 AND patient.user_id = $1
+           AND request.status = 'pending_patient' AND appointment.status = 'confirmed'
+           AND request.expires_at > NOW() AND appointment.updated_at = request.appointment_updated_at
+       )
+       ON CONFLICT (recipient_user_id, event_key) DO NOTHING RETURNING id`,
+      [recipientUserId, appointment.id, eventKey, eventType, title, message, requestId],
+    );
+    return { created: Boolean(result.rows[0]), skipped: !result.rows[0] };
+  }
+
   async function list(userId, { limit, offset }) {
     const [result, counts] = await Promise.all([database.query(
       `SELECT id, appointment_id, event_type, title, message, created_at, read_at
@@ -67,7 +90,7 @@ function createInAppNotificationService({ database, logger = console }) {
     return { updated: result.rowCount || 0 };
   }
 
-  return { sendAppointmentNotification, sendReminder, list, markRead, markAllRead };
+  return { sendAppointmentNotification, sendReminder, sendAssistedRescheduleRequested, list, markRead, markAllRead };
 }
 
 module.exports = { createInAppNotificationService };

@@ -52,6 +52,15 @@ function reminderEmail(reminderType, appointment) {
   return { subject: "Appointment reminder", textContent: `${message}\nDoctor: ${doctor}\nDate: ${appointment.date}\nTime: ${formatTime(appointment.start_time)}`, htmlContent };
 }
 
+function assistedRescheduleEmail(appointment, appointmentUrl) {
+  const doctor = `Dr. ${[appointment.doctor_first_name, appointment.doctor_last_name].filter(Boolean).join(" ")}`;
+  const when = `${appointment.previous_date} at ${formatTime(appointment.previous_start_time)}`;
+  const message = `Your appointment with ${doctor} at ${when} is affected by a schedule change. Suggested alternatives are available. Choose and confirm a new time; it will not change until you confirm it.`;
+  const safeUrl = escapeHtml(appointmentUrl);
+  const htmlContent = `<!doctype html><html><body style="margin:0;background:#f7f3f6;font-family:Arial,sans-serif;color:#30252D"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 12px"><tr><td align="center"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#fff;border-radius:12px"><tr><td style="background:#67465F;padding:22px 26px;color:#fff;font-size:20px;font-weight:700">Medrella</td></tr><tr><td style="padding:26px"><h1 style="margin:0 0 12px;font-size:22px">Choose a new appointment time</h1><p style="margin:0 0 18px;line-height:1.5;color:#51454F">${escapeHtml(message)}</p><p style="margin:0 0 18px"><a href="${safeUrl}" style="display:inline-block;background:#67465F;color:#fff;text-decoration:none;padding:12px 18px;border-radius:7px;font-weight:700">Review suggested times</a></p><p style="margin:0;color:#51454F;font-size:13px">If the button does not work, open: <a href="${safeUrl}">${safeUrl}</a></p></td></tr></table></td></tr></table></body></html>`;
+  return { subject: "Choose a new appointment time", textContent: `${message}\nChoose and confirm a suggested time here: ${appointmentUrl}`, htmlContent };
+}
+
 function isTransientNetworkError(error) {
   return error?.name === "AbortError" || error?.name === "TimeoutError" || error instanceof TypeError;
 }
@@ -154,10 +163,17 @@ function createEmailNotificationService({
         },
       };
     },
+    createAssistedReschedulePayload(appointment, appointmentUrl) {
+      return {
+        to: appointment.patient_email || null,
+        ...assistedRescheduleEmail(appointment, appointmentUrl),
+        sender: { email: configuredValue(config.BREVO_SENDER_EMAIL), name: configuredValue(config.BREVO_SENDER_NAME) },
+      };
+    },
     async sendNotificationPayload(payload, idempotencyKey, options = {}) {
       return sendEmail({ ...payload, idempotencyKey, maxAttemptsOverride: options.maxAttempts });
     },
   };
 }
 
-module.exports = { createEmailNotificationService };
+module.exports = { assistedRescheduleEmail, createEmailNotificationService };

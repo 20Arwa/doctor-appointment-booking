@@ -23,14 +23,25 @@ import {
   cancelAppointment,
   getAppointment,
   getAppointmentCancellationRefundPreview,
+  getPatientAssistedRequest,
   getDoctorSlots,
+  confirmPatientAssistedReschedule,
+  declinePatientAssistedReschedule,
   ProfileApiError,
   rescheduleAppointment,
   type AvailabilitySlot,
+  type AssistedPatientRequest,
   type PatientAppointment,
 } from "@/lib/profile-api";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
+
+class AssistedRescheduleResponseMismatchError extends Error {
+  constructor() {
+    super("The server returned an appointment that does not match the selected suggestion. Reload its status or contact support before trying again.");
+    this.name = "AssistedRescheduleResponseMismatchError";
+  }
+}
 
 function appointmentInstant(appointment: Pick<PatientAppointment, "date" | "start_time">) {
   const instant = new Date(`${appointment.date}T${appointment.start_time}+05:30`);
@@ -91,6 +102,7 @@ export function PatientAppointmentsPage() {
   const requestedNotificationAppointment = useRef<string | null>(null);
   const notificationRequestInFlight = useRef<{ appointmentId: string } | null>(null);
   const pendingNotificationScroll = useRef<string | null>(null);
+  const assistedSectionRef = useRef<HTMLElement | null>(null);
   const [notificationFocusId, setNotificationFocusId] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState<number | null>(null);
   const [activeRequest, setActiveRequest] = useState<string | null>(null);
@@ -106,12 +118,22 @@ export function PatientAppointmentsPage() {
   const [refundPreview, setRefundPreview] = useState<Awaited<ReturnType<typeof getAppointmentCancellationRefundPreview>> | null>(null);
   const [refundPreviewLoading, setRefundPreviewLoading] = useState(false);
   const [refundPreviewError, setRefundPreviewError] = useState<string | null>(null);
+  const [assistedRequest, setAssistedRequest] = useState<AssistedPatientRequest | null>(null);
+  const [assistedSlots, setAssistedSlots] = useState<AvailabilitySlot[]>([]);
+  const [assistedLoading, setAssistedLoading] = useState(false);
+  const [assistedError, setAssistedError] = useState<string | null>(null);
+  const [selectedAssistedSuggestion, setSelectedAssistedSuggestion] = useState<string>("");
+  const [assistedDialog, setAssistedDialog] = useState<"confirm" | "decline" | null>(null);
+  const [assistedTargetAppointmentId, setAssistedTargetAppointmentId] = useState<string | null>(null);
+  const [assistedReload, setAssistedReload] = useState(0);
+  const [assistedStale, setAssistedStale] = useState(false);
 
   const [previousPathname, setPreviousPathname] = useState(pathname);
   if (previousPathname !== pathname) {
     setPreviousPathname(pathname);
     setCancelTarget(null);
   }
+  const assistedTargetAppointment = appointments.find((appointment) => appointment.id === assistedTargetAppointmentId) ?? null;
 
   useEffect(() => {
     const initialTime = window.setTimeout(() => setCurrentTime(Date.now()), 0);
@@ -136,6 +158,8 @@ export function PatientAppointmentsPage() {
         if (!token) throw new Error("Your session could not be verified. Please sign in again.");
         const appointment = await getAppointment(token, appointmentFromNotification);
         if (!active) return;
+        setAssistedLoading(true);
+        setAssistedTargetAppointmentId(appointment.id);
         requestedNotificationAppointment.current = appointmentFromNotification;
         pendingNotificationScroll.current = appointment.id;
         setAppointments((current) => current.some((item) => item.id === appointment.id)
@@ -153,18 +177,72 @@ export function PatientAppointmentsPage() {
   }, [appointmentFromNotification, getToken, loading, setAppointments]);
 
   useEffect(() => {
+    if (!assistedTargetAppointmentId) return;
+    let active = true;
+    const timer = window.setTimeout(() => {
+      setAssistedLoading(true);
+      setAssistedError(null);
+      void (async () => {
+        try {
+          const token = await getToken();
+          if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+          const request = await getPatientAssistedRequest(token, assistedTargetAppointmentId);
+          if (!active) return;
+          setAssistedRequest(request);
+          setAssistedSlots([]);
+          setSelectedAssistedSuggestion("");
+          setAssistedStale(request.status === "pending_patient" && request.appointment_status !== "confirmed");
+          if (request.status === "pending_patient" && request.appointment_status === "confirmed" && assistedTargetAppointment) {
+            const dates = request.suggestions.map((suggestion) => suggestion.date).sort();
+            if (dates.length) {
+              const live = await getDoctorSlots(token, assistedTargetAppointment.doctor_id, dates[0], dates[dates.length - 1]);
+              if (!active) return;
+              setAssistedSlots(live.filter((slot) => !slot.reservation_only && (slot.remaining_capacity ?? 0) > 0
+                && request.suggestions.some((suggestion) => suggestion.availability_id === slot.id
+                  && suggestion.mode === slot.mode && suggestion.date === slot.date
+                  && suggestion.start_time.slice(0, 8) === slot.start_time.slice(0, 8)
+                  && suggestion.end_time.slice(0, 8) === slot.end_time.slice(0, 8))));
+              setRescheduleDate(dates[0]);
+              setRescheduleMonth(dates[0].slice(0, 7));
+            }
+          }
+        } catch (requestError) {
+          if (!active) return;
+          if (requestError instanceof ProfileApiError && requestError.status === 404) setAssistedRequest(null);
+          else setAssistedError(requestError instanceof Error ? requestError.message : "We couldn't load the assisted rescheduling request.");
+        } finally { if (active) setAssistedLoading(false); }
+      })();
+    }, 0);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [assistedTargetAppointmentId, assistedTargetAppointment, getToken, assistedReload]);
+
+  useEffect(() => {
     const appointmentId = pendingNotificationScroll.current;
     if (!appointmentId || !appointments.some((appointment) => appointment.id === appointmentId)) return;
+    if (assistedTargetAppointmentId === appointmentId && assistedLoading) return;
     const currentUrl = new URL(window.location.href);
     if (currentUrl.searchParams.get("appointment") !== appointmentId) return;
-    const card = document.getElementById(`appointment-${appointmentId}`);
-    if (!card) return;
-    card.scrollIntoView({ block: "center" });
+    const hasSavedAssistedSuggestions = assistedTargetAppointmentId === appointmentId
+      && assistedRequest?.appointment_id === appointmentId
+      && assistedRequest.status === "pending_patient"
+      && assistedRequest.suggestions.length > 0;
+    if (hasSavedAssistedSuggestions) {
+      const section = assistedSectionRef.current;
+      if (!section) return;
+      const stickyHeader = document.querySelector<HTMLElement>("header.sticky");
+      const headerOffset = stickyHeader?.getBoundingClientRect().height ?? 64;
+      const sectionTop = section.getBoundingClientRect().top + window.scrollY;
+      window.scrollTo({ top: Math.max(0, sectionTop - headerOffset - 16), behavior: "smooth" });
+    } else {
+      const card = document.getElementById(`appointment-${appointmentId}`);
+      if (!card) return;
+      card.scrollIntoView({ block: "center" });
+    }
     setNotificationFocusId(appointmentId);
     pendingNotificationScroll.current = null;
     currentUrl.searchParams.delete("appointment");
     router.replace(`${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`, { scroll: false });
-  }, [appointments, loadError, loading, router]);
+  }, [appointments, assistedTargetAppointmentId, assistedLoading, assistedRequest, loadError, loading, router]);
 
   function clearNotificationFocus() {
     pendingNotificationScroll.current = null;
@@ -296,6 +374,13 @@ export function PatientAppointmentsPage() {
       const replacement = await rescheduleAppointment(token, appointment.id, selectedSlotId);
       notifyInAppNotificationsChanged();
       setAppointments((current) => [...current.map((item) => item.id === appointment.id ? { ...item, status: "cancelled" as const } : item), replacement]);
+      if (assistedTargetAppointmentId === appointment.id || assistedRequest?.appointment_id === appointment.id) {
+        setAssistedTargetAppointmentId(appointment.id);
+        setAssistedRequest((current) => current?.appointment_id === appointment.id ? { ...current, status: "superseded" } : current);
+        setAssistedSlots([]);
+        setSelectedAssistedSuggestion("");
+        setAssistedReload((value) => value + 1);
+      }
       setRescheduleId(null);
       setSlots([]);
       setSelectedSlotId("");
@@ -315,6 +400,99 @@ export function PatientAppointmentsPage() {
     }
   }
 
+  async function confirmAssistedReschedule(appointment: PatientAppointment) {
+    if (!assistedRequest || !selectedAssistedSuggestion || requestLock.current) return;
+    requestLock.current = true;
+    setActiveRequest(`assisted:${appointment.id}`);
+    try {
+      const token = await getToken();
+      if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+      const updated = await confirmPatientAssistedReschedule(token, assistedRequest.id, selectedAssistedSuggestion);
+      const selectedSuggestion = assistedRequest.suggestions.find((suggestion) => suggestion.id === selectedAssistedSuggestion);
+      const matchesSuggestion = selectedSuggestion
+        && updated.availability_id === selectedSuggestion.availability_id
+        && updated.mode === selectedSuggestion.mode
+        && updated.date === selectedSuggestion.date
+        && updated.start_time.slice(0, 8) === selectedSuggestion.start_time.slice(0, 8)
+        && updated.end_time.slice(0, 8) === selectedSuggestion.end_time.slice(0, 8);
+      if (!matchesSuggestion) {
+        throw new AssistedRescheduleResponseMismatchError();
+      }
+      setAppointments((current) => current.map((item) => item.id === updated.id ? updated : item));
+      setAssistedRequest({ ...assistedRequest, status: "accepted" });
+      setAssistedStale(false);
+      setAssistedDialog(null);
+      notifyInAppNotificationsChanged();
+      notifySuccess("Your appointment time has been updated.", `assisted-reschedule-${assistedRequest.id}`);
+    } catch (cause) {
+      const stale = cause instanceof ProfileApiError && cause.code === "ASSISTED_RESCHEDULE_REQUEST_STALE";
+      const expired = cause instanceof ProfileApiError && cause.code === "ASSISTED_RESCHEDULE_REQUEST_EXPIRED";
+      const declined = cause instanceof ProfileApiError && cause.code === "ASSISTED_RESCHEDULE_REQUEST_DECLINED";
+      const superseded = cause instanceof ProfileApiError && cause.code === "ASSISTED_RESCHEDULE_REQUEST_SUPERSEDED";
+      const closed = cause instanceof ProfileApiError && cause.code === "ASSISTED_RESCHEDULE_REQUEST_CLOSED";
+      const requestConflict = cause instanceof ProfileApiError && cause.code === "ASSISTED_RESCHEDULE_REQUEST_CONFLICT";
+      const acceptedStateConflict = cause instanceof ProfileApiError && cause.code === "ASSISTED_RESCHEDULE_ACCEPTED_STATE_CONFLICT";
+      const responseMismatch = cause instanceof AssistedRescheduleResponseMismatchError;
+      const unavailable = cause instanceof ProfileApiError && cause.status === 409
+        && !expired && !stale && !declined && !superseded && !closed && !requestConflict && !acceptedStateConflict;
+      setAssistedError(expired ? "This request expired when the original appointment was due to start. Its suggestions can no longer be confirmed."
+        : stale ? "This request no longer matches the appointment. Its saved suggestions are no longer selectable."
+          : declined ? "You already declined this assisted rescheduling request."
+            : superseded ? "A newer schedule change replaced this request."
+              : closed ? "This request is no longer open. Reload the appointment to see its current status."
+                : responseMismatch ? "The server returned an appointment that does not match the selected suggestion. Reload its status or contact support before trying again."
+                  : acceptedStateConflict ? "The request is marked accepted, but the appointment does not match the selected time. Reload its status or contact support before trying again."
+                  : requestConflict ? "The request changed while confirmation was processing. Reload it before trying again."
+                  : unavailable ? "That time is no longer available. Review current options before trying again."
+                    : cause instanceof Error ? cause.message : "We couldn't confirm this time.");
+      if (expired) { setAssistedRequest({ ...assistedRequest, status: "expired" }); setAssistedSlots([]); setSelectedAssistedSuggestion(""); }
+      if (declined || superseded) {
+        setAssistedRequest({ ...assistedRequest, status: declined ? "declined" : "superseded" });
+        setAssistedSlots([]);
+        setSelectedAssistedSuggestion("");
+      }
+      if (closed || requestConflict || acceptedStateConflict || responseMismatch) {
+        setAssistedSlots([]);
+        setSelectedAssistedSuggestion("");
+        setAssistedReload((value) => value + 1);
+      }
+      if (stale) setAssistedStale(true);
+      if (unavailable && !expired && !stale) {
+        setSelectedAssistedSuggestion("");
+        try {
+          const token = await getToken();
+          const dates = assistedRequest.suggestions.map((suggestion) => suggestion.date).sort();
+          if (token && dates.length) {
+            const live = await getDoctorSlots(token, appointment.doctor_id, dates[0], dates[dates.length - 1]);
+            setAssistedSlots(live.filter((slot) => !slot.reservation_only && (slot.remaining_capacity ?? 0) > 0
+              && assistedRequest.suggestions.some((suggestion) => suggestion.availability_id === slot.id && suggestion.mode === slot.mode
+                && suggestion.date === slot.date && suggestion.start_time.slice(0, 8) === slot.start_time.slice(0, 8)
+                && suggestion.end_time.slice(0, 8) === slot.end_time.slice(0, 8))));
+            setAssistedError(null);
+          }
+        } catch (availabilityError) {
+          setAssistedSlots([]);
+          setAssistedError(availabilityError instanceof Error ? availabilityError.message : "We couldn't refresh saved suggestions.");
+        }
+      }
+    } finally { setAssistedDialog(null); setActiveRequest(null); requestLock.current = false; }
+  }
+
+  async function declineAssistedReschedule() {
+    if (!assistedRequest || requestLock.current) return;
+    requestLock.current = true;
+    setActiveRequest(`assisted-decline:${assistedRequest.appointment_id}`);
+    try {
+      const token = await getToken();
+      if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+      await declinePatientAssistedReschedule(token, assistedRequest.id);
+      setAssistedRequest({ ...assistedRequest, status: "declined" });
+      notifySuccess("You declined the suggested schedule change.", `assisted-decline-${assistedRequest.id}`);
+    } catch (cause) {
+      setAssistedError(cause instanceof Error ? cause.message : "We couldn't decline this request.");
+    } finally { setAssistedDialog(null); setActiveRequest(null); requestLock.current = false; }
+  }
+
   return (
     <div className="mx-auto max-w-5xl space-y-8">
       <header>
@@ -322,6 +500,31 @@ export function PatientAppointmentsPage() {
         <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">My appointments</h1>
         <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">Review upcoming and past visits.</p>
       </header>
+
+      {(appointmentFromNotification || assistedTargetAppointmentId || assistedRequest) ? <section ref={assistedSectionRef} className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6" aria-labelledby="assisted-request-heading">
+        <h2 id="assisted-request-heading" className="text-xl font-semibold text-foreground">Suggested appointment change</h2>
+        {assistedLoading ? <p className="mt-3 text-sm text-muted-foreground" role="status">Checking for an assisted rescheduling request…</p> : null}
+        {!assistedLoading && assistedError ? <div className="mt-3 rounded-lg bg-destructive/5 p-3" role="alert"><p className="text-sm text-destructive">{assistedError}</p><button type="button" onClick={() => { requestedNotificationAppointment.current = null; setAssistedError(null); setAssistedReload((value) => value + 1); }} className="mt-2 text-sm font-medium text-primary underline">Reload this appointment</button></div> : null}
+        {!assistedLoading && !assistedError && (!assistedRequest || assistedRequest.appointment_id !== (appointmentFromNotification || assistedTargetAppointmentId)) ? <p className="mt-3 text-sm text-muted-foreground">There is no assisted rescheduling request for this appointment.</p> : null}
+        {!assistedLoading && assistedRequest && assistedRequest.appointment_id === (appointmentFromNotification || assistedTargetAppointmentId) ? <>
+          <p className="mt-2 text-sm text-muted-foreground">Dr. {assistedRequest.doctor_first_name} {assistedRequest.doctor_last_name} suggested a schedule change for your {appointmentDate(assistedRequest.previous_date)} appointment. You must choose and confirm a new time; it will not change automatically.</p>
+          {assistedRequest.status === "pending_patient" && assistedRequest.appointment_status === "confirmed" && !assistedStale ? <>
+            {assistedError ? null : assistedSlots.length ? <fieldset className="mt-4 grid gap-2 sm:grid-cols-2"><legend className="mb-2 text-sm font-medium text-foreground">Available saved suggestions</legend>{assistedRequest.suggestions.map((suggestion) => {
+              const liveSlot = assistedSlots.find((slot) => slot.id === suggestion.availability_id);
+              if (!liveSlot) return null;
+              return <label key={suggestion.id} className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 text-sm ${selectedAssistedSuggestion === suggestion.id ? "border-primary bg-secondary/60" : "border-border hover:bg-muted/60"}`}><input type="radio" name={`assisted-${assistedRequest.id}`} value={suggestion.id} checked={selectedAssistedSuggestion === suggestion.id} onChange={() => setSelectedAssistedSuggestion(suggestion.id)} className="size-4 accent-primary" /><span><span className="block font-medium text-foreground">{appointmentDate(suggestion.date)} · {suggestion.mode === "wave" ? "Wave" : "Stream"}</span><span className="text-muted-foreground">{appointmentTime(suggestion.start_time)}–{appointmentTime(suggestion.end_time)} IST</span><span className="mt-1 block text-xs text-muted-foreground">{liveSlot.remaining_capacity} places currently available</span></span></label>;
+            })}</fieldset> : <p className="mt-4 rounded-lg bg-muted p-3 text-sm text-muted-foreground">The saved suggestions are no longer showing available capacity. You can use regular Reschedule below to check current availability.</p>}
+            <div className="mt-4 flex flex-wrap gap-3">{assistedSlots.length > 0 ? <Button type="button" disabled={!selectedAssistedSuggestion || Boolean(activeRequest)} onClick={() => setAssistedDialog("confirm")}>Choose and confirm this time</Button> : null}<Button type="button" variant="outline" disabled={Boolean(activeRequest)} onClick={() => setAssistedDialog("decline")}>Decline suggestions</Button></div>
+          </> : <p className="mt-4 rounded-lg bg-muted p-3 text-sm text-muted-foreground">{assistedRequest.status === "superseded" ? "This request was superseded because the appointment was rescheduled." : assistedStale || assistedRequest.appointment_status !== "confirmed" ? "This appointment is no longer confirmed or no longer matches this request, so its suggestions cannot be booked." : assistedRequest.status === "no_alternatives" ? "No alternatives were available when the schedule changed." : assistedRequest.status === "accepted" ? "You accepted a suggested time. The appointment has been updated." : assistedRequest.status === "declined" ? "You declined this request." : assistedRequest.status === "expired" ? "This request expired when the original appointment was due to start. Check current availability before making any changes." : "This request is no longer active. Check current availability before making any changes."}</p>}
+        </> : null}
+      </section> : null}
+
+      <AlertDialog open={assistedDialog !== null} onOpenChange={(open) => { if (!open && !activeRequest) setAssistedDialog(null); }}>
+        <AlertDialogContent className="max-w-md rounded-2xl border border-border bg-card p-6 text-card-foreground shadow-xl ring-0 sm:max-w-md">
+          <AlertDialogHeader><AlertDialogTitle>{assistedDialog === "decline" ? "Decline suggested times?" : "Confirm this new appointment time?"}</AlertDialogTitle><AlertDialogDescription>{assistedDialog === "decline" ? "You can still use the regular rescheduling options later." : "Your existing appointment will be moved to the selected time. Your appointment history will remain associated with this booking."}</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogFooter className="m-0 flex-row justify-end gap-3 border-0 bg-transparent p-0"><AlertDialogCancel disabled={Boolean(activeRequest)}>Go back</AlertDialogCancel><AlertDialogAction disabled={Boolean(activeRequest)} onClick={(event) => { event.preventDefault(); const target = appointments.find((item) => item.id === assistedRequest?.appointment_id); if (assistedDialog === "decline") void declineAssistedReschedule(); else if (target) void confirmAssistedReschedule(target); }}>{activeRequest?.startsWith("assisted") ? "Saving…" : assistedDialog === "decline" ? "Decline request" : "Confirm new time"}</AlertDialogAction></AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {loading ? <p className="rounded-2xl bg-muted p-6 text-sm text-muted-foreground" role="status">Loading your appointments…</p> : null}
       {!loading && loadError ? (

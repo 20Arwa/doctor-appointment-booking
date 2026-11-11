@@ -21,6 +21,7 @@ const { createAppointmentNotificationOutboxService } = require("./services/appoi
 const notificationRecoveryRoutes = require("./routes/notificationRecoveryRoutes");
 const inAppNotificationRoutes = require("./routes/inAppNotificationRoutes");
 const { createInAppNotificationService } = require("./services/inAppNotificationService");
+const { createAssistedRescheduleNotificationService } = require("./services/assistedRescheduleNotificationService");
 
 function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), smsNotificationService = createSmsNotificationService({ config: env }), notificationDeliveryService, inAppNotificationService, reminderService, reminderSecret = env.REMINDER_CRON_SECRET, notificationRecoverySecret = env.NOTIFICATION_RECOVERY_CRON_SECRET, stripeService, paymentService, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
@@ -32,6 +33,12 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
   const notificationDeliveries = notificationDeliveryService || createNotificationDeliveryService({ database, emailNotificationService, smsNotificationService });
   const inAppNotifications = inAppNotificationService || createInAppNotificationService({ database });
   const appointmentNotificationOutbox = createAppointmentNotificationOutboxService({ database, notificationDeliveryService: notificationDeliveries, inAppNotificationService: inAppNotifications });
+  const assistedRescheduleNotifications = createAssistedRescheduleNotificationService({
+    database,
+    notificationDeliveryService: notificationDeliveries,
+    inAppNotificationService: inAppNotifications,
+    frontendOrigin: frontendOrigin || env.FRONTEND_ORIGIN,
+  });
   const payments = paymentService || createPaymentService({
     database,
     stripe,
@@ -61,7 +68,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     service: reminderService || createAppointmentReminderService({ database, emailNotificationService, inAppNotificationService: inAppNotifications, notificationDeliveryService: notificationDeliveries, timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata" }),
     secret: reminderSecret,
   }));
-  app.use("/api/v1/internal/notification-deliveries", notificationRecoveryRoutes({ service: notificationDeliveries, appointmentNotificationOutboxService: appointmentNotificationOutbox, secret: notificationRecoverySecret }));
+  app.use("/api/v1/internal/notification-deliveries", notificationRecoveryRoutes({ service: notificationDeliveries, appointmentNotificationOutboxService: appointmentNotificationOutbox, assistedRescheduleService: assistedRescheduleNotifications, secret: notificationRecoverySecret }));
   app.use("/api/v1/payments", paymentRoutes({ service: payments }));
   app.use("/api/v1/users", userRoutes);
   app.use("/api/v1/patients", patientRoutes);
