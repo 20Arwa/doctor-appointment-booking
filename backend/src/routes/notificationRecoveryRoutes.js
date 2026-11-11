@@ -1,7 +1,7 @@
 const crypto = require("node:crypto");
 const express = require("express");
 
-function createNotificationRecoveryRoutes({ service, secret }) {
+function createNotificationRecoveryRoutes({ service, appointmentNotificationOutboxService, secret }) {
   const router = express.Router();
   router.post("/run", async (request, response) => {
     if (!secret) return response.status(503).json({ error: { code: "NOTIFICATION_RECOVERY_NOT_CONFIGURED", message: "Notification recovery is not configured" } });
@@ -12,7 +12,11 @@ function createNotificationRecoveryRoutes({ service, secret }) {
     if (expectedBuffer.length !== suppliedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, suppliedBuffer)) {
       return response.status(401).json({ error: { code: "UNAUTHORIZED", message: "Unauthorized" } });
     }
-    try { return response.status(200).json(await service.runRecovery()); }
+    try {
+      const deliveries = await service.runRecovery();
+      const appointmentNotificationOutbox = await appointmentNotificationOutboxService?.runRecovery?.();
+      return response.status(200).json({ ...deliveries, ...(appointmentNotificationOutbox ? { appointmentNotificationOutbox } : {}) });
+    }
     catch (error) {
       console.error("Notification recovery run failed", { message: error.message });
       return response.status(500).json({ error: { code: "NOTIFICATION_RECOVERY_FAILED", message: "Notification recovery run failed" } });
