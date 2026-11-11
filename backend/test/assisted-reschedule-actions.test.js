@@ -81,6 +81,7 @@ function createDatabase({ status = "pending_patient", selectedAvailabilityId = n
       historyInserted = true;
       return { rows: [] };
     }
+    if (sql.startsWith("INSERT INTO appointment_notification_outbox")) return { rows: [] };
     if (sql.startsWith("UPDATE assisted_reschedule_requests") && sql.includes("SET status = 'expired'")) {
       request.status = "expired";
       return { rows: [{ id: ids.request }], rowCount: 1 };
@@ -136,6 +137,13 @@ for (const mode of ["wave", "stream"]) test(`confirms a saved ${mode} alternativ
   assert.ok(fixture.calls.findIndex(({ sql }) => sql.startsWith("INSERT INTO appointment_allocations")) < fixture.calls.findIndex(({ sql }) => sql === "COMMIT"));
   assert.ok(fixture.calls.findIndex(({ sql }) => sql.startsWith("UPDATE appointment_allocations SET status = 'released'")) < fixture.calls.findIndex(({ sql }) => sql === "COMMIT"));
   assert.ok(fixture.calls.findIndex(({ sql }) => sql.startsWith("INSERT INTO appointment_reschedule_history")) < fixture.calls.findIndex(({ sql }) => sql === "COMMIT"));
+  const notificationInsert = fixture.calls.find(({ sql }) => sql.startsWith("INSERT INTO appointment_notification_outbox"));
+  assert.ok(notificationInsert);
+  assert.equal(notificationInsert.values[1], "appointment.rescheduled");
+  assert.equal(notificationInsert.values[3], "patient");
+  assert.equal(JSON.parse(notificationInsert.values[4]).previous_date, "2099-04-10");
+  assert.equal(JSON.parse(notificationInsert.values[4]).previous_start_time, "10:00:00");
+  assert.ok(fixture.calls.indexOf(notificationInsert) < fixture.calls.findIndex(({ sql }) => sql === "COMMIT"));
 });
 
 test("rolls back request acceptance and all later confirmation changes if appointment update fails", async () => {

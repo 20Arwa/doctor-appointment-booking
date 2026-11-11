@@ -40,9 +40,12 @@ function createDatabase({
   currentUser = patientUser,
   slots = [makeSlot(firstSlotId), makeSlot(secondSlotId, "11:00")],
   appointments = [],
+  allocations = [],
   appointmentRefs = [],
+  assistedRequests = [],
+  failOutboxInsert = false,
 } = {}) {
-  const state = { slots: slots.map((slot) => ({ ...slot })), appointments: appointments.map((appointment) => ({ ...appointment })) };
+  const state = { slots: slots.map((slot) => ({ ...slot })), appointments: appointments.map((appointment) => ({ ...appointment })), allocations: allocations.map((allocation) => ({ ...allocation })), assistedRequests: assistedRequests.map((request) => ({ ...request })), outbox: [] };
   const lockTails = new Map();
 
   function details(appointment) {
@@ -105,6 +108,9 @@ function createDatabase({
     },
     async connect() {
       let txAppointments;
+      let txAllocations;
+      let txOutbox;
+      let txAssistedRequests;
       let pendingLocks = [];
       let heldLocks = false;
       const heldAvailabilityIds = new Set();
@@ -122,6 +128,9 @@ function createDatabase({
         async query(sql, values = []) {
           if (sql === "BEGIN") {
             txAppointments = state.appointments.map((appointment) => ({ ...appointment }));
+            txAllocations = state.allocations.map((allocation) => ({ ...allocation }));
+            txOutbox = state.outbox.map((item) => ({ ...item }));
+            txAssistedRequests = state.assistedRequests.map((request) => ({ ...request }));
             return { rows: [] };
           }
           if (sql === "SELECT id FROM patients WHERE user_id = $1") {
@@ -132,6 +141,24 @@ function createDatabase({
             return { rows: appointment ? [{ availability_id: appointment.availability_id }] : [] };
           }
           if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
+          if (sql.startsWith("SELECT COUNT(DISTINCT reservation.patient_id)::int AS occupied")) return { rows: [{ occupied: 0 }] };
+          if (sql.startsWith("INSERT INTO appointment_allocations")) return { rows: [{ id: "rescheduled-allocation" }] };
+          if (sql.startsWith("SELECT id FROM availability WHERE doctor_id = $1")) {
+            const [ownerDoctorId, date, start, end] = values;
+            const slot = state.slots.find((item) => item.doctor_id === ownerDoctorId && item.date === date
+              && item.start_time === start && item.end_time === end && !item.deleted_at);
+            return { rows: slot ? [{ id: slot.id }] : [] };
+          }
+          if (sql.startsWith("SELECT id, deleted_at, mode, capacity, date::text AS date")) {
+            const slot = state.slots.find((item) => item.id === values[0]);
+            return { rows: slot ? [{ ...slot, mode: "wave", capacity: 1 }] : [] };
+          }
+          if (sql.includes("FROM availability") && sql.includes("ORDER BY id") && sql.includes("FOR UPDATE")) {
+            return { rows: values[0].map((id) => {
+              const slot = state.slots.find((item) => item.id === id);
+              return slot ? { id: slot.id, doctor_id: slot.doctor_id } : null;
+            }).filter(Boolean) };
+          }
           if (sql.includes("FROM appointment_slot_holds h") && sql.includes("h.expires_at > NOW()")) return { rows: [] };
           if (sql.includes("SELECT id, doctor_id FROM availability")) {
             const ids = values[0] || [];
@@ -221,7 +248,34 @@ function createDatabase({
             if (appointment) Object.assign(appointment, { status: "cancelled", cancelled_at: "2099-02-01T00:00:00.000Z", updated_at: "2099-02-01T00:00:00.000Z" });
             return { rows: [] };
           }
-          if (sql.startsWith("UPDATE appointment_allocations SET status = 'released'")) return { rows: [] };
+          if (sql.startsWith("INSERT INTO appointment_notification_outbox")) {
+            if (failOutboxInsert) throw new Error("simulated outbox insert failure");
+            txOutbox.push({
+              event_key: values[0],
+              event_type: values[1],
+              appointment_id: values[2],
+              actor_role: values[3],
+              payload: JSON.parse(values[4]),
+            });
+            return { rows: [] };
+          }
+          if (sql.startsWith("UPDATE appointment_allocations SET status = 'released'")) {
+            const appointment = txAppointments.find((row) => row.id === values[0]);
+            const allocation = txAllocations.find((row) => row.id === appointment?.allocation_id);
+            if (allocation?.status === "confirmed") allocation.status = "released";
+            return { rows: [] };
+          }
+          if (sql.startsWith("UPDATE assisted_reschedule_requests")) {
+            for (const request of txAssistedRequests) {
+              if (request.appointment_id === values[0] && ["pending_patient", "no_alternatives"].includes(request.status)
+                  && (!values[1] || request.id !== values[1])) request.status = "superseded";
+            }
+            return { rows: [] };
+          }
+          if (sql.startsWith("SELECT id FROM assisted_reschedule_requests")) {
+            return { rows: txAssistedRequests.filter((request) => request.appointment_id === values[0]
+              && ["pending_patient", "no_alternatives"].includes(request.status)).map((request) => ({ id: request.id })) };
+          }
           if (sql.startsWith("UPDATE appointments SET status = 'completed'")) {
             const appointment = txAppointments.find((row) => row.id === values[0]);
             if (appointment) Object.assign(appointment, { status: "completed", updated_at: "2099-02-01T00:00:00.000Z" });
@@ -244,11 +298,16 @@ function createDatabase({
           }
           if (sql === "COMMIT") {
             state.appointments.splice(0, state.appointments.length, ...txAppointments);
-            releaseLocks();
+            state.allocations.splice(0, state.allocations.length, ...txAllocations);
+            state.outbox.splice(0, state.outbox.length, ...txOutbox);
+            state.assistedRequests.splice(0, state.assistedRequests.length, ...txAssistedRequests);            releaseLocks();
             return { rows: [] };
           }
           if (sql === "ROLLBACK") {
             txAppointments = undefined;
+            txAllocations = undefined;
+            txOutbox = undefined;
+            txAssistedRequests = undefined;
             releaseLocks();
             return { rows: [] };
           }
@@ -327,7 +386,9 @@ describe("appointment schemas and migration", () => {
       "012_appointment_consultation_fee_snapshot.sql", "013_notification_deliveries.sql",
       "013_weekly_doctor_scheduling.sql", "014_notification_delivery_recovery.sql", "015_wave_stream_scheduling.sql",
       "016_wave_stream_capacity_indexes.sql", "017_stream_window_capacity.sql", "023_notification_sms_provider_identifiers.sql",
-      "024_in_app_notifications.sql",
+      "024_in_app_notifications.sql", "025_assisted_reschedule_requests.sql", "026_assisted_reschedule_notifications.sql",
+      "027_assisted_reschedule_expiry.sql",
+      "028_appointment_notification_outbox.sql",
     ]) assert.ok(files.includes(migration), `missing migration ${migration}`);
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
@@ -342,7 +403,7 @@ describe("appointment schemas and migration", () => {
 });
 
 describe("appointment workflows", () => {
-  it("keeps cancellation and Email successful when awaited In-App persistence fails", async () => {
+  it("does not dispatch cancellation notifications in the post-commit request path", async () => {
     const events = [];
     const originalCancel = appointmentService.cancelAppointment;
     appointmentService.cancelAppointment = async () => { events.push("appointment"); return makeAppointment({ status: "cancelled" }); };
@@ -353,7 +414,7 @@ describe("appointment workflows", () => {
         database: {},
         paymentService: { async refundCancelledAppointment() { return { status: "not_applicable" }; } },
         notificationDeliveryService: { async sendAppointmentNotification() { events.push("email"); } },
-        inAppNotificationService: { async sendAppointmentNotification() { events.push("in-app"); throw new Error("storage unavailable"); } },
+        inAppNotificationService: { async sendAppointmentNotification() { events.push("in-app"); } },
       },
       status(statusCode) { this.statusCode = statusCode; return this; },
       json(body) { this.body = body; return this; },
@@ -365,7 +426,7 @@ describe("appointment workflows", () => {
     }
     assert.equal(response.statusCode, 200);
     assert.equal(response.body.status, "cancelled");
-    assert.deepEqual(events, ["appointment", "email", "in-app"]);
+    assert.deepEqual(events, ["appointment"]);
   });
 
   it("paginates past and cancelled appointment history on the server", async () => {
@@ -418,7 +479,7 @@ describe("appointment workflows", () => {
     });
   });
 
-  it("keeps cancellation and rescheduling notifications for existing appointments", async () => {
+  it("does not dispatch cancellation or rescheduling notifications after commit", async () => {
     const notifications = [];
     const emailNotificationService = { sendAppointmentNotification: async (...args) => notifications.push(args) };
     const booking = createTestApp({ emailNotificationService });
@@ -435,12 +496,10 @@ describe("appointment workflows", () => {
     await withServer(reschedule.app, async (url) => {
       assert.equal((await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }) })).status, 200);
     });
-    assert.deepEqual(notifications.map(([action]) => action), ["cancelled", "rescheduled"]);
-    assert.equal(notifications[1][1].previous_date, "2099-04-10");
-    assert.equal(notifications[1][1].previous_start_time, "10:00:00");
+    assert.deepEqual(notifications, []);
   });
 
-  it("routes patient cancellation and patient/doctor reschedules through stable delivery events", async () => {
+  it("does not route patient cancellation or patient/doctor reschedules directly to delivery", async () => {
     const events = [];
     const notificationDeliveryService = { async sendAppointmentNotification(event) { events.push(event); } };
     const cancellation = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }), notificationDeliveryService });
@@ -455,11 +514,7 @@ describe("appointment workflows", () => {
     await withServer(doctorReschedule.app, async (url) => {
       assert.equal((await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ date: "2099-04-11", start_time: "12:00", end_time: "12:30" }) })).status, 200);
     });
-    assert.deepEqual(events.map(({ eventType }) => eventType), ["appointment.cancelled", "appointment.rescheduled", "appointment.rescheduled"]);
-    assert.notEqual(events[1].eventKey, events[2].eventKey);
-    assert.match(events[1].eventKey, /^appointment\.rescheduled:/);
-    assert.equal(events[1].appointment.id, secondAppointmentId);
-    assert.equal(events[2].appointment.id, appointmentId);
+    assert.deepEqual(events, []);
   });
 
   it("keeps cancellation successful when notification delivery fails", async () => {
@@ -582,13 +637,23 @@ describe("appointment workflows", () => {
   });
 
   it("cancels without deleting history and denies doctor cancellation under the unspecified policy", async () => {
-    const { app, database } = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }) });
+    const { app, database } = createTestApp({ database: createDatabase({
+      appointments: [{ ...makeAppointment(), allocation_id: "allocation-1" }],
+      allocations: [{ id: "allocation-1", status: "confirmed" }],
+      assistedRequests: [{ id: "assisted-request-1", appointment_id: appointmentId, status: "pending_patient" }],
+    }) });
     await withServer(app, async (url) => {
       const cancelled = await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" });
       assert.equal(cancelled.status, 200);
       assert.equal((await cancelled.json()).status, "cancelled");
       assert.equal(database.state.appointments.length, 1);
       assert.ok(database.state.appointments[0].cancelled_at);
+      assert.equal(database.state.allocations[0].status, "released");
+      assert.equal(database.state.assistedRequests[0].status, "superseded");
+      assert.equal(database.state.outbox.length, 1);
+      assert.equal(database.state.outbox[0].event_type, "appointment.cancelled");
+      assert.equal(database.state.outbox[0].payload.patient_first_name, "Pia");
+      assert.equal(database.state.outbox[0].payload.patient_last_name, "Patient");
       const again = await fetch(`${url}/api/v1/appointments/${appointmentId}/cancel`, { method: "PUT" });
       assert.equal(again.status, 409);
     });
@@ -599,8 +664,19 @@ describe("appointment workflows", () => {
     });
   });
 
+  it("rolls back cancellation when its transactional Outbox insert fails", async () => {
+    const database = createDatabase({appointments: [makeAppointment()], assistedRequests: [{ id: "assisted-request-1", appointment_id: appointmentId, status: "pending_patient" },], failOutboxInsert: true,});
+    await assert.rejects(appointmentService.cancelAppointment(database, patientUser, appointmentId), /simulated outbox insert failure/);
+    assert.equal(database.state.appointments[0].status, "confirmed");
+    assert.equal(database.state.assistedRequests[0].status, "pending_patient");
+    assert.equal(database.state.outbox.length, 0);
+  });
+
   it("reschedules atomically while preserving the cancelled original appointment", async () => {
-    const { app, database } = createTestApp({ database: createDatabase({ appointments: [makeAppointment()] }) });
+    const { app, database } = createTestApp({ database: createDatabase({
+      appointments: [makeAppointment()],
+      assistedRequests: [{ id: "assisted-request-1", appointment_id: appointmentId, status: "pending_patient" }],
+    }) });
     await withServer(app, async (url) => {
       const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/reschedule`, {
         method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ availability_id: secondSlotId }),
@@ -614,6 +690,9 @@ describe("appointment workflows", () => {
       assert.equal(database.state.appointments[0].availability_id, firstSlotId);
       assert.equal(database.state.appointments[0].status, "cancelled");
       assert.ok(database.state.appointments[0].cancelled_at);
+      assert.equal(database.state.assistedRequests[0].status, "superseded");
+      assert.equal(database.state.outbox.length, 1);
+      assert.equal(database.state.outbox[0].event_type, "appointment.rescheduled");
     });
     const occupiedTarget = createTestApp({ database: createDatabase({ appointments: [
       makeAppointment(),
@@ -677,11 +756,15 @@ describe("appointment workflows", () => {
   });
 
   it("completes only for the owning doctor and rejects invalid state transitions", async () => {
-    const doctor = createTestApp({ currentUser: doctorUser, database: createDatabase({ currentUser: doctorUser, appointments: [makeAppointment()] }) });
+    const doctor = createTestApp({ currentUser: doctorUser, database: createDatabase({ currentUser: doctorUser,
+      appointments: [makeAppointment()],
+      assistedRequests: [{ id: "assisted-request-1", appointment_id: appointmentId, status: "pending_patient" }],
+    }) });
     await withServer(doctor.app, async (url) => {
       const response = await fetch(`${url}/api/v1/appointments/${appointmentId}/complete`, { method: "PUT" });
       assert.equal(response.status, 200);
       assert.equal((await response.json()).status, "completed");
+      assert.equal(doctor.database.state.assistedRequests[0].status, "superseded");
       const second = await fetch(`${url}/api/v1/appointments/${appointmentId}/complete`, { method: "PUT" });
       assert.equal(second.status, 409);
     });

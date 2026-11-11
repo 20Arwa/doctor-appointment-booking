@@ -24,8 +24,12 @@ function escapeHtml(value) {
 function appointmentEmail(action, appointment, recipientType = "patient") {
   const doctor = `Dr. ${[appointment.doctor_first_name, appointment.doctor_last_name].filter(Boolean).join(" ")}`;
   const patient = [appointment.patient_first_name, appointment.patient_last_name].filter(Boolean).join(" ") || "Patient";
-  const current = `${appointment.date} at ${formatTime(appointment.start_time)}`;
   const previous = `${appointment.previous_date} at ${formatTime(appointment.previous_start_time)}`;
+  const startTime = formatTime(appointment.start_time);
+  const endTime = formatTime(appointment.end_time);
+  const timeRange = endTime ? `${startTime}–${endTime}` : startTime;
+  const bookingMode = appointment.mode === "wave" ? "Wave" : appointment.mode === "stream" ? "Stream" : "Appointment";
+  const current = `${appointment.date} at ${timeRange} (${bookingMode})`;
   let title;
   let message;
   if (recipientType === "doctor") {
@@ -38,9 +42,9 @@ function appointmentEmail(action, appointment, recipientType = "patient") {
         : `Your appointment with ${doctor} has been rescheduled.`;
   }
   const details = action === "rescheduled" ? `Previous appointment: ${previous}` : null;
-  const lines = [message, recipientType === "doctor" ? `Patient: ${patient}` : null, `Doctor: ${doctor}`, `Date: ${appointment.date}`, `Time: ${formatTime(appointment.start_time)}`, details].filter(Boolean);
+  const lines = [message, recipientType === "doctor" ? `Patient: ${patient}` : null, `Doctor: ${doctor}`, `Date: ${appointment.date}`, `Time: ${timeRange}`, `Booking mode: ${bookingMode}`, details].filter(Boolean);
   const row = (label, value) => `<tr><td style="padding:10px 12px;color:#67465F;font-size:13px;font-weight:600">${label}</td><td style="padding:10px 12px;color:#30252D;font-size:15px;font-weight:700">${escapeHtml(value)}</td></tr>`;
-  const htmlContent = `<!doctype html><html><body style="margin:0;background:#f7f3f6;font-family:Arial,sans-serif;color:#30252D"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 12px"><tr><td align="center"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#fff;border-radius:12px;overflow:hidden"><tr><td style="background:#67465F;padding:22px 26px;color:#fff;font-size:20px;font-weight:700">Medrella</td></tr><tr><td style="padding:26px"><h1 style="margin:0 0 12px;font-size:22px;color:#30252D">${escapeHtml(title)}</h1><p style="margin:0 0 18px;line-height:1.5;color:#51454F">${escapeHtml(message)}</p><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e8dfe7;border-radius:8px">${recipientType === "doctor" ? row("Patient", patient) : ""}${row("Doctor", doctor)}${row("Date", appointment.date)}${row("Time", formatTime(appointment.start_time))}</table>${details ? `<p style="margin:16px 0 0;color:#51454F">${escapeHtml(details)}</p>` : ""}</td></tr></table></td></tr></table></body></html>`;
+  const htmlContent = `<!doctype html><html><body style="margin:0;background:#f7f3f6;font-family:Arial,sans-serif;color:#30252D"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 12px"><tr><td align="center"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#fff;border-radius:12px;overflow:hidden"><tr><td style="background:#67465F;padding:22px 26px;color:#fff;font-size:20px;font-weight:700">Medrella</td></tr><tr><td style="padding:26px"><h1 style="margin:0 0 12px;font-size:22px;color:#30252D">${escapeHtml(title)}</h1><p style="margin:0 0 18px;line-height:1.5;color:#51454F">${escapeHtml(message)}</p><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e8dfe7;border-radius:8px">${recipientType === "doctor" ? row("Patient", patient) : ""}${row("Doctor", doctor)}${row("Date", appointment.date)}${row("Time", timeRange)}${row("Booking mode", bookingMode)}</table>${details ? `<p style="margin:16px 0 0;color:#51454F">${escapeHtml(details)}</p>` : ""}</td></tr></table></td></tr></table></body></html>`;
   return { subject: recipientType === "doctor" ? title : appointmentSubject(action), textContent: lines.join("\n"), htmlContent };
 }
 
@@ -56,9 +60,12 @@ function assistedRescheduleEmail(appointment, appointmentUrl) {
   const doctor = `Dr. ${[appointment.doctor_first_name, appointment.doctor_last_name].filter(Boolean).join(" ")}`;
   const when = `${appointment.previous_date} at ${formatTime(appointment.previous_start_time)}`;
   const message = `Your appointment with ${doctor} at ${when} is affected by a schedule change. Suggested alternatives are available. Choose and confirm a new time; it will not change until you confirm it.`;
-  const safeUrl = escapeHtml(appointmentUrl);
-  const htmlContent = `<!doctype html><html><body style="margin:0;background:#f7f3f6;font-family:Arial,sans-serif;color:#30252D"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 12px"><tr><td align="center"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#fff;border-radius:12px"><tr><td style="background:#67465F;padding:22px 26px;color:#fff;font-size:20px;font-weight:700">Medrella</td></tr><tr><td style="padding:26px"><h1 style="margin:0 0 12px;font-size:22px">Choose a new appointment time</h1><p style="margin:0 0 18px;line-height:1.5;color:#51454F">${escapeHtml(message)}</p><p style="margin:0 0 18px"><a href="${safeUrl}" style="display:inline-block;background:#67465F;color:#fff;text-decoration:none;padding:12px 18px;border-radius:7px;font-weight:700">Review suggested times</a></p><p style="margin:0;color:#51454F;font-size:13px">If the button does not work, open: <a href="${safeUrl}">${safeUrl}</a></p></td></tr></table></td></tr></table></body></html>`;
-  return { subject: "Choose a new appointment time", textContent: `${message}\nChoose and confirm a suggested time here: ${appointmentUrl}`, htmlContent };
+  const htmlContent = `<!doctype html><html><body style="margin:0;background:#f7f3f6;font-family:Arial,sans-serif;color:#30252D"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 12px"><tr><td align="center"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#fff;border-radius:12px"><tr><td style="background:#67465F;padding:22px 26px;color:#fff;font-size:20px;font-weight:700">Medrella</td></tr><tr><td style="padding:26px"><h1 style="margin:0 0 12px;font-size:22px">Choose a new appointment time</h1><p style="margin:0 0 18px;line-height:1.5;color:#51454F">${escapeHtml(message)}</p><p style="margin:0 0 18px"><a href="${escapeHtml(appointmentUrl)}" style="display:inline-block;background:#67465F;color:#fff;text-decoration:none;padding:12px 18px;border-radius:7px;font-weight:700">Review suggested times</a></p><p style="margin:0;color:#51454F;font-size:13px">If the button does not work, open: <a href="${escapeHtml(appointmentUrl)}">${escapeHtml(appointmentUrl)}</a></p></td></tr></table></td></tr></table></body></html>`;
+  return {
+    subject: "Choose a new appointment time",
+    textContent: `${message}\nChoose and confirm a suggested time here: ${appointmentUrl}`,
+    htmlContent,
+  };
 }
 
 function isTransientNetworkError(error) {
@@ -167,7 +174,10 @@ function createEmailNotificationService({
       return {
         to: appointment.patient_email || null,
         ...assistedRescheduleEmail(appointment, appointmentUrl),
-        sender: { email: configuredValue(config.BREVO_SENDER_EMAIL), name: configuredValue(config.BREVO_SENDER_NAME) },
+        sender: {
+          email: configuredValue(config.BREVO_SENDER_EMAIL),
+          name: configuredValue(config.BREVO_SENDER_NAME),
+        },
       };
     },
     async sendNotificationPayload(payload, idempotencyKey, options = {}) {

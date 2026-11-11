@@ -180,6 +180,7 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
     competingBooking,
     events: new Set(),
     notificationDeliveries: new Map(),
+    notificationOutbox: [],
     reconciliation: new Map(),
     calls: [],
     sentEmails: [],
@@ -268,7 +269,10 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
             state.appointment = { ...appointment };
             return { rows: [{ id: appointmentId }] };
           }
-          if (sql.startsWith("INSERT INTO appointment_notification_outbox")) return { rows: [] };
+          if (sql.startsWith("INSERT INTO appointment_notification_outbox")) {
+            state.notificationOutbox.push({ event_key: values[0], event_type: values[1], appointment_id: values[2], actor_role: values[3], payload: JSON.parse(values[4]) });
+            return { rows: [] };
+          }
           if (sql.includes("FROM appointments a") && sql.includes("WHERE a.id = $1")) return { rows: state.appointment ? [{ ...state.appointment }] : [] };
           throw new Error(`Unexpected client query: ${sql}`);
         },
@@ -507,18 +511,14 @@ describe("Stripe appointment Checkout", () => {
     assert.equal(database.state.hold.status, "released");
   });
 
-  it("serializes concurrent Checkout attempts for one patient and slot into one reservation and session", async () => {
+  it("allows one concurrent Checkout attempt and rejects the duplicate without creating another reservation", async () => {
     const database = createReservationDatabase();
     let checkoutAttempts = 0;
-    let releaseCheckout;
-    const checkoutBarrier = new Promise((resolve) => { releaseCheckout = resolve; });
     const providerSessions = new Map();
     let providerSessionCreations = 0;
     const stripe = {
       async createCheckoutSession(params, idempotencyKey) {
         checkoutAttempts += 1;
-        if (checkoutAttempts === 2) releaseCheckout();
-        await checkoutBarrier;
         let session = providerSessions.get(idempotencyKey);
         if (!session) {
           providerSessionCreations += 1;
@@ -533,16 +533,20 @@ describe("Stripe appointment Checkout", () => {
       },
     };
     const service = createPaymentService({ database, stripe, frontendOrigin: "https://medrella.example" });
-    const [first, second] = await Promise.all([
+    const results = await Promise.allSettled([
       service.createCheckoutSession(patient, { availability_id: availabilityId, idempotency_key: paymentId }),
       service.createCheckoutSession(patient, { availability_id: availabilityId, idempotency_key: "99999999-9999-4999-8999-999999999999" }),
     ]);
 
-    assert.equal(first.payment_id, second.payment_id);
-    assert.equal(first.session_id, second.session_id);
+    const succeeded = results.filter((result) => result.status === "fulfilled");
+    const failed = results.filter((result) => result.status === "rejected");
+    assert.equal(succeeded.length, 1);
+    assert.equal(failed.length, 1);
+    assert.equal(failed[0].reason.code, "DUPLICATE_BOOKING");
     assert.equal(database.state.holdCount, 1);
     assert.equal(database.state.paymentCount, 1);
     assert.equal(database.state.appointmentCount, 0);
+    assert.equal(checkoutAttempts, 1);
     assert.equal(providerSessionCreations, 1);
     assert.equal(providerSessions.size, 1);
     assert.equal(database.state.hold.status, "active");
@@ -620,7 +624,7 @@ describe("Stripe appointment Checkout", () => {
 });
 
 describe("Stripe Checkout webhook and reconciliation", () => {
-  it("sends tracked branded booking emails once to both recipients despite repeated/out-of-order success events", async () => {
+  it("writes one booking Outbox event and leaves delivery to recovery", async () => {
     const database = createPaymentDatabase();
     const stripeService = { constructWebhookEvent(raw, signature) { assert.ok(Buffer.isBuffer(raw)); assert.equal(signature, "stripe-signature"); return JSON.parse(raw.toString("utf8")); } };
     const emailNotificationService = createEmailNotificationService({
@@ -648,28 +652,19 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     });
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.payment.provider_payment_id, intentId);
-    assert.equal(database.state.sentEmails.length, 2);
-    assert.equal(inAppAttempts, 1);
-    assert.deepEqual(database.state.sentEmails.map((mail) => mail.to[0].email), ["patient@example.test", "doctor@example.test"]);
-    for (const mail of database.state.sentEmails) {
-      assert.match(mail.htmlContent, /#67465F/);
-      assert.match(mail.htmlContent, /#30252D/);
-      assert.match(mail.textContent, /Date: 2099-04-10/);
-      assert.match(mail.textContent, /Time: 10:00/);
-    }
-    assert.match(database.state.sentEmails[0].textContent, /Your appointment with Dr\. Dara Doctor is confirmed/);
-    assert.match(database.state.sentEmails[1].textContent, /A patient booked an appointment with you/);
-    assert.equal(database.state.notificationDeliveries.size, 4);
-    const emailDeliveries = [...database.state.notificationDeliveries.values()].filter((delivery) => delivery.channel === "email");
-    assert.deepEqual(emailDeliveries.map((delivery) => delivery.recipient_user_id), [userId, otherUserId]);
-    assert.deepEqual(emailDeliveries.map((delivery) => delivery.payload.to), ["patient@example.test", "doctor@example.test"]);
-    for (const delivery of emailDeliveries) {
-      assert.match(delivery.payload.htmlContent, /#67465F/);
-      assert.match(delivery.payload.textContent, /Date: 2099-04-10/);
-    }
+    assert.equal(database.state.sentEmails.length, 0);
+    assert.equal(inAppAttempts, 0);
+    assert.equal(database.state.notificationDeliveries.size, 0);
+    assert.equal(database.state.notificationOutbox.length, 1);
+    assert.equal(database.state.notificationOutbox[0].event_type, "appointment.booked");
+    assert.equal(database.state.notificationOutbox[0].actor_role, "system");
+    assert.equal(database.state.notificationOutbox[0].payload.id, appointmentId);
+    const outboxInsert = database.state.calls.findIndex((sql) => sql.startsWith("INSERT INTO appointment_notification_outbox"));
+    const finalCommit = database.state.calls.map((sql) => sql).lastIndexOf("COMMIT");
+    assert.ok(outboxInsert >= 0 && outboxInsert < finalCommit, "the Outbox insert is part of the appointment transaction");
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
-    assert.equal(database.state.sentEmails.length, 2);
-    assert.equal(database.state.notificationDeliveries.size, 4);
+    assert.equal(database.state.sentEmails.length, 0);
+    assert.equal(database.state.notificationDeliveries.size, 0);
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
   });
@@ -702,8 +697,9 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     assert.equal(database.state.payment.status, "captured");
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.hold.status, "consumed");
-    assert.deepEqual(database.state.sentEmails, ["patient@example.test", "doctor@example.test"]);
-    assert.equal(database.state.notificationDeliveries.size, 2);
+    assert.deepEqual(database.state.sentEmails, []);
+    assert.equal(database.state.notificationDeliveries.size, 0);
+    assert.equal(database.state.notificationOutbox.length, 1);
     assert.equal(database.state.reconciliation.size, 0);
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
   });
@@ -714,21 +710,30 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     const service = createPaymentService({ database, stripe, timeZone: "Asia/Kolkata", emailNotificationService: { async sendNotificationPayload(payload) { database.state.sentEmails.push(payload.to); return { sent: true, attempts: 1 }; } } });
     const success = createSessionEvent("checkout.session.async_payment_succeeded", "evt_async_success_first");
     assert.equal((await service.processWebhook(Buffer.from(JSON.stringify(success)), "sig")).status, "confirmed");
-    assert.deepEqual(database.state.sentEmails, ["patient@example.test", "doctor@example.test"]);
-    assert.equal(database.state.notificationDeliveries.size, 2);
+    assert.equal(database.state.notificationOutbox.length, 1);
+    assert.deepEqual(database.state.sentEmails, []);
+    assert.equal(database.state.notificationDeliveries.size, 0);
+
     const failure = createSessionEvent("checkout.session.async_payment_failed", "evt_async_failure_late");
     assert.equal((await service.processWebhook(Buffer.from(JSON.stringify(failure)), "sig")).status, "captured");
-    assert.equal(database.state.sentEmails.length, 2);
-    assert.equal(database.state.notificationDeliveries.size, 2);
-    assert.deepEqual(await service.processWebhook(Buffer.from(JSON.stringify(failure)), "sig"), { duplicate: true });
+    assert.equal(database.state.sentEmails.length, 0);
+    assert.equal(database.state.notificationDeliveries.size, 0);
+
+    assert.deepEqual(
+      await service.processWebhook(Buffer.from(JSON.stringify(failure)), "sig"),
+      { duplicate: true }
+    );
+
     await service.processWebhook(Buffer.from(JSON.stringify(success)), "sig");
+
+    assert.equal(database.state.notificationOutbox.length, 1);
     assert.equal(database.state.payment.status, "captured");
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO appointments")).length, 1);
     assert.equal(database.state.events.size, 2);
     assert.equal(database.state.reconciliation.size, 0);
-    assert.deepEqual(database.state.sentEmails, ["patient@example.test", "doctor@example.test"]);
-    assert.equal(database.state.notificationDeliveries.size, 2);
+    assert.deepEqual(database.state.sentEmails, []);
+    assert.equal(database.state.notificationDeliveries.size, 0);
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
   });
 

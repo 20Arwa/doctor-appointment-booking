@@ -1,20 +1,4 @@
 const appointmentService = require("../services/appointmentService");
-const { appointmentEventKey } = require("../services/notificationDeliveryService");
-
-async function notify(response, eventType, appointment) {
-  const eventKey = appointmentEventKey(eventType, appointment);
-  const actorRole = response.locals.user.role;
-  await Promise.all([
-    (async () => {
-      try { await response.locals.notificationDeliveryService.sendAppointmentNotification({ eventKey, eventType, appointment, actorRole }); }
-      catch (_error) { console.error("Appointment email notification failed", { eventType, reason: "unexpected_error" }); }
-    })(),
-    (async () => {
-      try { await response.locals.inAppNotificationService.sendAppointmentNotification({ eventKey, eventType, appointment, actorRole }); }
-      catch (_error) { console.error("In-App appointment notification failed", { eventType, reason: "unexpected_error" }); }
-    })(),
-  ]);
-}
 
 function handle(operation) {
   return async (request, response, next) => {
@@ -66,7 +50,6 @@ const cancelAppointment = handle(async (_request, response) => {
     response.locals.params.id,
   );
   const refund = await response.locals.paymentService.refundCancelledAppointment(response.locals.user, appointment);
-  await notify(response, "appointment.cancelled", appointment);
   return { body: { ...appointment, refund } };
 });
 
@@ -86,7 +69,6 @@ const rescheduleAppointment = handle(async (_request, response) => {
     response.locals.params.id,
     response.locals.body.availability_id,
     ));
-  await notify(response, "appointment.rescheduled", appointment);
   const {
     previous_date: _previousDate,
     previous_start_time: _previousStartTime,

@@ -5,7 +5,8 @@ const { createEmailNotificationService } = require("../src/services/emailNotific
 const config = { BREVO_API_KEY: "test-api-key", BREVO_SENDER_EMAIL: "sender@example.test", BREVO_SENDER_NAME: "Medrella" };
 const appointment = {
   patient_email: "patient@example.test", doctor_first_name: "Dara", doctor_last_name: "Doctor",
-  date: "2099-04-10", start_time: "10:00:00", previous_date: "2099-04-09", previous_start_time: "09:00:00",
+  date: "2099-04-10", start_time: "10:00:00", end_time: "10:30:00", mode: "wave",
+  previous_date: "2099-04-09", previous_start_time: "09:00:00",
 };
 const ok = { ok: true, status: 201 };
 
@@ -21,15 +22,34 @@ describe("Brevo email notification service", () => {
     assert.equal(result.status, 201);
     assert.equal(request.url, "https://api.brevo.com/v3/smtp/email");
     assert.equal(request.options.headers["api-key"], config.BREVO_API_KEY);
+    assert.equal(request.options.headers["content-type"], "application/json");
     assert.deepEqual(body.sender, { email: config.BREVO_SENDER_EMAIL, name: config.BREVO_SENDER_NAME });
     assert.deepEqual(body.to, [{ email: appointment.patient_email }]);
     assert.equal(body.subject, "Appointment rescheduled");
     assert.match(body.textContent, /Previous appointment: 2099-04-09 at 09:00/);
     assert.match(body.textContent, /Date: 2099-04-10/);
+    assert.match(body.textContent, /Time: 10:00–10:30/);
+    assert.match(body.textContent, /Booking mode: Wave/);
     assert.match(body.htmlContent, /#67465F/);
     assert.match(body.htmlContent, /#30252D/);
     assert.match(body.htmlContent, /Doctor/);
+    assert.match(body.htmlContent, /<th|<td[^>]*>10:00–10:30<\/td>/);
+    assert.match(body.htmlContent, />Booking mode</);
     assert.ok(request.options.signal instanceof AbortSignal);
+  });
+
+  it("formats Stream booking windows in both HTML and text alternatives sent to Brevo", async () => {
+    let request;
+    const service = createEmailNotificationService({ config, fetchImpl: async (url, options) => { request = { url, options }; return ok; } });
+    await service.sendAppointmentNotification("booked", { ...appointment, start_time: "10:00:00", end_time: "14:00:00", mode: "stream" });
+    const body = JSON.parse(request.options.body);
+    assert.match(body.textContent, /Time: 10:00–14:00/);
+    assert.match(body.textContent, /Booking mode: Stream/);
+    assert.match(body.htmlContent, /10:00–14:00/);
+    assert.match(body.htmlContent, />Stream</);
+    assert.equal(request.options.headers["content-type"], "application/json");
+    assert.ok(body.htmlContent.startsWith("<!doctype html>"));
+    assert.equal(typeof body.textContent, "string");
   });
 
   it("aborts a stalled request at the configured timeout and retries only within the attempt limit", async () => {
