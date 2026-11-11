@@ -1,4 +1,16 @@
 const { localDateTime, slotStartsInFuture } = require("../utils/schedulingTime");
+const { appointmentEventKey } = require("./notificationDeliveryService");
+
+async function enqueueAppointmentNotification(client, eventType, appointment, actorRole) {
+  const eventKey = appointmentEventKey(eventType, appointment);
+  const fields = ["id", "updated_at", "reschedule_version", "patient_user_id", "doctor_user_id", "patient_first_name", "patient_last_name", "patient_email", "doctor_email", "doctor_first_name", "doctor_last_name", "date", "start_time", "end_time", "mode", "previous_date", "previous_start_time"];
+  const payload = Object.fromEntries(fields.filter((key) => appointment[key] !== undefined).map((key) => [key, appointment[key]]));
+  await client.query(
+    `INSERT INTO appointment_notification_outbox (event_key, event_type, appointment_id, actor_role, payload)
+     VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT (event_key) DO NOTHING`,
+    [eventKey, eventType, appointment.id, actorRole, JSON.stringify(payload)],
+  );
+}
 
 const APPOINTMENT_DETAILS = `
   SELECT a.id, a.status, a.reason, a.cancelled_at,
@@ -229,6 +241,7 @@ async function createPaymentAppointment(client, { availabilityId, patientId, rea
     [patientId, availabilityId, allocation.rows[0].id, reason, slot.date, slot.start_time, slot.end_time, consultationFee],
   );
   const appointment = await readDetails(client, created.rows[0].id);
+  await enqueueAppointmentNotification(client, "appointment.booked", appointment, "system");
   return appointment;
 }
 
@@ -408,6 +421,7 @@ async function cancelAppointment(database, user, appointmentId) {
     await client.query("UPDATE appointment_allocations SET status = 'released', updated_at = NOW() WHERE id = (SELECT allocation_id FROM appointments WHERE id = $1) AND status = 'confirmed'", [appointmentId]);
     await supersedeOpenAssistedRescheduleRequests(client, appointmentId);
     const appointment = await readDetails(client, appointmentId);
+    await enqueueAppointmentNotification(client, "appointment.cancelled", appointment, user.role);
     return appointment;
   });
 }
@@ -469,6 +483,7 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
     await supersedeOpenAssistedRescheduleRequests(client, appointmentId);
     const appointment = await readDetails(client, created.rows[0].id);
     const result = { ...appointment, previous_date: previousAppointment.date, previous_start_time: previousAppointment.start_time };
+    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role);
     return result;
   });
 }
@@ -773,6 +788,7 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
       previous_start_time: original.start_time,
       reschedule_version: updated.rows[0].reschedule_version,
     };
+    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role);
     return result;
   });
 }
@@ -803,6 +819,7 @@ async function completeAppointment(database, user, appointmentId) {
 
 module.exports = {
   AppointmentError,
+  enqueueAppointmentNotification,
   countOccupiedPlaces,
   countOccupiedPlacesForSlots,
   cancelAppointment,

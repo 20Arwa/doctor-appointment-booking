@@ -268,6 +268,7 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
             state.appointment = { ...appointment };
             return { rows: [{ id: appointmentId }] };
           }
+          if (sql.startsWith("INSERT INTO appointment_notification_outbox")) return { rows: [] };
           if (sql.includes("FROM appointments a") && sql.includes("WHERE a.id = $1")) return { rows: state.appointment ? [{ ...state.appointment }] : [] };
           throw new Error(`Unexpected client query: ${sql}`);
         },

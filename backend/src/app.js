@@ -17,6 +17,7 @@ const paymentRoutes = require("./routes/paymentRoutes");
 const { createStripeService } = require("./services/stripeService");
 const { createPaymentService } = require("./services/paymentService");
 const { createNotificationDeliveryService } = require("./services/notificationDeliveryService");
+const { createAppointmentNotificationOutboxService } = require("./services/appointmentNotificationOutboxService");
 const notificationRecoveryRoutes = require("./routes/notificationRecoveryRoutes");
 const inAppNotificationRoutes = require("./routes/inAppNotificationRoutes");
 const { createInAppNotificationService } = require("./services/inAppNotificationService");
@@ -30,6 +31,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
   const stripe = stripeService || createStripeService({ config: paymentConfig });
   const notificationDeliveries = notificationDeliveryService || createNotificationDeliveryService({ database, emailNotificationService, smsNotificationService });
   const inAppNotifications = inAppNotificationService || createInAppNotificationService({ database });
+  const appointmentNotificationOutbox = createAppointmentNotificationOutboxService({ database, notificationDeliveryService: notificationDeliveries, inAppNotificationService: inAppNotifications });
   const payments = paymentService || createPaymentService({
     database,
     stripe,
@@ -59,7 +61,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     service: reminderService || createAppointmentReminderService({ database, emailNotificationService, inAppNotificationService: inAppNotifications, notificationDeliveryService: notificationDeliveries, timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata" }),
     secret: reminderSecret,
   }));
-  app.use("/api/v1/internal/notification-deliveries", notificationRecoveryRoutes({ service: notificationDeliveries, secret: notificationRecoverySecret }));
+  app.use("/api/v1/internal/notification-deliveries", notificationRecoveryRoutes({ service: notificationDeliveries, appointmentNotificationOutboxService: appointmentNotificationOutbox, secret: notificationRecoverySecret }));
   app.use("/api/v1/payments", paymentRoutes({ service: payments }));
   app.use("/api/v1/users", userRoutes);
   app.use("/api/v1/patients", patientRoutes);
