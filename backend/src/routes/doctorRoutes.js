@@ -9,12 +9,15 @@ const { doctorPatientAppointmentsQuerySchema, doctorPatientParamsSchema } = requ
 const scheduleController = require("../controllers/scheduleController");
 const { createScheduleSchema, elasticScheduleSchema, exceptionSchema, generateSchema, scheduleParamsSchema } = require("../validators/scheduleSchemas");
 const elasticScheduleController = require("../controllers/elasticScheduleController");
+const assistedRescheduleController = require("../controllers/assistedRescheduleController");
+const { doctorAssistedRequestsQuerySchema } = require("../validators/assistedRescheduleSchemas");
 
 const router = express.Router();
 router.get("/patients/:patientId/appointments", requireClerkIdentity, requireLocalUser, validate(doctorPatientParamsSchema, "params"), validate(doctorPatientAppointmentsQuerySchema, "query"), listDoctorPatientAppointments);
 router.get("/patients/:patientId", requireClerkIdentity, requireLocalUser, validate(doctorPatientParamsSchema, "params"), getDoctorPatient);
 router.get("/:id/slots", validate(doctorIdParamsSchema, "params"), validate(slotQuerySchema, "query"), requireClerkIdentity, requireLocalUser, getDoctorSlots);
 router.get("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, scheduleController.listSchedules);
+router.get("/:id/assisted-reschedule-requests", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(doctorAssistedRequestsQuerySchema, "query"), assistedRescheduleController.listDoctorRequests);
 router.post("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(createScheduleSchema, "body"), scheduleController.createSchedule);
 router.post("/:id/schedules/:scheduleId/preview", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(elasticScheduleSchema, "body"), elasticScheduleController.previewScheduleUpdate);
 router.put("/:id/schedules/:scheduleId", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(elasticScheduleSchema, "body"), elasticScheduleController.updateSchedule);

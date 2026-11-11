@@ -1,7 +1,11 @@
 const { localDateTime } = require("../utils/schedulingTime");
 const { eachDateInclusive } = require("../utils/dateOnly");
 const { findSchedulePeriodOverlap } = require("../services/schedulePeriodConflictService");
-const { appointmentAffectedByException, failForProtectedAppointments, findProtectedAppointmentsForScheduleDate } = require("../services/scheduleProtectionService");
+const {
+  appointmentAffectedByException,
+  failForProtectedAppointments,
+  findProtectedAppointmentsForScheduleDate,
+} = require("../services/scheduleProtectionService");
 
 async function owner(response, doctorId) {
   if (response.locals.user.role !== "doctor") return false;
@@ -409,11 +413,95 @@ async function createException(_request, response, next) {
         }
       }
     }
-    await client.query("SELECT id FROM availability WHERE schedule_id = $1 AND date = $2::date AND deleted_at IS NULL FOR UPDATE", [scheduleId, input.service_date]);
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
-    const protectedCandidates = await findProtectedAppointmentsForScheduleDate(client, scheduleId, input.service_date, response.locals.applicationTimezone || "Asia/Kolkata");
-    const affectedProtectedAppointments = protectedCandidates.filter((appointment) => appointmentAffectedByException(appointment, input.exception_type, input.periods));
-    if (failForProtectedAppointments(response, affectedProtectedAppointments)) { await client.query("ROLLBACK"); return; }
+    const existingException = await client.query(
+      "SELECT id, exception_type FROM doctor_schedule_exceptions WHERE schedule_id = $1 AND service_date = $2::date FOR UPDATE",
+      [scheduleId, input.service_date],
+    );
+    const existingExceptionRow = existingException.rows[0];
+    if (existingExceptionRow) {
+      if (existingExceptionRow.exception_type !== input.exception_type) {
+        await client.query("ROLLBACK");
+        return fail(response, 409, "SCHEDULE_EXCEPTION_CONFLICT", "A different exception already exists for this date");
+      }
+      const existingExceptionPeriods = await client.query(
+        "SELECT start_time::text AS start_time, end_time::text AS end_time FROM doctor_schedule_exception_periods WHERE exception_id = $1 ORDER BY start_time",
+        [existingExceptionRow.id],
+      );
+      const samePeriods = existingExceptionPeriods.rows.length === input.periods.length
+        && input.periods.every((period) => existingExceptionPeriods.rows.some((item) =>
+          item.start_time.slice(0, 5) === period.start_time && item.end_time.slice(0, 5) === period.end_time));
+      if (!samePeriods) {
+        await client.query("ROLLBACK");
+        return fail(response, 409, "SCHEDULE_EXCEPTION_CONFLICT", "A different exception already exists for this date");
+      }
+    } else {
+      await client.query("SELECT id FROM availability WHERE schedule_id = $1 AND date = $2::date AND deleted_at IS NULL FOR UPDATE", [scheduleId, input.service_date]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
+      const protectedCandidates = await findProtectedAppointmentsForScheduleDate(
+        client, scheduleId, input.service_date, response.locals.applicationTimezone || "Asia/Kolkata",
+      );
+      const affectedProtectedAppointments = protectedCandidates.filter((appointment) =>
+        appointmentAffectedByException(appointment, input.exception_type, input.periods));
+      if (failForProtectedAppointments(response, affectedProtectedAppointments)) {
+        await client.query("ROLLBACK");
+        return;
+      }
+      if (input.exception_type === "additional") {
+        for (const period of input.periods) {
+          const overlappingHold = await client.query(
+            `SELECT 1 FROM availability av
+             WHERE av.doctor_id = $1 AND av.date = $2::date AND av.deleted_at IS NULL
+               AND av.start_time < $4::time AND av.end_time > $3::time
+               AND (EXISTS (SELECT 1 FROM appointment_slot_holds hold
+                     WHERE hold.availability_id = av.id AND hold.status = 'active' AND hold.expires_at > NOW())
+                 OR EXISTS (SELECT 1 FROM appointment_allocations allocation
+                     WHERE allocation.availability_id = av.id AND allocation.status = 'held' AND allocation.expires_at > NOW()))
+             LIMIT 1`, [id, input.service_date, period.start_time, period.end_time],
+          );
+          if (overlappingHold.rows[0]) {
+            await client.query("ROLLBACK");
+            return fail(response, 409, "SCHEDULE_EXCEPTION_HELD", "Added hours overlap an active payment hold. Wait for it to finish before changing availability.");
+          }
+        }
+      } else {
+        const activeHolds = await client.query(
+          `SELECT 1 FROM availability av
+           WHERE av.schedule_id = $1 AND av.date = $2::date AND av.deleted_at IS NULL
+             AND (EXISTS (SELECT 1 FROM appointment_slot_holds hold WHERE hold.availability_id = av.id AND hold.status = 'active' AND hold.expires_at > NOW())
+               OR EXISTS (SELECT 1 FROM appointment_allocations allocation WHERE allocation.availability_id = av.id AND allocation.status = 'held' AND allocation.expires_at > NOW()))
+           LIMIT 1`, [scheduleId, input.service_date],
+        );
+        if (activeHolds.rows[0]) {
+          await client.query("ROLLBACK");
+          return fail(response, 409, "SCHEDULE_EXCEPTION_HELD", "This date has an active payment hold. Wait for it to finish before changing availability.");
+        }
+        const confirmedAppointments = await client.query(
+          `SELECT appointment.scheduled_start_time::text AS start_time,
+                  appointment.scheduled_end_time::text AS end_time
+           FROM appointments appointment
+           JOIN availability av ON av.id = appointment.availability_id
+           WHERE av.schedule_id = $1 AND av.date = $2::date AND av.deleted_at IS NULL
+             AND appointment.status = 'confirmed'
+             AND ((appointment.scheduled_date + appointment.scheduled_end_time) AT TIME ZONE $3) > NOW()`,
+          [scheduleId, input.service_date, response.locals.applicationTimezone || "Asia/Kolkata"],
+        );
+        const affectedConfirmedAppointment = confirmedAppointments.rows.some((appointment) =>
+          appointmentAffectedByException(appointment, input.exception_type, input.periods));
+        const confirmedAllocations = await client.query(
+          `SELECT 1 FROM appointment_allocations allocation
+           JOIN availability av ON av.id = allocation.availability_id
+           WHERE av.schedule_id = $1 AND av.date = $2::date AND av.deleted_at IS NULL
+             AND allocation.status = 'confirmed'
+             AND NOT EXISTS (SELECT 1 FROM appointments linked
+               WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed')
+           LIMIT 1`, [scheduleId, input.service_date],
+        );
+        if (affectedConfirmedAppointment || confirmedAllocations.rows[0]) {
+          await client.query("ROLLBACK");
+          return fail(response, 409, "SCHEDULE_EXCEPTION_BOOKED", "This date has a confirmed appointment and cannot be changed safely.");
+        }
+      }
+    }
     const inserted = await client.query("INSERT INTO doctor_schedule_exceptions (schedule_id, service_date, exception_type) VALUES ($1,$2::date,$3) ON CONFLICT (schedule_id, service_date) DO NOTHING RETURNING id, schedule_id, service_date::text AS service_date, exception_type", [scheduleId, input.service_date, input.exception_type]);
     const exception = inserted.rows[0] ?? (await client.query("SELECT id, schedule_id, service_date::text AS service_date, exception_type FROM doctor_schedule_exceptions WHERE schedule_id = $1 AND service_date = $2::date FOR UPDATE", [scheduleId, input.service_date])).rows[0];
     if (!exception || exception.exception_type !== input.exception_type) {
@@ -427,40 +515,9 @@ async function createException(_request, response, next) {
       return fail(response, 409, "SCHEDULE_EXCEPTION_CONFLICT", "A different exception already exists for this date");
     }
     if (inserted.rows[0]) {
-      if (input.exception_type === "additional") {
-        for (const period of input.periods) {
-          const overlappingHold = await client.query(
-            `SELECT 1 FROM availability av WHERE av.doctor_id = $1 AND av.date = $2::date AND av.deleted_at IS NULL
-               AND av.start_time < $4::time AND av.end_time > $3::time
-               AND (EXISTS (SELECT 1 FROM appointment_slot_holds hold WHERE hold.availability_id = av.id AND hold.status = 'active' AND hold.expires_at > NOW())
-                 OR EXISTS (SELECT 1 FROM appointment_allocations allocation WHERE allocation.availability_id = av.id AND allocation.status = 'held' AND allocation.expires_at > NOW())) LIMIT 1`,
-            [id, input.service_date, period.start_time, period.end_time],
-          );
-          if (overlappingHold.rows[0]) { await client.query("ROLLBACK"); return fail(response, 409, "SCHEDULE_EXCEPTION_HELD", "Added hours overlap an active payment hold. Wait for it to finish before changing availability."); }
-        }
-      } else {
-        const activeHolds = await client.query(
-          `SELECT 1 FROM availability av WHERE av.schedule_id = $1 AND av.date = $2::date AND av.deleted_at IS NULL
-             AND (EXISTS (SELECT 1 FROM appointment_slot_holds hold WHERE hold.availability_id = av.id AND hold.status = 'active' AND hold.expires_at > NOW())
-               OR EXISTS (SELECT 1 FROM appointment_allocations allocation WHERE allocation.availability_id = av.id AND allocation.status = 'held' AND allocation.expires_at > NOW())) LIMIT 1`,
-          [scheduleId, input.service_date],
-        );
-        if (activeHolds.rows[0]) { await client.query("ROLLBACK"); return fail(response, 409, "SCHEDULE_EXCEPTION_HELD", "This date has an active payment hold. Wait for it to finish before changing availability."); }
-        const confirmedAppointments = await client.query(
-          `SELECT appointment.scheduled_start_time::text AS start_time, appointment.scheduled_end_time::text AS end_time
-           FROM appointments appointment JOIN availability av ON av.id = appointment.availability_id
-           WHERE av.schedule_id = $1 AND av.date = $2::date AND av.deleted_at IS NULL AND appointment.status = 'confirmed'
-             AND ((appointment.scheduled_date + appointment.scheduled_end_time) AT TIME ZONE $3) > NOW()`,
-          [scheduleId, input.service_date, response.locals.applicationTimezone || "Asia/Kolkata"],
-        );
-        const affectedConfirmedAppointment = confirmedAppointments.rows.some((appointment) => appointmentAffectedByException(appointment, input.exception_type, input.periods));
-        const confirmedAllocations = await client.query(
-          `SELECT 1 FROM appointment_allocations allocation JOIN availability av ON av.id = allocation.availability_id
-           WHERE av.schedule_id = $1 AND av.date = $2::date AND av.deleted_at IS NULL AND allocation.status = 'confirmed'
-             AND NOT EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') LIMIT 1`,
-          [scheduleId, input.service_date],
-        );
-        if (affectedConfirmedAppointment || confirmedAllocations.rows[0]) { await client.query("ROLLBACK"); return fail(response, 409, "SCHEDULE_EXCEPTION_BOOKED", "This date has a confirmed appointment and cannot be changed safely."); }
+      if (input.exception_type !== "additional") {
+        await client.query("SELECT id FROM availability WHERE schedule_id = $1 AND date = $2::date AND deleted_at IS NULL FOR UPDATE", [scheduleId, input.service_date]);
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [id]);
         await client.query("UPDATE availability SET deleted_at = NOW(), updated_at = NOW() WHERE schedule_id = $1 AND date = $2::date AND deleted_at IS NULL", [scheduleId, input.service_date]);
         await client.query("UPDATE doctor_schedule_windows SET deleted_at = NOW() WHERE schedule_id = $1 AND service_date = $2::date AND deleted_at IS NULL", [scheduleId, input.service_date]);
       }
