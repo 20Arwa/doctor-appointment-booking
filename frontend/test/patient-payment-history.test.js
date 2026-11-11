@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import Module from "node:module";
+import Module, { createRequire } from "node:module";
 import path from "node:path";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -8,15 +8,34 @@ import ts from "typescript";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
+const require = createRequire(import.meta.url);
+
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const componentPath = path.join(projectRoot, "components", "payment-history-view.tsx");
 const source = fs.readFileSync(componentPath, "utf8");
+const dateFormatPath = path.join(projectRoot, "lib", "date-format.ts");
+const dateFormatModule = new Module(dateFormatPath);
+dateFormatModule.filename = dateFormatPath;
+dateFormatModule.paths = Module._nodeModulePaths(path.dirname(dateFormatPath));
+dateFormatModule._compile(ts.transpileModule(fs.readFileSync(dateFormatPath, "utf8"), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText, dateFormatPath);
+require.cache[dateFormatPath] = dateFormatModule;
 const paymentHistoryModule = new Module(componentPath);
 paymentHistoryModule.filename = componentPath;
 paymentHistoryModule.paths = Module._nodeModulePaths(path.dirname(componentPath));
-paymentHistoryModule._compile(ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
-}).outputText, componentPath);
+const resolveFilename = Module._resolveFilename;
+Module._resolveFilename = function resolveTestAlias(request, parent, isMain, options) {
+  if (request === "@/lib/date-format") return dateFormatPath;
+  return resolveFilename.call(this, request, parent, isMain, options);
+};
+try {
+  paymentHistoryModule._compile(ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
+  }).outputText, componentPath);
+} finally {
+  Module._resolveFilename = resolveFilename;
+}
 const { PaymentHistoryView, paymentStatusLabel, refundStatusLabel } = paymentHistoryModule.exports;
 const estimatePath = path.join(projectRoot, "components", "cancellation-refund-estimate.tsx");
 const estimateSource = fs.readFileSync(estimatePath, "utf8");

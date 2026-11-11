@@ -5,6 +5,7 @@ import { CalendarCheck2, CalendarClock, CalendarDays, CalendarPlus, Clock3, Hist
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { getAppointments, type PatientAppointment } from "@/lib/profile-api";
+import { formatInstantDate } from "@/lib/date-format";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
 
@@ -38,7 +39,7 @@ function getCounts(appointments: PatientAppointment[], now: number) {
 }
 
 function formatAppointmentDate(instant: Date) {
-  return new Intl.DateTimeFormat("en-IN", { dateStyle: "full", timeZone: APPLICATION_TIME_ZONE }).format(instant);
+  return formatInstantDate(instant, APPLICATION_TIME_ZONE);
 }
 
 function formatAppointmentTime(instant: Date) {

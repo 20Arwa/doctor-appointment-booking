@@ -17,6 +17,7 @@ import { emptyOnboardingForm, onboardingFormSchema, type OnboardingFormValues } 
 import { dashboardPath } from "@/lib/roles";
 import { MEDICAL_SPECIALTIES } from "@/lib/medical-specialties";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { DateInput } from "@/components/ui/date-input";
 
 type Role = "patient" | "doctor";
 type FieldName = keyof OnboardingFormValues;
@@ -340,7 +341,17 @@ function Field({
   return (
     <div>
       <label htmlFor={name} className="mb-1.5 block text-sm font-medium text-foreground">{label}{required && <span aria-hidden="true"> *</span>}</label>
-      <input
+      {type === "date" ? <DateInput
+        id={name}
+        name={name}
+        value={value}
+        required={required}
+        disabled={disabled}
+        aria-invalid={Boolean(error)}
+        aria-describedby={error ? errorId : undefined}
+        onChange={onChange}
+        className="min-h-11 w-full rounded-lg border border-input bg-background px-3.5 py-2.5 text-sm text-foreground outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground"
+      /> : <input
         id={name}
         name={name}
         type={type}
@@ -352,7 +363,7 @@ function Field({
         aria-describedby={error ? errorId : undefined}
         onChange={(event) => onChange(event.target.value)}
         className="min-h-11 w-full rounded-lg border border-input bg-background px-3.5 py-2.5 text-sm text-foreground outline-none transition-shadow placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground"
-      />
+      />}
       {error && <p id={errorId} className="mt-1.5 text-sm text-destructive">{error}</p>}
     </div>
   );

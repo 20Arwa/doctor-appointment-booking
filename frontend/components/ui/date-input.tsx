@@ -75,7 +75,7 @@ export function DateInput({ id, name, value, defaultValue = "", onChange, min, m
   const currentValue = value ?? internalValue;
   const draft = draftOverride?.sourceValue === currentValue ? draftOverride.text : formatDateInput(currentValue);
   const initialMonth = currentValue || min || todayInApplicationZone();
-  const [visibleMonth, setVisibleMonth] = useState(`${initialMonth.slice(0, 7)}-01`);
+  const [visibleMonth, setVisibleMonth] = useState(monthWithinBounds(initialMonth, min, max));
   const visibleRangeKey = `${currentValue}\u0000${min ?? ""}\u0000${max ?? ""}`;
   const [synchronizedRangeKey, setSynchronizedRangeKey] = useState(visibleRangeKey);
   if (synchronizedRangeKey !== visibleRangeKey) {
@@ -97,8 +97,18 @@ export function DateInput({ id, name, value, defaultValue = "", onChange, min, m
 
   useEffect(() => {
     const parsed = parseDisplayDate(draft);
-    const outsideRange = parsed && ((min && parsed < min) || (max && parsed > max));
-    inputRef.current?.setCustomValidity(outsideRange ? "Choose a date within the allowed range." : "");
+    const invalidDate = draft.trim() !== "" && !parsed;
+    const outsideRange = Boolean(
+      parsed && ((min && parsed < min) || (max && parsed > max))
+    );
+
+    inputRef.current?.setCustomValidity(
+      invalidDate
+        ? "Enter a valid date."
+        : outsideRange
+          ? "Choose a date within the allowed range."
+          : ""
+    );
   }, [draft, max, min]);
 
   function selectDate(date: string) {

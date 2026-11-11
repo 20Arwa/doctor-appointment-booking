@@ -21,6 +21,7 @@ import { notifyInAppNotificationsChanged, notifySuccess } from "@/lib/notificati
 import { AppShellLoading } from "@/components/app-shell-loading";
 import { CheckoutReturnNotice, type CheckoutReturnState } from "@/components/checkout-return-notice";
 import { cancelAppointmentPaymentOrder, createAppointmentPaymentOrder, getAppointmentPaymentStatus, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
+import { formatDateOnly } from "@/lib/date-format";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
 const inrFormatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
@@ -79,11 +80,7 @@ function isBookableInMonth(slot: AvailabilitySlot, from: string, to: string, now
 }
 
 function formatSlotDate(date: string) {
-  const [year, month, day] = date.split("-").map(Number);
-  return new Intl.DateTimeFormat("en-IN", {
-    dateStyle: "full",
-    timeZone: "UTC",
-  }).format(new Date(Date.UTC(year, month - 1, day)));
+  return formatDateOnly(date);
 }
 
 function formatSlotTime(time: string) {

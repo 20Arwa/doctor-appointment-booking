@@ -18,6 +18,7 @@ import {
 import { deleteDoctorSlot, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DoctorSchedule, type ElasticSchedulePreview, type ElasticScheduleInput, createDoctorSchedule, createScheduleException, generateDoctorAvailability, getDoctorSchedules, previewDoctorScheduleUpdate, updateDoctorSchedule, updateDoctorProfile } from "@/lib/profile-api";
 import { notifySuccess } from "@/lib/notifications";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { formatDateOnly } from "@/lib/date-format";
 import { DateInput } from "@/components/ui/date-input";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
@@ -31,13 +32,11 @@ function todayInApplicationZone() {
 }
 
 function formatDate(date: string) {
-  const [year, month, day] = date.split("-").map(Number);
-  return new Intl.DateTimeFormat("en-IN", { dateStyle: "full", timeZone: "UTC" })
-    .format(new Date(Date.UTC(year, month - 1, day)));
+  return formatDateOnly(date);
 }
 
 function formatScheduleDate(date: string | null) {
-  return date ? formatDate(date) : "Not set";
+  return date ? formatDateOnly(date) : "Not set";
 }
 
 function groupByDate<T extends { date: string }>(items: T[]) {
