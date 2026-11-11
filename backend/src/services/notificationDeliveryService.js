@@ -98,6 +98,9 @@ function createNotificationDeliveryService({ database, emailNotificationService,
     let outcome;
     try {
       if (row.channel === "sms") {
+        if (row.event_type === "appointment.assisted_reschedule_requested") {
+          outcome = { sent: false, skipped: true, reason: "appointment_not_eligible", attempts: 0 };
+        } else
         if (row.event_type === "appointment.reminder_24h" || row.event_type === "appointment.reminder_1h") {
           let current;
           try {
@@ -185,7 +188,21 @@ function createNotificationDeliveryService({ database, emailNotificationService,
           }
         }
       } else {
-        outcome = typeof emailNotificationService.sendNotificationPayload === "function"
+        if (row.event_type === "appointment.assisted_reschedule_requested") {
+          try {
+            const eligible = await database.query(
+              `SELECT 1 FROM assisted_reschedule_requests request
+               JOIN appointments appointment ON appointment.id = request.appointment_id
+               JOIN patients patient ON patient.id = request.patient_id
+               WHERE request.appointment_id = $1 AND patient.user_id = $2
+                 AND request.status = 'pending_patient' AND request.expires_at > NOW()
+                 AND appointment.status = 'confirmed' AND appointment.updated_at = request.appointment_updated_at LIMIT 1`,
+              [row.appointment_id, row.recipient_user_id],
+            );
+            if (!eligible.rows[0]) outcome = { sent: false, skipped: true, reason: "appointment_not_eligible", attempts: 0 };
+          } catch (_error) { outcome = { sent: false, reason: "unexpected_error", attempts: 1 }; }
+        }
+        if (!outcome) outcome = typeof emailNotificationService.sendNotificationPayload === "function"
           ? await emailNotificationService.sendNotificationPayload(row.payload, row.idempotency_key, { maxAttempts: MAX_ATTEMPTS - (row.attempt_count || 0) })
           : await emailNotificationService.sendAppointmentNotification(row.event_type.slice("appointment.".length), row.appointment || {});
       }
@@ -196,6 +213,7 @@ function createNotificationDeliveryService({ database, emailNotificationService,
   }
 
   async function sendAppointmentNotification({ eventKey, eventType, appointment, actorRole = "patient" }) {
+    if (eventType === "appointment.assisted_reschedule_requested") return { sent: false, skipped: true, reason: "dedicated_dispatch_required", outcomes: [] };
     const recipients = [{ type: "patient", userId: appointment.patient_user_id, email: appointment.patient_email }];
     if (eventType !== "appointment.rescheduled" || actorRole !== "doctor") {
       recipients.push({ type: "doctor", userId: appointment.doctor_user_id, email: appointment.doctor_email });
@@ -245,8 +263,34 @@ function createNotificationDeliveryService({ database, emailNotificationService,
     return { sent, duplicate: !sent && outcomes.some((outcome) => outcome.duplicate), outcomes };
   }
 
+  async function sendAssistedRescheduleEmail({ eventKey, appointment, recipientUserId, appointmentUrl }) {
+    const eventType = "appointment.assisted_reschedule_requested";
+    const recipient = { type: "patient", userId: recipientUserId, email: appointment.patient_email };
+    if (!recipient.userId || !recipient.email) return { sent: false, skipped: true, reason: "missing_recipient" };
+    if (typeof emailNotificationService.createAssistedReschedulePayload !== "function") {
+      throw new TypeError("Email service does not support assisted reschedule notifications");
+    }
+    const payload = emailNotificationService.createAssistedReschedulePayload(appointment, appointmentUrl);
+    const delivery = await createDelivery({ eventKey, eventType, appointment, recipient, payload });
+    if (!delivery) return { sent: false, reason: "tracking_unavailable" };
+    if (delivery.created) {
+      const outcome = await dispatch({ ...delivery, event_type: eventType, appointment }, delivery.lease_token);
+      return { ...outcome, retryable: !outcome.sent && !outcome.skipped && !outcome.ambiguous && !outcome.permanent };
+    }
+    const existing = await database.query(
+      "SELECT status, failure_classification, next_attempt_at, lease_expires_at FROM notification_deliveries WHERE event_key = $1 AND channel = 'email'",
+      [eventKey],
+    );
+    const row = existing.rows[0];
+    if (row?.status === "accepted") return { sent: true, duplicate: true };
+    return { sent: false, duplicate: true, status: row?.status || "missing",
+      retryable: row?.status === "failed" && row.failure_classification === "transient",
+      nextAttemptAt: row?.next_attempt_at || row?.lease_expires_at || null };
+  }
+
   // Records each event's SMS delivery independently from its email delivery.
   async function sendSmsDelivery({ eventKey, eventType, appointment, recipient, to, consent = false, deferEligibility = false, message, payloadExtra = {} }) {
+    if (eventType === "appointment.assisted_reschedule_requested") return { sent: false, skipped: true, reason: "appointment_not_eligible" };
     if (!recipient?.userId || !message) return { sent: false, skipped: true, reason: "missing_recipient" };
     const isReminder = eventType === "appointment.reminder_24h" || eventType === "appointment.reminder_1h";
     const resolveEligibilityAtDispatch = deferEligibility || isReminder;
@@ -334,7 +378,7 @@ function createNotificationDeliveryService({ database, emailNotificationService,
     return { claimed: claim.rows.length, retried, markedAmbiguous: (stale.rowCount || stale.rows.length) + (expired.rowCount || expired.rows.length) };
   }
 
-  return { sendAppointmentNotification, sendSmsDelivery, runRecovery };
+  return { sendAppointmentNotification, sendAssistedRescheduleEmail, sendSmsDelivery, runRecovery };
 }
 
 function appointmentEventKey(eventType, appointment) {

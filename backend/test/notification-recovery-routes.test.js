@@ -26,6 +26,7 @@ describe("notification delivery recovery endpoint", () => {
         retried: 1,
         markedAmbiguous: 0,
         appointmentNotificationOutbox: { claimed: 0, processed: 0, pending: 0 },
+        assistedRescheduling: { claimed: 0, dispatched: 0, failed: 0, skipped: 0 },
       });
       assert.equal(runs, 1);
     } finally {

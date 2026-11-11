@@ -3,10 +3,10 @@
 import { useAuth } from "@clerk/nextjs";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { CalendarClock, CheckCircle2, RefreshCw, CalendarPlus } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { CalendarClock, CheckCircle2, RefreshCw, CalendarPlus, ChevronDown, ChevronUp } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { completeDoctorAppointment, doctorRescheduleAppointment, getAppointment, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type PatientAppointment } from "@/lib/profile-api";
+import { completeDoctorAppointment, doctorRescheduleAppointment, getAppointment, getCurrentProfile, getDoctorAssistedRequests, getDoctorSlots, ProfileApiError, type AssistedDoctorRequest, type AvailabilitySlot, type PatientAppointment } from "@/lib/profile-api";
 import { notifyError, notifyInAppNotificationsChanged, notifySuccess } from "@/lib/notifications";
 import { useAppointmentHistory } from "@/components/use-appointment-history";
 import { AppointmentAvailabilityCalendar } from "@/components/appointment-availability-calendar";
@@ -73,6 +73,28 @@ export function DoctorAppointmentsPage() {
   const [rescheduleDate, setRescheduleDate] = useState(todayInIndia());
   const [selectedSlotId, setSelectedSlotId] = useState("");
   const [rescheduleError, setRescheduleError] = useState<string | null>(null);
+  const [assistedRequests, setAssistedRequests] = useState<AssistedDoctorRequest[]>([]);
+  const [assistedLoading, setAssistedLoading] = useState(true);
+  const [assistedError, setAssistedError] = useState<string | null>(null);
+
+  const loadAssistedRequests = useCallback(async () => {
+    setAssistedLoading(true);
+    setAssistedError(null);
+    try {
+      const token = await getToken();
+      if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+      const profile = await getCurrentProfile(token);
+      if (profile.role !== "doctor") throw new Error("Doctor account details are unavailable.");
+      setAssistedRequests(await getDoctorAssistedRequests(token, profile.profile.id));
+    } catch (cause) {
+      setAssistedError(cause instanceof Error ? cause.message : "We couldn't load assisted rescheduling requests.");
+    } finally { setAssistedLoading(false); }
+  }, [getToken]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void loadAssistedRequests(), 0);
+    return () => window.clearTimeout(timer);
+  }, [loadAssistedRequests]);
 
   useEffect(() => {
     const initialTime = window.setTimeout(() => setCurrentTime(Date.now()), 0);
@@ -238,6 +260,26 @@ export function DoctorAppointmentsPage() {
     } finally { setActiveAppointment(null); mutationLock.current = false; }
   }
 
+  const pendingAssistedRequests = assistedRequests.filter((request) => request.status === "pending_patient");
+  const assistedRequestHistory = assistedRequests.filter((request) => request.status !== "pending_patient");
+  const renderAssistedRequest = (request: AssistedDoctorRequest) => {
+    const label = request.status === "pending_patient" ? "Waiting for patient" : request.status === "no_alternatives" ? "No alternatives found" : request.status === "accepted" ? "Accepted" : request.status === "declined" ? "Declined" : request.status === "expired" ? "Expired" : "Superseded";
+    const closed = ["accepted", "declined", "expired", "superseded"].includes(request.status) || request.appointment_status !== "confirmed";
+    return <li key={request.id} className="rounded-xl border border-border bg-background p-3 sm:p-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <p className="font-medium text-foreground">{request.patient_first_name} {request.patient_last_name}</p>
+          <p className="mt-1 text-sm text-muted-foreground">{formatDate(request.previous_date)} · {formatTime(request.previous_start_time)}–{formatTime(request.previous_end_time)} IST</p>
+          <p className="mt-1 text-xs text-muted-foreground">{request.mode === "wave" ? "Wave" : "Stream"} · {request.suggestion_count > 0 ? `${request.suggestion_count} saved alternative${request.suggestion_count === 1 ? "" : "s"}` : "No saved alternatives"}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-3 sm:justify-end">
+          <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${closed ? "bg-muted text-muted-foreground" : "bg-secondary text-secondary-foreground"}`}>{request.appointment_status !== "confirmed" ? "Appointment no longer confirmed" : label}</span>
+          <Link href={`/doctor/appointments?appointment=${encodeURIComponent(request.appointment_id)}`} className="text-sm font-semibold text-primary underline-offset-4 hover:underline">View appointment</Link>
+        </div>
+      </div>
+    </li>;
+  };
+
   return (
     <div className="mx-auto max-w-5xl space-y-8">
       <header>
@@ -245,6 +287,25 @@ export function DoctorAppointmentsPage() {
         <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">My appointments</h1>
         <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">Review your scheduled and past appointments.</p>
       </header>
+
+      <section className="rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-5" aria-labelledby="assisted-rescheduling-heading">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div><h2 id="assisted-rescheduling-heading" className="text-xl font-semibold text-foreground">Assisted rescheduling</h2><p className="mt-1 text-sm text-muted-foreground">Track appointments affected by schedule changes and patient responses.</p></div>
+          <Button type="button" variant="outline" size="sm" onClick={() => void loadAssistedRequests()} disabled={assistedLoading}><RefreshCw aria-hidden="true" className="size-4" /> Refresh</Button>
+        </div>
+        {assistedLoading ? <p className="mt-4 text-sm text-muted-foreground" role="status">Loading assisted requests…</p> : null}
+        {!assistedLoading && assistedError ? <div className="mt-4 rounded-lg border border-destructive/30 bg-destructive/5 p-3" role="alert"><p className="text-sm text-destructive">{assistedError}</p><button type="button" onClick={() => void loadAssistedRequests()} className="mt-2 text-sm font-medium text-primary underline">Try again</button></div> : null}
+        {!assistedLoading && !assistedError ? <div className="mt-4 space-y-4">
+          <section aria-labelledby="awaiting-patient-response-heading">
+            <h3 id="awaiting-patient-response-heading" className="text-sm font-semibold text-foreground">Awaiting patient response <span className="ml-1 font-normal text-muted-foreground">({pendingAssistedRequests.length})</span></h3>
+            {pendingAssistedRequests.length ? <ul className="mt-2 grid gap-2 sm:grid-cols-2">{pendingAssistedRequests.map(renderAssistedRequest)}</ul> : <p className="mt-2 rounded-lg bg-muted p-3 text-sm text-muted-foreground">No requests are awaiting a patient response.</p>}
+          </section>
+          {assistedRequestHistory.length ? <details className="group rounded-xl border border-border">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-xl px-3 py-3 font-semibold text-foreground hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"><span>Request history <span className="ml-1 font-normal text-muted-foreground">({assistedRequestHistory.length})</span></span><span className="text-muted-foreground"><ChevronDown aria-hidden="true" className="size-4 group-open:hidden" /><ChevronUp aria-hidden="true" className="hidden size-4 group-open:block" /></span></summary>
+            <ul className="grid gap-2 border-t border-border p-3 sm:grid-cols-2">{assistedRequestHistory.map(renderAssistedRequest)}</ul>
+          </details> : null}
+        </div> : null}
+      </section>
 
       {loading ? <p className="rounded-2xl bg-muted p-6 text-sm text-muted-foreground" role="status">Loading your appointments…</p> : null}
       {!loading && error ? (

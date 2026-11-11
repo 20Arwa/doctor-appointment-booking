@@ -179,6 +179,28 @@ export type DirectoryDoctor = z.infer<typeof doctorSchema>;
 export type DoctorPatient = z.infer<typeof doctorPatientSchema>;
 export type PatientAppointment = z.infer<typeof appointmentSchema>;
 export type AvailabilitySlot = z.infer<typeof availabilitySlotSchema>;
+
+const assistedSuggestionSchema = z.object({
+  id: z.string().uuid(), availability_id: z.string().uuid(), mode: z.enum(["wave", "stream"]),
+  date: z.iso.date(), start_time: z.string(), end_time: z.string(),
+  remaining_capacity_at_suggestion: z.number().int().nonnegative(), rank: z.number().int().positive(),
+});
+const assistedRequestStatusSchema = z.enum(["pending_patient", "no_alternatives", "accepted", "declined", "expired", "superseded"]);
+const assistedPatientRequestSchema = z.object({
+  id: z.string().uuid(), appointment_id: z.string().uuid(), status: assistedRequestStatusSchema,
+  mode: z.enum(["wave", "stream"]), previous_date: z.iso.date(), previous_start_time: z.string(), previous_end_time: z.string(),
+  appointment_updated_at: z.string(), expires_at: z.string(), appointment_status: z.enum(["confirmed", "cancelled", "completed"]),
+  created_at: z.string(), updated_at: z.string(),
+  doctor_first_name: z.string(), doctor_last_name: z.string(), suggestions: z.array(assistedSuggestionSchema),
+});
+export type AssistedRescheduleSuggestion = z.infer<typeof assistedSuggestionSchema>;
+export type AssistedPatientRequest = z.infer<typeof assistedPatientRequestSchema>;
+export type AssistedDoctorRequest = {
+  id: string; appointment_id: string; patient_id: string; previous_date: string;
+  previous_start_time: string; previous_end_time: string; mode: "wave" | "stream";
+  status: z.infer<typeof assistedRequestStatusSchema>; created_at: string; updated_at: string;
+  expires_at: string; patient_first_name: string; patient_last_name: string; appointment_status: string; suggestion_count: number;
+};
 const scheduleDateSchema = z.iso.date();
 const schedulePeriodSchema = z.object({ weekday: z.number().int().min(0).max(6).nullable().optional(), service_date: scheduleDateSchema.nullable().optional(), start_time: z.string(), end_time: z.string() });
 const doctorScheduleSchema = z.object({ id: z.string().uuid(), mode: z.enum(["wave", "stream"]), recurrence_type: z.enum(["weekly", "specific_dates"]), visibility: z.enum(["public", "private"]), active: z.boolean(), starts_on: scheduleDateSchema.nullable(), ends_on: scheduleDateSchema.nullable(), updated_at: z.string().optional(), wave_capacity_per_slot: z.number().int(), stream_capacity_per_window: z.number().int(), periods: z.array(schedulePeriodSchema) });
@@ -272,7 +294,11 @@ async function request<T>(token: string | undefined, path: string, init: Request
     }).safeParse(payload);
     const details = error.success ? error.data.error?.details : undefined;
     const validationDetails = z.array(z.object({ path: z.string(), message: z.string() })).safeParse(details);
-    const protectedDetails = z.object({ protected_appointments: z.array(z.object({ appointment_id: z.string(), date: z.string(), start_time: z.string(), end_time: z.string() })) }).safeParse(details);
+    const protectedDetails = z.object({
+      protected_appointments: z.array(z.object({
+        appointment_id: z.string(), date: z.string(), start_time: z.string(), end_time: z.string(),
+      })),
+    }).safeParse(details);
     throw new ProfileApiError(
       response.status,
       error.success ? error.data.error?.message ?? "The request could not be completed." : "The request could not be completed.",
@@ -347,6 +373,40 @@ export async function getDoctorSlots(token: string, doctorId: string, from: stri
   const parsed = z.array(availabilitySlotSchema).safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete availability list.");
   return parsed.data;
+}
+
+export async function getDoctorAssistedRequests(token: string, doctorId: string): Promise<AssistedDoctorRequest[]> {
+  const payload = await request<{ items: unknown[] }>(token, `/doctors/${encodeURIComponent(doctorId)}/assisted-reschedule-requests?limit=100&offset=0`);
+  const parsed = z.array(z.object({
+    id: z.string().uuid(), appointment_id: z.string().uuid(), patient_id: z.string().uuid(),
+    previous_date: z.iso.date(), previous_start_time: z.string(), previous_end_time: z.string(),
+    mode: z.enum(["wave", "stream"]), status: assistedRequestStatusSchema,
+    expires_at: z.string(),
+    created_at: z.string(), updated_at: z.string(), patient_first_name: z.string(), patient_last_name: z.string(),
+    appointment_status: z.string(), suggestion_count: z.coerce.number().int().nonnegative(),
+  })).safeParse(payload.items);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete assisted rescheduling list.");
+  return parsed.data;
+}
+
+export async function getPatientAssistedRequest(token: string, appointmentId: string): Promise<AssistedPatientRequest> {
+  const payload = await request<unknown>(token, `/appointments/${encodeURIComponent(appointmentId)}/assisted-reschedule-request`);
+  const parsed = assistedPatientRequestSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete assisted rescheduling request.");
+  return parsed.data;
+}
+
+export async function confirmPatientAssistedReschedule(token: string, requestId: string, suggestionId: string): Promise<PatientAppointment> {
+  const payload = await request<unknown>(token, `/appointments/assisted-reschedule-requests/${encodeURIComponent(requestId)}/confirm`, {
+    method: "POST", body: JSON.stringify({ suggestion_id: suggestionId }),
+  });
+  const parsed = appointmentSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete rescheduling response.");
+  return parsed.data;
+}
+
+export async function declinePatientAssistedReschedule(token: string, requestId: string): Promise<void> {
+  await request<unknown>(token, `/appointments/assisted-reschedule-requests/${encodeURIComponent(requestId)}/decline`, { method: "POST" });
 }
 
 export async function getDoctorSchedules(token: string, doctorId: string): Promise<DoctorSchedule[]> {
