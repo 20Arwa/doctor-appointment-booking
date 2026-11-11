@@ -17,10 +17,37 @@ const createScheduleSchema = z.object({
 });
 const scheduleParamsSchema = z.object({ id: z.uuid(), scheduleId: z.uuid() }).strict();
 const generateSchema = z.object({ from: z.iso.date(), to: z.iso.date() }).strict().refine((v) => v.from <= v.to, { path: ["to"], message: "to must be on or after from" });
+const elasticScheduleSchema = z.object({
+  mode: z.enum(["wave", "stream"]),
+  expected_updated_at: z.iso.datetime(),
+  starts_on: z.iso.date(),
+  ends_on: z.iso.date(),
+  periods: z.array(z.object({ weekday: z.number().int().min(0).max(6), start_time: time, end_time: time }).strict()
+    .refine((value) => value.end_time > value.start_time, { path: ["end_time"], message: "End time must be after start time" }))
+    .min(1).max(100),
+}).strict().superRefine((value, context) => {
+  if (value.starts_on > value.ends_on) {
+    context.addIssue({ code: "custom", path: ["ends_on"], message: "End date must be on or after start date" });
+  }
+  for (let index = 0; index < value.periods.length; index += 1) {
+    const candidate = value.periods[index];
+    const overlappingIndex = value.periods.findIndex((existing, otherIndex) => otherIndex < index
+      && existing.weekday === candidate.weekday
+      && existing.start_time < candidate.end_time
+      && existing.end_time > candidate.start_time);
+    if (overlappingIndex !== -1) {
+      context.addIssue({
+        code: "custom",
+        path: ["periods", index],
+        message: `This period overlaps another submitted period on weekday ${candidate.weekday}.`,
+      });
+    }
+  }
+});
 const exceptionSchema = z.object({ service_date: z.iso.date(), exception_type: z.enum(["day_off", "override", "additional"]), periods: z.array(z.object({ start_time: time, end_time: time }).strict()).max(50).default([]) }).strict()
   .superRefine((v, context) => {
     if (v.exception_type === "day_off" && v.periods.length) context.addIssue({ code: "custom", path: ["periods"], message: "Day off exceptions cannot contain periods" });
     if (v.exception_type !== "day_off" && !v.periods.length) context.addIssue({ code: "custom", path: ["periods"], message: "Override and additional exceptions require periods" });
     for (const [index, periodValue] of v.periods.entries()) if (periodValue.end_time <= periodValue.start_time) context.addIssue({ code: "custom", path: ["periods", index, "end_time"], message: "End time must be after start time" });
   });
-module.exports = { createScheduleSchema, exceptionSchema, generateSchema, scheduleParamsSchema };
+module.exports = { createScheduleSchema, elasticScheduleSchema, exceptionSchema, generateSchema, scheduleParamsSchema };

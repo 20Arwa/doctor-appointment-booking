@@ -7,7 +7,8 @@ const { createDoctorSlots, deleteDoctorSlot, getDoctorSlots } = require("../cont
 const { doctorIdParamsSchema, slotParamsSchema, slotQuerySchema, slotsBodySchema } = require("../validators/availabilitySchemas");
 const { doctorPatientAppointmentsQuerySchema, doctorPatientParamsSchema } = require("../validators/doctorPatientSchemas");
 const scheduleController = require("../controllers/scheduleController");
-const { createScheduleSchema, exceptionSchema, generateSchema, scheduleParamsSchema } = require("../validators/scheduleSchemas");
+const { createScheduleSchema, elasticScheduleSchema, exceptionSchema, generateSchema, scheduleParamsSchema } = require("../validators/scheduleSchemas");
+const elasticScheduleController = require("../controllers/elasticScheduleController");
 
 const router = express.Router();
 router.get("/patients/:patientId/appointments", requireClerkIdentity, requireLocalUser, validate(doctorPatientParamsSchema, "params"), validate(doctorPatientAppointmentsQuerySchema, "query"), listDoctorPatientAppointments);
@@ -15,6 +16,8 @@ router.get("/patients/:patientId", requireClerkIdentity, requireLocalUser, valid
 router.get("/:id/slots", validate(doctorIdParamsSchema, "params"), validate(slotQuerySchema, "query"), requireClerkIdentity, requireLocalUser, getDoctorSlots);
 router.get("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, scheduleController.listSchedules);
 router.post("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(createScheduleSchema, "body"), scheduleController.createSchedule);
+router.post("/:id/schedules/:scheduleId/preview", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(elasticScheduleSchema, "body"), elasticScheduleController.previewScheduleUpdate);
+router.put("/:id/schedules/:scheduleId", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(elasticScheduleSchema, "body"), elasticScheduleController.updateSchedule);
 router.post("/:id/schedules/:scheduleId/generate", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(generateSchema, "body"), scheduleController.generateAvailability);
 router.post("/:id/schedules/:scheduleId/exceptions", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(exceptionSchema, "body"), scheduleController.createException);
 router.post("/:id/slots", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(slotsBodySchema, "body"), createDoctorSlots);

@@ -5,6 +5,8 @@ const { describe, it } = require("node:test");
 const { createApp } = require("../src/app");
 const { localDateTime, slotStartsInFuture } = require("../src/utils/schedulingTime");
 const { slotsBodySchema, slotQuerySchema } = require("../src/validators/availabilitySchemas");
+const { getDoctorSlots } = require("../src/controllers/availabilityController");
+const { Client } = require("pg");
 
 const userId = "11111111-1111-4111-8111-111111111111";
 const doctorId = "22222222-2222-4222-8222-222222222222";
@@ -19,13 +21,40 @@ const user = {
   is_active: true,
 };
 
-function createDatabase({ initialSlots = [], appointmentReferences = [], paymentHoldReferences = [], holdForeignKeyRaceReferences = [], currentUser = user } = {}) {
+it("parses the complete getDoctorSlots query with PostgreSQL", {
+  skip: !process.env.POSTGRES_TEST_DATABASE_URL && "Set POSTGRES_TEST_DATABASE_URL to a schema-ready PostgreSQL test database",
+}, async () => {
+  const client = new Client({ connectionString: process.env.POSTGRES_TEST_DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query("BEGIN READ ONLY");
+    const response = {
+      locals: {
+        params: { id: doctorId }, query: {}, user: { role: "patient" }, applicationTimezone: "UTC",
+        database: { query: (sql, values) => client.query(`EXPLAIN (COSTS OFF) ${sql}`, values) },
+      },
+      status(code) { this.statusCode = code; return this; },
+      json(payload) { this.payload = payload; return this; },
+    };
+    let queryError;
+    await getDoctorSlots({}, response, (error) => { queryError = error; });
+    if (queryError) throw queryError;
+    assert.ok(response.statusCode < 400);
+  } finally {
+    await client.query("ROLLBACK").catch(() => {});
+    await client.end();
+  }
+});
+
+function createDatabase({ initialSlots = [], appointmentReferences = [], paymentHoldReferences = [], allocationReferences = [], holdForeignKeyRaceReferences = [], protectedAppointments = [], currentUser = user } = {}) {
   const slots = initialSlots.map((slot, index) => ({
     id: slot.id || `44444444-4444-4444-8444-${String(index + 1).padStart(12, "0")}`,
     doctor_id: slot.doctor_id || doctorId,
     date: slot.date,
     start_time: slot.start_time,
     end_time: slot.end_time,
+    schedule_id: slot.schedule_id ?? null,
+    schedule_window_id: slot.schedule_window_id ?? null,
     created_at: "2099-01-01T00:00:00.000Z",
     updated_at: "2099-01-01T00:00:00.000Z",
     deleted_at: slot.deleted_at || null,
@@ -38,29 +67,37 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], payment
     availabilityQueries: [],
     appointmentQueries: [],
     holdQueries: [],
+    protectionQueries: [],
+    allocationReferences,
+    paymentHoldReferences,
     deleteQueries: [],
     async query(sql, values = []) {
       if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [currentUser] };
       if (sql === "SELECT id FROM doctors WHERE user_id = $1") {
         return { rows: values[0] === currentUser.id && currentUser.role === "doctor" ? [{ id: doctorId }] : [] };
       }
-      if (sql.startsWith("SELECT availability.id, availability.doctor_id, availability.date::text AS date")) {
+      if (sql.startsWith("SELECT availability.id, availability.doctor_id, availability.schedule_id")) {
         database.availabilityQueries.push(sql);
-        const [requestedDoctorId, currentDate, currentTime, _timezone, from, to] = values;
+        const [requestedDoctorId, currentDate, currentTime, _timezone, _managementView, _excludedAppointment, _excludedAllocation, from, to] = values;
         const doctorManagementView = currentUser.role === "doctor" && requestedDoctorId === doctorId;
+        const activeAppointment = (slot) => appointmentReferences.some((reference) => typeof reference !== "string"
+          && reference.id === slot.id && reference.status === "confirmed" && reference.ends_at > Date.now());
+        const activeHold = (slot) => paymentHoldReferences.some((reference) => typeof reference !== "string"
+          && reference.id === slot.id && reference.status === "active" && new Date(reference.expires_at).getTime() > Date.now());
         return { rows: slots.filter((slot) => slot.doctor_id === requestedDoctorId
-          && !slot.deleted_at
+          && (!slot.deleted_at || doctorManagementView && (activeAppointment(slot) || activeHold(slot)))
           && (slot.date > currentDate || (slot.date === currentDate && slot.start_time > currentTime))
           && (!from || slot.date >= from) && (!to || slot.date <= to)
-          && !appointmentReferences.some((reference) => typeof reference !== "string"
-            && reference.id === slot.id && reference.status === "confirmed" && reference.ends_at > Date.now())
+          && (doctorManagementView || !activeAppointment(slot))
           && (doctorManagementView || !paymentHoldReferences.some((reference) => typeof reference !== "string"
             && reference.id === slot.id && reference.status === "active" && new Date(reference.expires_at).getTime() > Date.now())))
           .map((slot) => {
-            const activeHold = paymentHoldReferences.find((reference) => typeof reference !== "string"
+            const hold = paymentHoldReferences.find((reference) => typeof reference !== "string"
               && reference.id === slot.id && reference.status === "active" && new Date(reference.expires_at).getTime() > Date.now());
-            return { ...slot, hold_status: doctorManagementView ? activeHold?.status ?? null : null,
-              hold_expires_at: doctorManagementView ? activeHold?.expires_at ?? null : null };
+            return { ...slot, schedule_id: null, reservation_only: Boolean(slot.deleted_at),
+              has_confirmed_appointment: activeAppointment(slot), has_active_allocation: false,
+              hold_status: doctorManagementView ? hold?.status ?? null : null,
+              hold_expires_at: doctorManagementView ? hold?.expires_at ?? null : null };
           }) };
       }
       throw new Error(`Unexpected test query: ${sql}`);
@@ -74,9 +111,14 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], payment
       return {
         async query(sql, values = []) {
           if (sql === "BEGIN") return { rows: [] };
-          if (sql.startsWith("SELECT id FROM availability WHERE id = $1 AND doctor_id = $2 AND deleted_at IS NULL FOR UPDATE")) {
+          if (sql.includes("CROSS JOIN (SELECT clock_timestamp() AS checked_at) protection_window")) {
+            database.protectionQueries.push({ sql, values });
+            return { rows: protectedAppointments.filter((appointment) => appointment.availability_id === values[0]) };
+          }
+          if (sql.startsWith("SELECT id, schedule_window_id FROM availability WHERE id = $1 AND doctor_id = $2 AND deleted_at IS NULL FOR UPDATE")) {
             const [slotId, requestedDoctorId] = values;
-            return { rows: slots.some((slot) => slot.id === slotId && slot.doctor_id === requestedDoctorId && !slot.deleted_at) ? [{ id: slotId }] : [] };
+            const slot = slots.find((item) => item.id === slotId && item.doctor_id === requestedDoctorId && !item.deleted_at);
+            return { rows: slot ? [{ id: slotId, schedule_window_id: slot.schedule_window_id }] : [] };
           }
           if (sql.startsWith("SELECT pg_advisory_xact_lock")) {
             database.lockQueries.push(values);
@@ -93,19 +135,17 @@ function createDatabase({ initialSlots = [], appointmentReferences = [], payment
             const [requestedDoctorId, dates] = values;
             return { rows: slots.filter((slot) => slot.doctor_id === requestedDoctorId && !slot.deleted_at && dates.includes(slot.date)) };
           }
-          if (sql.startsWith("SELECT 1 FROM appointments") && sql.includes("status = 'confirmed'")) {
-            database.appointmentQueries.push(sql);
-            const active = appointmentReferences.some((reference) => typeof reference !== "string" && reference.id === values[0]
-              && reference.status === "confirmed" && reference.ends_at > Date.now());
-            return { rows: active ? [{ exists: 1 }] : [] };
-          }
-          if (sql.startsWith("SELECT 1 FROM appointment_slot_holds") && sql.includes("status = 'active'")) {
+          if (sql.startsWith("SELECT 1 WHERE EXISTS")) {
             database.holdQueries.push(sql);
-            return { rows: paymentHoldReferences.some((reference) => typeof reference !== "string" && reference.id === values[0]
-              && reference.status === "active" && reference.expires_at > Date.now()) ? [{ exists: 1 }] : [] };
+            const hasPaymentHold = paymentHoldReferences.some((reference) => typeof reference !== "string" && reference.id === values[0]
+              && reference.status === "active" && reference.expires_at > Date.now());
+            const hasHeldAllocation = allocationReferences.some((reference) => typeof reference !== "string" && reference.id === values[0]
+              && reference.status === "held" && reference.expires_at > Date.now());
+            return { rows: hasPaymentHold || hasHeldAllocation ? [{ exists: 1 }] : [] };
           }
           if (sql.startsWith("SELECT EXISTS (SELECT 1 FROM appointments")) {
             const referenced = appointmentReferences.some((reference) => (typeof reference === "string" ? reference : reference.id) === values[0])
+              || allocationReferences.some((reference) => reference.id === values[0])
               || paymentHoldReferences.some((reference) => (typeof reference === "string" ? reference : reference.id) === values[0]);
             return { rows: [{ referenced }] };
           }
@@ -239,8 +279,8 @@ describe("availability validation", () => {
 
   it("confirms the new migration follows Phase 1", () => {
     const migrationFiles = fs.readdirSync(path.join(__dirname, "..", "migrations")).filter((file) => file.endsWith(".sql")).sort();
-    assert.deepEqual(migrationFiles.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
     assert.equal(migrationFiles.length, 25);
+    assert.deepEqual(migrationFiles.slice(0, 3), ["001_users_patients_doctors.sql", "002_doctor_availability.sql", "003_appointments.sql"]);
     assert.match(migrationFiles[3], /^004_.*\.sql$/);
     assert.equal(migrationFiles[4], "005_appointment_schedule_snapshot.sql");
     assert.equal(migrationFiles[5], "006_doctor_consultation_fee.sql");
@@ -284,12 +324,13 @@ describe("availability endpoints", () => {
       assert.equal(created.status, 201);
       assert.equal((await created.json()).length, 2);
       assert.equal(database.slots.length, 2);
-      assert.equal(database.lockQueries.length, 1);
+      assert.equal(database.lockQueries.length, 2);
 
       const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`);
       assert.equal(response.status, 200);
       assert.equal((await response.json()).length, 2);
       assert.match(database.availabilityQueries[0], /NOT EXISTS[\s\S]*FROM appointments/);
+      assert.match(database.availabilityQueries[0], /WHERE linked\.allocation_id = allocation\.id\)\)\)\)\s+AND allocation\.id IS DISTINCT FROM \$7::uuid\s+UNION\s+SELECT appointment\.patient_id/);
     });
   });
 
@@ -309,7 +350,7 @@ describe("availability endpoints", () => {
       assert.equal(rows.length, 1);
       assert.equal(rows[0].hold_status, "active");
       assert.equal(rows[0].hold_expires_at, expiresAt);
-      assert.equal(rows[0].deleted_at, null);
+      assert.equal(rows[0].reservation_only, false);
       assert.equal(rows[0].status, undefined, "a payment hold is not represented as an appointment status");
       assert.match(database.availabilityQueries[0], /hold\.status = 'active' AND hold\.expires_at > NOW\(\)/);
     });
@@ -333,7 +374,7 @@ describe("availability endpoints", () => {
       const rows = await response.json();
       assert.deepEqual(rows.map((row) => row.id).sort(), [expiredId, releasedId]);
       assert.ok(rows.every((row) => row.hold_status === null));
-      assert.match(database.availabilityQueries[0], /AND payment_hold\.id IS NULL/);
+      assert.match(database.availabilityQueries[0], /availability\.mode IS NOT NULL OR payment_hold\.id IS NULL/);
     });
   });
 
@@ -352,6 +393,72 @@ describe("availability endpoints", () => {
       assert.equal(rows[0].id, slotId);
       assert.equal(rows[0].hold_status, null);
       assert.equal(rows[0].hold_expires_at, null);
+    });
+  });
+
+  it("shows soft-retired appointment and active-hold windows only as doctor reservation rows", async () => {
+    const appointmentSlotId = "44444444-4444-4444-8444-000000000026";
+    const holdSlotId = "44444444-4444-4444-8444-000000000027";
+    const database = createDatabase({
+      initialSlots: [
+        { id: appointmentSlotId, date: "2099-04-10", start_time: "11:00", end_time: "14:00", deleted_at: "2099-01-01T00:00:00.000Z" },
+        { id: holdSlotId, date: "2099-04-10", start_time: "10:00", end_time: "14:00", deleted_at: "2099-01-01T00:00:00.000Z" },
+      ],
+      appointmentReferences: [{ id: appointmentSlotId, status: "confirmed", ends_at: Date.now() + 60_000 }],
+      paymentHoldReferences: [{ id: holdSlotId, status: "active", expires_at: new Date(Date.now() + 60_000).toISOString() }],
+    });
+    const { app } = createTestApp({ database });
+    await withServer(app, async (url) => {
+      const doctorView = await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`);
+      assert.equal(doctorView.status, 200);
+      const reservations = await doctorView.json();
+      assert.deepEqual(reservations.map((row) => row.id).sort(), [appointmentSlotId, holdSlotId]);
+      assert.ok(reservations.every((row) => row.reservation_only));
+      assert.equal(reservations.find((row) => row.id === appointmentSlotId).has_confirmed_appointment, true);
+      assert.equal(reservations.find((row) => row.id === holdSlotId).hold_status, "active");
+      assert.match(database.availabilityQueries[0], /deleted_at IS NULL OR \(\$5::boolean AND/);
+
+      const patient = { ...user, role: "patient" };
+      const patientApp = createTestApp({ database: createDatabase({
+        initialSlots: [
+          { id: appointmentSlotId, date: "2099-04-10", start_time: "11:00", end_time: "14:00", deleted_at: "2099-01-01T00:00:00.000Z" },
+          { id: holdSlotId, date: "2099-04-10", start_time: "10:00", end_time: "14:00", deleted_at: "2099-01-01T00:00:00.000Z" },
+        ],
+        appointmentReferences: [{ id: appointmentSlotId, status: "confirmed", ends_at: Date.now() + 60_000 }],
+        paymentHoldReferences: [{ id: holdSlotId, status: "active", expires_at: new Date(Date.now() + 60_000).toISOString() }],
+        currentUser: patient,
+      }), currentUser: patient });
+      await withServer(patientApp.app, async (patientUrl) => {
+        const patientView = await fetch(`${patientUrl}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`);
+        assert.equal(patientView.status, 200);
+        assert.deepEqual(await patientView.json(), []);
+        assert.match(patientApp.database.availabilityQueries[0], /deleted_at IS NULL OR \(\$5::boolean AND/);
+        assert.doesNotMatch(patientApp.database.availabilityQueries[0], /deleted_at IS NULL OR \(TRUE AND/);
+      });
+    });
+  });
+
+  it("returns only the active Jan 4 Stream replacement to patients", async () => {
+    const retiredId = "44444444-4444-4444-8444-000000000031";
+    const activeId = "44444444-4444-4444-8444-000000000032";
+    const patient = { ...user, role: "patient" };
+    const database = createDatabase({
+      initialSlots: [
+        { id: retiredId, date: "2027-01-04", start_time: "10:00", end_time: "15:00", deleted_at: "2026-11-09T11:03:42.893Z" },
+        { id: activeId, date: "2027-01-04", start_time: "11:00", end_time: "15:00" },
+      ],
+      appointmentReferences: [{ id: retiredId, status: "confirmed", ends_at: Date.now() + 60_000 }],
+      currentUser: patient,
+    });
+    const { app } = createTestApp({ database, currentUser: patient });
+    await withServer(app, async (url) => {
+      const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2027-01-04&to=2027-01-04`);
+      assert.equal(response.status, 200);
+      const rows = await response.json();
+      assert.deepEqual(rows.map((row) => row.id), [activeId]);
+      assert.equal(rows[0].reservation_only, false);
+      assert.equal(rows[0].start_time, "11:00");
+      assert.equal(rows[0].end_time, "15:00");
     });
   });
 
@@ -433,6 +540,7 @@ describe("availability endpoints", () => {
     const historicalCases = [
       { name: "past confirmed appointment", appointments: [{ id: referencedId, status: "confirmed", ends_at: Date.parse("2000-01-01T00:00:00Z") }] },
       { name: "cancelled appointment", appointments: [{ id: referencedId, status: "cancelled", ends_at: Date.parse("2099-04-10T10:30:00Z") }] },
+      { name: "allocation history", allocations: [{ id: referencedId, status: "released" }] },
       { name: "expired hold", holds: [{ id: referencedId, status: "expired", expires_at: 0 }] },
       { name: "released hold", holds: [{ id: referencedId, status: "released", expires_at: Date.now() + 60_000 }] },
     ];
@@ -441,6 +549,7 @@ describe("availability endpoints", () => {
       const database = createDatabase({
         initialSlots: [{ id: slotIdForCase, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
         appointmentReferences: (entry.appointments || []).map((item) => ({ ...item, id: slotIdForCase })),
+        allocationReferences: (entry.allocations || []).map((item) => ({ ...item, id: slotIdForCase })),
         paymentHoldReferences: (entry.holds || []).map((item) => ({ ...item, id: slotIdForCase })),
       });
       const test = createTestApp({ database });
@@ -474,25 +583,102 @@ describe("availability endpoints", () => {
     });
   });
 
-  it("rejects future confirmed appointments and active unexpired holds", async () => {
+  it("preserves confirmed bookings and blocks each kind of active unexpired payment hold", async () => {
     const cases = [
-      { id: "44444444-4444-4444-8444-000000000011", appointments: [{ id: "x", status: "confirmed", ends_at: Date.parse("2099-04-10T10:30:00Z") }] },
+      { id: "44444444-4444-4444-8444-000000000011", appointments: [{ id: "x", status: "confirmed", ends_at: Date.parse("2099-04-10T10:30:00Z") }], allocations: [{ id: "x", status: "confirmed" }] },
       { id: "44444444-4444-4444-8444-000000000012", holds: [{ id: "x", status: "active", expires_at: Date.now() + 60_000 }] },
+      { id: "44444444-4444-4444-8444-000000000017", allocations: [{ id: "x", status: "held", expires_at: Date.now() + 60_000 }] },
     ];
     for (const entry of cases) {
       const database = createDatabase({
         initialSlots: [{ id: entry.id, date: "2099-04-10", start_time: "10:00", end_time: "10:30" }],
         appointmentReferences: (entry.appointments || []).map((item) => ({ ...item, id: entry.id })),
+        allocationReferences: (entry.allocations || []).map((item) => ({ ...item, id: entry.id })),
         paymentHoldReferences: (entry.holds || []).map((item) => ({ ...item, id: entry.id })),
       });
       const test = createTestApp({ database });
       await withServer(test.app, async (url) => {
         const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots/${entry.id}`, { method: "DELETE" });
-        assert.equal(response.status, 409);
-        assert.equal((await response.json()).error.code, "SLOT_IN_USE");
-        assert.equal(database.slots[0].deleted_at, null);
+        if (entry.appointments) {
+          assert.equal(response.status, 204);
+          assert.ok(database.slots[0].deleted_at);
+          assert.equal(database.slots[0].id, entry.id);
+          assert.equal(database.allocationReferences[0].status, "confirmed");
+          const doctorRows = await (await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`)).json();
+          assert.equal(doctorRows.length, 1);
+          assert.equal(doctorRows[0].reservation_only, true);
+        } else {
+          assert.equal(response.status, 409);
+          const payload = await response.json();
+          assert.equal(payload.error.code, "ACTIVE_PAYMENT_HOLD");
+          assert.match(payload.error.message, /payment hold.*expire or be resolved/i);
+          assert.equal(database.slots[0].deleted_at, null);
+          assert.equal(database.holdQueries.length, 1);
+          assert.equal(database.paymentHoldReferences[0]?.status ?? database.allocationReferences[0]?.status,
+            entry.holds ? "active" : "held");
+        }
       });
+      if (entry.appointments) {
+        const patient = { ...user, role: "patient" };
+        const patientDatabase = createDatabase({
+          initialSlots: [{ id: entry.id, date: "2099-04-10", start_time: "10:00", end_time: "10:30", deleted_at: "2099-01-01T00:00:00.000Z" }],
+          appointmentReferences: (entry.appointments || []).map((item) => ({ ...item, id: entry.id })), currentUser: patient,
+        });
+        const patientApp = createTestApp({ database: patientDatabase, currentUser: patient });
+        await withServer(patientApp.app, async (url) => {
+          const rows = await (await fetch(`${url}/api/v1/doctors/${doctorId}/slots?from=2099-04-10&to=2099-04-10`)).json();
+          assert.deepEqual(rows, []);
+        });
+      }
     }
+  });
+
+  it("rejects availability removal before mutation when a confirmed appointment starts within six hours", async () => {
+    const slotId = "44444444-4444-4444-8444-000000000021";
+    const appointment = {
+      appointment_id: "55555555-5555-4555-8555-555555555521", availability_id: slotId,
+      date: "2026-11-11", start_time: "10:15:00", end_time: "10:45:00",
+    };
+    const database = createDatabase({
+      initialSlots: [{ id: slotId, date: appointment.date, start_time: "10:00", end_time: "10:30" }],
+      protectedAppointments: [appointment],
+    });
+    const test = createTestApp({ database });
+    await withServer(test.app, async (url) => {
+      const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots/${slotId}`, { method: "DELETE" });
+      const payload = await response.json();
+      assert.equal(response.status, 409);
+      assert.equal(payload.error.code, "SCHEDULE_CHANGE_PROTECTED_APPOINTMENT");
+      assert.deepEqual(payload.error.details.protected_appointments, [{
+        appointment_id: appointment.appointment_id, date: appointment.date, start_time: "10:15", end_time: "10:45",
+      }]);
+      assert.equal(database.slots[0].deleted_at, null);
+      assert.equal(database.deleteQueries.length, 0);
+      assert.equal(database.protectionQueries.length, 1);
+    });
+  });
+
+  it("keeps a removed schedule-generated availability row as a recovery exclusion", async () => {
+    const waveId = "44444444-4444-4444-8444-000000000015";
+    const streamId = "44444444-4444-4444-8444-000000000016";
+    const database = createDatabase({ initialSlots: [
+      { id: waveId, schedule_id: "schedule-1", schedule_window_id: "wave-window-1",
+        date: "2099-04-10", start_time: "10:00", end_time: "10:30" },
+      { id: streamId, schedule_id: "schedule-1", schedule_window_id: "stream-window-1",
+        date: "2099-04-11", start_time: "10:00", end_time: "12:00" },
+    ] });
+    const { app } = createTestApp({ database });
+    await withServer(app, async (url) => {
+      for (const [slotId, windowId] of [[waveId, "wave-window-1"], [streamId, "stream-window-1"]]) {
+        const response = await fetch(`${url}/api/v1/doctors/${doctorId}/slots/${slotId}`, { method: "DELETE" });
+        assert.equal(response.status, 204);
+        const removed = database.slots.find((slot) => slot.id === slotId);
+        assert.ok(removed.deleted_at);
+        assert.equal(removed.schedule_window_id, windowId);
+      }
+      assert.equal(database.slots.length, 2);
+      assert.equal(database.deleteQueries.length, 0);
+    });
   });
 
   it("allows recreating a previously soft-deleted time slot", async () => {
@@ -545,7 +731,7 @@ describe("availability endpoints", () => {
       const responses = await Promise.all([create("10:00", "10:30"), create("10:15", "10:45")]);
       assert.deepEqual(responses.map((response) => response.status).sort(), [201, 409]);
       assert.equal(database.slots.length, 1);
-      assert.equal(database.lockQueries.length, 2);
+      assert.equal(database.lockQueries.length, 4);
     });
   });
 });
