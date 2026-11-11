@@ -7,6 +7,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useDashboardProfile } from "@/components/role-application-shell";
 import { PatientDashboardContent } from "@/components/patient-dashboard-content";
 import { getAppointments, type PatientAppointment } from "@/lib/profile-api";
+import { formatInstantDate } from "@/lib/date-format";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
 
@@ -22,7 +23,7 @@ function applicationDate(value: Date) {
 }
 
 function formatDate(value: Date) {
-  return new Intl.DateTimeFormat("en-IN", { dateStyle: "full", timeZone: APPLICATION_TIME_ZONE }).format(value);
+  return formatInstantDate(value, APPLICATION_TIME_ZONE);
 }
 
 function formatTime(value: Date) {

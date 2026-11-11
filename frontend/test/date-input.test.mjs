@@ -35,5 +35,11 @@ describe("shared date input", () => {
     assert.match(source, /className="inline-flex h-11 shrink-0/);
   });
 
-
+  it("replaces native date controls across the application", () => {
+    const availability = fs.readFileSync(path.join(root, "components/doctor-availability-page.tsx"), "utf8");
+    const onboarding = fs.readFileSync(path.join(root, "components/onboarding-flow.tsx"), "utf8");
+    assert.doesNotMatch(availability, /<input[^>]*type="date"/);
+    assert.doesNotMatch(onboarding, /<input[^>]*type="date"/);
+    assert.match(onboarding, /type === "date" \? <DateInput/);
+  });
 });

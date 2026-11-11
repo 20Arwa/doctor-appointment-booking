@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowLeft, CalendarCheck2, CalendarClock, CalendarDays, Clock3, Mail, Phone, RefreshCw, Stethoscope, UserRound, UsersRound } from "lucide-react";
 import { getDoctorPatient, getDoctorPatientAppointmentsPage, type DoctorPatient, type PatientAppointment } from "@/lib/profile-api";
+import { formatDateOnly as formatDateOnlyShared, formatInstantDate } from "@/lib/date-format";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
 const views = ["scheduled", "past", "cancelled"] as const;
@@ -43,12 +44,11 @@ function patientAge(dateOfBirth: string, now: number) {
 }
 
 function formatDateOnly(value: string) {
-  const [year, month, day] = value.split("-").map(Number);
-  return new Intl.DateTimeFormat("en-IN", { dateStyle: "long", timeZone: "UTC" }).format(new Date(Date.UTC(year, month - 1, day)));
+  return formatDateOnlyShared(value);
 }
 
 function formatAppointmentDate(instant: Date) {
-  return new Intl.DateTimeFormat("en-IN", { dateStyle: "full", timeZone: APPLICATION_TIME_ZONE }).format(instant);
+  return formatInstantDate(instant, APPLICATION_TIME_ZONE);
 }
 
 function formatAppointmentTime(instant: Date) {

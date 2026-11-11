@@ -1,5 +1,6 @@
 import type { PatientPaymentHistoryItem } from "@/lib/profile-api";
 import { ExternalLink } from "lucide-react";
+import { formatInstantDate } from "@/lib/date-format";
 
 const paymentStatusLabels: Record<PatientPaymentHistoryItem["status"], string> = {
   created: "Created",
@@ -50,11 +51,9 @@ export function formatPaymentAmount(amount: string | number, currency: string) {
 
 function formatDate(value: string) {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "Date unavailable" : new Intl.DateTimeFormat("en-IN", {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone: "Asia/Kolkata",
-  }).format(date);
+  return Number.isNaN(date.getTime()) ? "Date unavailable" : `${formatInstantDate(date)} · ${new Intl.DateTimeFormat("en-GB", {
+    hour: "numeric", minute: "2-digit", timeZone: "Asia/Kolkata",
+  }).format(date)}`;
 }
 
 function refundAmount(refunds: PatientPaymentHistoryItem["refunds"], currency: string) {

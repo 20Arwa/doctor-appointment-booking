@@ -19,6 +19,7 @@ import { CancellationRefundEstimate } from "@/components/cancellation-refund-est
 import { notifyError, notifyInAppNotificationsChanged, notifySuccess } from "@/lib/notifications";
 import { useAppointmentHistory } from "@/components/use-appointment-history";
 import { AppointmentAvailabilityCalendar } from "@/components/appointment-availability-calendar";
+import { formatDateOnly } from "@/lib/date-format";
 import {
   cancelAppointment,
   getAppointment,
@@ -56,9 +57,7 @@ function appointmentEndInstant(appointment: Pick<PatientAppointment, "date" | "e
 const inrFormatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
 
 function appointmentDate(date: string) {
-  const [year, month, day] = date.split("-").map(Number);
-  return new Intl.DateTimeFormat("en-IN", { dateStyle: "full", timeZone: "UTC" })
-    .format(new Date(Date.UTC(year, month - 1, day)));
+  return formatDateOnly(date);
 }
 
 function appointmentTime(time: string) {

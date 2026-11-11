@@ -10,6 +10,7 @@ import { completeDoctorAppointment, doctorRescheduleAppointment, getAppointment,
 import { notifyError, notifyInAppNotificationsChanged, notifySuccess } from "@/lib/notifications";
 import { useAppointmentHistory } from "@/components/use-appointment-history";
 import { AppointmentAvailabilityCalendar } from "@/components/appointment-availability-calendar";
+import { formatDateOnly } from "@/lib/date-format";
 
 function todayInIndia() {
   const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date()).map(({ type, value }) => [type, value]));
@@ -36,9 +37,7 @@ function patientAge(dateOfBirth: string | null | undefined, now: number) {
 }
 
 function formatDate(date: string) {
-  const [year, month, day] = date.split("-").map(Number);
-  return new Intl.DateTimeFormat("en-IN", { dateStyle: "full", timeZone: "UTC" })
-    .format(new Date(Date.UTC(year, month - 1, day)));
+  return formatDateOnly(date);
 }
 
 function formatTime(time: string) {

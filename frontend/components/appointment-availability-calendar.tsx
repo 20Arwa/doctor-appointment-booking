@@ -1,6 +1,7 @@
 "use client";
 
 import { ChevronLeft, ChevronRight } from "lucide-react";
+import { formatDateOnly } from "@/lib/date-format";
 import type { AvailabilitySlot } from "@/lib/profile-api";
 
 function monthDays(month: string) {
@@ -18,8 +19,7 @@ function todayInIndia() {
 }
 
 function formatDate(date: string) {
-  const [year, month, day] = date.split("-").map(Number);
-  return new Intl.DateTimeFormat("en-IN", { dateStyle: "full", timeZone: "UTC" }).format(new Date(Date.UTC(year, month - 1, day)));
+  return formatDateOnly(date);
 }
 
 function formatMonth(month: string) {
