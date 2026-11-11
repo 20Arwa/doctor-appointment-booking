@@ -1,7 +1,6 @@
 const appointmentService = require("./appointmentService");
 const { StripePaymentError } = require("./stripeService");
 const { createRefundService } = require("./refundService");
-const { appointmentEventKey, createNotificationDeliveryService } = require("./notificationDeliveryService");
 
 const STRIPE_MIN_CHECKOUT_TTL_SECONDS = 30 * 60;
 const CHECKOUT_CREATION_SAFETY_SECONDS = 60;
@@ -140,10 +139,7 @@ function stripeReceiptUrl(value) {
   }
 }
 
-function createPaymentService({ database, stripe, emailNotificationService, notificationDeliveryService, inAppNotificationService, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now }) {
-  const notificationDeliveries = notificationDeliveryService || (emailNotificationService
-    ? createNotificationDeliveryService({ database, emailNotificationService, logger })
-    : null);
+function createPaymentService({ database, stripe, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now }) {
   const refundService = createRefundService({ database, stripe, logger, now });
   async function closePaymentWithoutSession(reservation, status = "failed") {
     await withTransaction(database, async (client) => {
@@ -418,24 +414,6 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
     });
   }
 
-  async function notifyNewAppointment(result) {
-    if (!result?.created || !result.appointment || (!notificationDeliveries && !inAppNotificationService)) return result;
-    const eventKey = appointmentEventKey("appointment.booked", result.appointment);
-    await Promise.all([
-      (async () => {
-        try {
-          await notificationDeliveries?.sendAppointmentNotification({ eventKey, eventType: "appointment.booked", appointment: result.appointment, actorRole: "system" });
-        } catch (_error) { logger.error("Paid appointment confirmation email failed", { reason: "unexpected_error" }); }
-      })(),
-      (async () => {
-        try {
-          await inAppNotificationService?.sendAppointmentNotification({ eventKey, eventType: "appointment.booked", appointment: result.appointment, actorRole: "system" });
-        } catch (_error) { logger.error("Paid appointment In-App notification failed", { reason: "unexpected_error" }); }
-      })(),
-    ]);
-    return result;
-  }
-
   async function markSessionFailure(payment, session, event, status) {
     return withTransaction(database, async (client) => {
       const slot = await lockSlot(client, payment.availability_id);
@@ -497,8 +475,7 @@ function createPaymentService({ database, stripe, emailNotificationService, noti
   async function processSession(payment, session, event) {
     validateSession(payment, session);
     if (session.payment_status === "paid") {
-      const result = await confirmPaidSession(payment, session, event);
-      return notifyNewAppointment(result);
+      return confirmPaidSession(payment, session, event);
     }
     if (session.status === "expired") return markSessionFailure(payment, session, event, "expired");
     if (event?.type === "checkout.session.expired") return markSessionFailure(payment, session, event, "expired");

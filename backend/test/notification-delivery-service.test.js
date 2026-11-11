@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { describe, it } = require("node:test");
-const { appointmentEventKey, appointmentSmsMessage, createNotificationDeliveryService } = require("../src/services/notificationDeliveryService");
+const { appointmentEventKey, appointmentPayload, appointmentSmsMessage, createNotificationDeliveryService } = require("../src/services/notificationDeliveryService");
 const { createMockSmsProvider } = require("../src/services/mockSmsProvider");
 const { createSmsNotificationService } = require("../src/services/smsNotificationService");
 
@@ -100,6 +100,14 @@ function createHarness({ outcome = { sent: true, attempts: 1, providerMessageId:
 }
 
 describe("notification delivery persistence", () => {
+  it("uses the same Wave/Stream range and mode in its plain-text fallback payload", () => {
+    const stream = appointmentPayload("appointment.booked", {
+      ...appointment, end_time: "14:00:00", mode: "stream",
+    }, "patient");
+    assert.match(stream.textContent, /10:00–14:00/);
+    assert.match(stream.textContent, /Your Stream appointment/);
+  });
+
   it("defines event, recipient, provider, status, and history constraints in a migration", () => {
     const migration = fs.readFileSync(path.join(__dirname, "..", "migrations", "013_notification_deliveries.sql"), "utf8");
     assert.match(migration, /event_key TEXT NOT NULL UNIQUE/i);
@@ -206,7 +214,7 @@ describe("notification delivery persistence", () => {
     let claimSql = "";
     let staleSql = "";
     let completionSql = "";
-    const database = { async query(sql) {
+    const database = { async query(sql, values = []) {
       if (sql.includes("lease_expires_at < NOW()")) { staleSql = sql; return { rows: [{ id: "stale" }], rowCount: 1 }; }
       if (sql.includes("created_at <= NOW()")) return { rows: [], rowCount: 0 };
       if (sql.includes("WITH candidates")) {
@@ -226,6 +234,51 @@ describe("notification delivery persistence", () => {
     assert.match(completionSql, /lease_token = \$11/i);
     assert.equal(claimAttempts, 2);
     assert.equal(sends, 1);
+  });
+
+  it("requeues an expired assisted Email lease with its original provider idempotency key", async () => {
+    let staleSql = "";
+    let staleValues;
+    let sends = 0;
+    const database = { async query(sql, values = []) {
+      if (sql.includes("lease_expires_at < NOW()")) { staleSql = sql; staleValues = values; return { rows: [{ id: "stale-assisted-email" }], rowCount: 1 }; }
+      if (sql.includes("created_at <= NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("WITH candidates")) return { rows: [] };
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const service = createNotificationDeliveryService({ database, emailNotificationService: { async sendNotificationPayload() { sends += 1; return { sent: true }; } } });
+    await service.runRecovery();
+    assert.match(staleSql, /event_type = 'appointment\.assisted_reschedule_requested'/);
+    assert.match(staleSql, /THEN 'failed' ELSE 'ambiguous' END/);
+    assert.match(staleSql, /idempotency_key IS NOT NULL/);
+    assert.deepEqual(staleValues, [1_800_000, 30_000]);
+    assert.equal(sends, 0);
+  });
+
+  it("suppresses assisted Email recovery after its request is superseded or its appointment snapshot changes", async () => {
+    let emailSends = 0;
+    let skippedReason;
+    const database = { async query(sql, values = []) {
+      if (sql.includes("lease_expires_at < NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("created_at <= NOW()")) return { rows: [], rowCount: 0 };
+      if (sql.includes("WITH candidates")) return { rows: [{
+        id: "assisted-email", channel: "email", event_type: "appointment.assisted_reschedule_requested",
+        appointment_id: appointment.id, recipient_user_id: recipientUserId,
+        payload: { to: appointment.patient_email, subject: "Subject", textContent: "Body", sender: { email: "s@example.test", name: "Sender" } },
+        idempotency_key: "stable-key", lease_token: "email-lease", attempt_count: 1, created_at: new Date(),
+      }] };
+      if (sql.includes("FROM assisted_reschedule_requests request")) return { rows: [] };
+      if (sql.startsWith("UPDATE notification_deliveries SET status = $2")) { skippedReason = values[4]; return { rows: [], rowCount: 1 }; }
+      throw new Error(`Unexpected query: ${sql}`);
+    } };
+    const service = createNotificationDeliveryService({
+      database,
+      emailNotificationService: { async sendNotificationPayload() { emailSends += 1; return { sent: true }; } },
+      smsNotificationService: { providerName: "mock", async sendSms() { throw new Error("Assisted reschedule must never send SMS"); } },
+    });
+    await service.runRecovery();
+    assert.equal(emailSends, 0);
+    assert.equal(skippedReason, "appointment_not_eligible");
   });
 
   it("marks expired idempotency windows ambiguous without dispatching", async () => {

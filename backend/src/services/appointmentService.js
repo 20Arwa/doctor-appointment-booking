@@ -3,8 +3,12 @@ const { appointmentEventKey } = require("./notificationDeliveryService");
 
 async function enqueueAppointmentNotification(client, eventType, appointment, actorRole) {
   const eventKey = appointmentEventKey(eventType, appointment);
-  const fields = ["id", "updated_at", "reschedule_version", "patient_user_id", "doctor_user_id", "patient_first_name", "patient_last_name", "patient_email", "doctor_email", "doctor_first_name", "doctor_last_name", "date", "start_time", "end_time", "mode", "previous_date", "previous_start_time"];
-  const payload = Object.fromEntries(fields.filter((key) => appointment[key] !== undefined).map((key) => [key, appointment[key]]));
+  const payload = Object.fromEntries([
+    "id", "updated_at", "reschedule_version", "patient_user_id", "doctor_user_id",
+    "patient_first_name", "patient_last_name",
+    "patient_email", "doctor_email", "doctor_first_name", "doctor_last_name",
+    "date", "start_time", "end_time", "mode", "previous_date", "previous_start_time",
+  ].filter((key) => appointment[key] !== undefined).map((key) => [key, appointment[key]]));
   await client.query(
     `INSERT INTO appointment_notification_outbox (event_key, event_type, appointment_id, actor_role, payload)
      VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT (event_key) DO NOTHING`,
@@ -662,7 +666,14 @@ async function confirmAssistedReschedule(database, user, timeZone, requestId, su
         allocation.rows[0].id, slot.id, slot.date, slot.start_time, slot.end_time],
     );
     await supersedeOpenAssistedRescheduleRequests(client, request.appointment_id, requestId);
-    return readDetails(client, request.appointment_id);
+    const appointment = await readDetails(client, request.appointment_id);
+    const result = {
+      ...appointment,
+      previous_date: request.current_date,
+      previous_start_time: request.current_start_time,
+    };
+    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role);
+    return result;
   });
   if (result?.assistedRequestExpired) fail(409, "ASSISTED_RESCHEDULE_REQUEST_EXPIRED", "This assisted rescheduling request has expired");
   return result;
@@ -819,7 +830,6 @@ async function completeAppointment(database, user, appointmentId) {
 
 module.exports = {
   AppointmentError,
-  enqueueAppointmentNotification,
   countOccupiedPlaces,
   countOccupiedPlacesForSlots,
   cancelAppointment,
