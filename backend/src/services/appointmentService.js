@@ -109,7 +109,10 @@ async function countOccupiedPlaces(client, availabilityId, { excludedAppointment
      FROM (
        SELECT allocation.patient_id FROM appointment_allocations allocation
        WHERE allocation.availability_id = $1
-         AND (allocation.status = 'confirmed' OR (allocation.status = 'held' AND allocation.expires_at > NOW()))
+         AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
+           OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
+             WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+             (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
          AND allocation.id IS DISTINCT FROM $2::uuid
        UNION
        SELECT appointment.patient_id FROM appointments appointment
@@ -118,7 +121,10 @@ async function countOccupiedPlaces(client, availabilityId, { excludedAppointment
          AND NOT EXISTS (
            SELECT 1 FROM appointment_allocations allocation
            WHERE allocation.id = appointment.allocation_id AND allocation.availability_id = $1
-             AND (allocation.status = 'confirmed' OR (allocation.status = 'held' AND allocation.expires_at > NOW()))
+             AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
+               OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
+                 WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                 (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
              AND allocation.id IS DISTINCT FROM $2::uuid
          )
        UNION

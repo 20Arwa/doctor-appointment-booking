@@ -1,4 +1,5 @@
 const { localDateTime, slotStartsInFuture } = require("../utils/schedulingTime");
+const { failForProtectedAppointments, findProtectedAppointmentsForAvailability } = require("../services/scheduleProtectionService");
 
 const AVAILABILITY_REFERENCE_CONSTRAINTS = new Set([
   "appointments_availability_id_fkey",
@@ -50,7 +51,35 @@ async function getDoctorSlots(_request, response, next) {
     excludedAllocationId = excluded.rows[0].allocation_id;
   }
   const values = [id, now.date, now.time, response.locals.applicationTimezone, isOwnDoctorManagementView, excludedAppointmentId, excludedAllocationId];
-  const filters = ["doctor_id = $1", "deleted_at IS NULL", "(date > $2::date OR (date = $2::date AND start_time > $3::time))"];
+  const filters = [
+    "doctor_id = $1",
+    `(deleted_at IS NULL OR ($5::boolean AND (
+       EXISTS (
+         SELECT 1 FROM appointments a
+         WHERE a.availability_id = availability.id AND a.status = 'confirmed'
+           AND ((a.scheduled_date + a.scheduled_end_time) AT TIME ZONE $4) > NOW()
+       )
+       OR EXISTS (
+         SELECT 1 FROM appointment_allocations allocation
+         WHERE allocation.availability_id = availability.id
+           AND (
+             (allocation.status = 'held' AND allocation.expires_at > NOW())
+             OR (
+               allocation.status = 'confirmed'
+               AND (
+                 EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed')
+                 OR NOT EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id)
+               )
+             )
+           )
+       )
+       OR EXISTS (
+         SELECT 1 FROM appointment_slot_holds hold
+         WHERE hold.availability_id = availability.id AND hold.status = 'active' AND hold.expires_at > NOW()
+       )
+     )))`,
+    "(date > $2::date OR (date = $2::date AND start_time > $3::time))",
+  ];
   if (from) {
     values.push(from);
     filters.push(`date >= $${values.length}::date`);
@@ -63,10 +92,28 @@ async function getDoctorSlots(_request, response, next) {
   try {
     const holdFilter = isOwnDoctorManagementView ? "" : "AND (availability.mode IS NOT NULL OR payment_hold.id IS NULL)";
     const result = await response.locals.database.query(
-      `SELECT availability.id, availability.doctor_id, availability.date::text AS date,
+      `SELECT availability.id, availability.doctor_id, availability.schedule_id,
+              availability.deleted_at IS NOT NULL AS reservation_only,
+              EXISTS (SELECT 1 FROM appointments a WHERE a.availability_id = availability.id AND a.status = 'confirmed'
+                AND ((a.scheduled_date + a.scheduled_end_time) AT TIME ZONE $4) > NOW()) AS has_confirmed_appointment,
+              EXISTS (SELECT 1 FROM appointment_allocations allocation WHERE allocation.availability_id = availability.id
+                AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
+                  OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
+                    WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                    (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))) AS has_active_allocation,
+              EXISTS (SELECT 1 FROM appointment_allocations allocation WHERE allocation.availability_id = availability.id
+                AND allocation.status = 'held' AND allocation.expires_at > NOW()) AS has_active_held_allocation,
+              (SELECT COUNT(*)::int FROM appointment_allocations allocation
+               WHERE allocation.availability_id = availability.id
+                 AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
+                   OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
+                     WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                     (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))) AS active_allocation_count,
+              availability.date::text AS date,
               availability.start_time::text AS start_time, availability.end_time::text AS end_time,
               availability.mode, availability.capacity,
               GREATEST(availability.capacity - COALESCE(occupancy.occupied, 0), 0)::int AS remaining_capacity,
+              COALESCE(preserved.bookings, 0)::int AS preserved_reservation_count,
               availability.created_at, availability.updated_at,
               payment_hold.status AS hold_status, payment_hold.expires_at AS hold_expires_at
        FROM availability
@@ -75,7 +122,10 @@ async function getDoctorSlots(_request, response, next) {
          FROM (
            SELECT allocation.patient_id FROM appointment_allocations allocation
            WHERE allocation.availability_id = availability.id
-             AND (allocation.status = 'confirmed' OR (allocation.status = 'held' AND allocation.expires_at > NOW()))
+             AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
+               OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
+                 WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                 (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
              AND allocation.id IS DISTINCT FROM $7::uuid
            UNION
            SELECT appointment.patient_id FROM appointments appointment
@@ -85,7 +135,10 @@ async function getDoctorSlots(_request, response, next) {
                SELECT 1 FROM appointment_allocations allocation
                WHERE allocation.id = appointment.allocation_id
                  AND allocation.availability_id = availability.id
-                 AND (allocation.status = 'confirmed' OR (allocation.status = 'held' AND allocation.expires_at > NOW()))
+                 AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
+                   OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
+                     WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                     (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
                  AND allocation.id IS DISTINCT FROM $7::uuid
              )
            UNION
@@ -93,6 +146,17 @@ async function getDoctorSlots(_request, response, next) {
            WHERE hold.availability_id = availability.id AND hold.status = 'active' AND hold.expires_at > NOW()
          ) reservation
        ) occupancy ON TRUE
+       LEFT JOIN LATERAL (
+         SELECT COUNT(DISTINCT reservation.patient_id)::int AS bookings FROM (
+           SELECT appointment.patient_id FROM appointments appointment
+           WHERE appointment.availability_id = availability.id AND appointment.status = 'confirmed'
+           UNION
+           SELECT allocation.patient_id FROM appointment_allocations allocation
+           WHERE allocation.availability_id = availability.id AND allocation.status = 'confirmed'
+             AND (EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed')
+               OR NOT EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))
+         ) reservation
+       ) preserved ON TRUE
        LEFT JOIN LATERAL (
          SELECT hold.id, hold.status, hold.expires_at
          FROM appointment_slot_holds hold
@@ -154,7 +218,9 @@ async function createDoctorSlots(_request, response, next) {
     await client.query("BEGIN");
     transactionStarted = true;
     const dates = [...new Set(slots.map((slot) => slot.date))].sort();
-    // Transaction-scoped locks serialize overlap checks per doctor and date. Sorted acquisition avoids batch deadlocks.
+    // Take the doctor lock first to serialize manual slots with schedule generation/edits,
+    // then sorted date locks to keep multi-date manual batches deadlock-free.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [ownership.doctorId]);
     for (const slotDate of dates) {
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [ownership.doctorId, slotDate]);
     }
@@ -212,7 +278,7 @@ async function deleteDoctorSlot(_request, response, next) {
     await client.query("BEGIN");
     transactionStarted = true;
     const locked = await client.query(
-      "SELECT id FROM availability WHERE id = $1 AND doctor_id = $2 AND deleted_at IS NULL FOR UPDATE",
+      "SELECT id, schedule_window_id FROM availability WHERE id = $1 AND doctor_id = $2 AND deleted_at IS NULL FOR UPDATE",
       [slotId, ownership.doctorId],
     );
     if (!locked.rows[0]) {
@@ -223,39 +289,43 @@ async function deleteDoctorSlot(_request, response, next) {
 
     // Booking and payment reservation flows lock the slot before this doctor-scoped advisory lock.
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [ownership.doctorId]);
-    const activeAppointment = await client.query(
-      `SELECT 1 FROM appointments
-       WHERE availability_id = $1 AND status = 'confirmed'
-         AND ((scheduled_date + scheduled_end_time) AT TIME ZONE $2) > NOW()
-       LIMIT 1`,
-      [slotId, response.locals.applicationTimezone],
+    const protectedAppointments = await findProtectedAppointmentsForAvailability(
+      client, slotId, response.locals.applicationTimezone || "Asia/Kolkata",
     );
-    if (activeAppointment.rows[0]) {
+    if (failForProtectedAppointments(response, protectedAppointments)) {
       await client.query("ROLLBACK");
       transactionStarted = false;
-      return response.status(409).json({ error: { code: "SLOT_IN_USE", message: "This slot has a future confirmed appointment and cannot be removed" } });
+      return;
     }
-
     const activeHold = await client.query(
-      "SELECT 1 FROM appointment_slot_holds WHERE availability_id = $1 AND status = 'active' AND expires_at > NOW() LIMIT 1",
+      `SELECT 1 WHERE EXISTS (
+         SELECT 1 FROM appointment_slot_holds
+         WHERE availability_id = $1 AND status = 'active' AND expires_at > NOW()
+       ) OR EXISTS (
+         SELECT 1 FROM appointment_allocations
+         WHERE availability_id = $1 AND status = 'held' AND expires_at > NOW()
+       )`,
       [slotId],
     );
     if (activeHold.rows[0]) {
       await client.query("ROLLBACK");
       transactionStarted = false;
-      return response.status(409).json({ error: { code: "SLOT_IN_USE", message: "This slot is temporarily held for payment and cannot be removed yet" } });
+      return response.status(409).json({ error: { code: "ACTIVE_PAYMENT_HOLD", message: "An active payment hold is using this availability. Wait for it to expire or be resolved before removing it." } });
     }
 
     const history = await client.query(
       `SELECT EXISTS (SELECT 1 FROM appointments WHERE availability_id = $1)
+           OR EXISTS (SELECT 1 FROM appointment_allocations WHERE availability_id = $1)
            OR EXISTS (SELECT 1 FROM appointment_slot_holds WHERE availability_id = $1) AS referenced`,
       [slotId],
     );
-    if (history.rows[0]?.referenced) {
+    if (history.rows[0]?.referenced || locked.rows[0].schedule_window_id) {
       await client.query(
         "UPDATE availability SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1 AND doctor_id = $2 AND deleted_at IS NULL",
         [slotId, ownership.doctorId],
       );
+      // Keep its active schedule-window row as a durable, date-specific exclusion marker.
+      // Recovery recognizes the retired availability/window pair and will not regenerate it.
       await client.query("COMMIT");
       transactionStarted = false;
       return response.status(204).end();

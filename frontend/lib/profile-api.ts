@@ -65,6 +65,7 @@ const appointmentSchema = z.object({
 const availabilitySlotSchema = z.object({
   id: z.string().uuid(),
   doctor_id: z.string().uuid(),
+  schedule_id: z.string().uuid().nullable().optional(),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   start_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
   end_time: z.string().regex(/^\d{2}:\d{2}:\d{2}$/),
@@ -73,6 +74,12 @@ const availabilitySlotSchema = z.object({
   remaining_capacity: z.number().int().nonnegative().nullable().optional(),
   hold_status: z.literal("active").nullable().optional(),
   hold_expires_at: z.string().nullable().optional(),
+  reservation_only: z.boolean().optional(),
+  has_confirmed_appointment: z.boolean().optional(),
+  has_active_allocation: z.boolean().optional(),
+  active_allocation_count: z.number().int().nonnegative().optional(),
+  has_active_held_allocation: z.boolean().optional(),
+  preserved_reservation_count: z.number().int().nonnegative().optional(),
 });
 
 const paymentOrderSchema = z.object({
@@ -172,10 +179,32 @@ export type DirectoryDoctor = z.infer<typeof doctorSchema>;
 export type DoctorPatient = z.infer<typeof doctorPatientSchema>;
 export type PatientAppointment = z.infer<typeof appointmentSchema>;
 export type AvailabilitySlot = z.infer<typeof availabilitySlotSchema>;
-const scheduleDateSchema = z.union([z.iso.date(), z.iso.datetime()]).transform((value) => value.slice(0, 10));
+const scheduleDateSchema = z.iso.date();
 const schedulePeriodSchema = z.object({ weekday: z.number().int().min(0).max(6).nullable().optional(), service_date: scheduleDateSchema.nullable().optional(), start_time: z.string(), end_time: z.string() });
-const doctorScheduleSchema = z.object({ id: z.string().uuid(), mode: z.enum(["wave", "stream"]), recurrence_type: z.enum(["weekly", "specific_dates"]), visibility: z.enum(["public", "private"]), active: z.boolean(), starts_on: scheduleDateSchema.nullable(), ends_on: scheduleDateSchema.nullable(), wave_capacity_per_slot: z.number().int(), stream_capacity_per_window: z.number().int(), periods: z.array(schedulePeriodSchema) });
+const doctorScheduleSchema = z.object({ id: z.string().uuid(), mode: z.enum(["wave", "stream"]), recurrence_type: z.enum(["weekly", "specific_dates"]), visibility: z.enum(["public", "private"]), active: z.boolean(), starts_on: scheduleDateSchema.nullable(), ends_on: scheduleDateSchema.nullable(), updated_at: z.string().optional(), wave_capacity_per_slot: z.number().int(), stream_capacity_per_window: z.number().int(), periods: z.array(schedulePeriodSchema) });
 export type DoctorSchedule = z.infer<typeof doctorScheduleSchema>;
+const elasticScheduleInputSchema = z.object({
+  mode: z.enum(["wave", "stream"]), expected_updated_at: z.string(), starts_on: z.iso.date(), ends_on: z.iso.date(),
+  periods: z.array(z.object({ weekday: z.number().int().min(0).max(6), start_time: z.string(), end_time: z.string() })),
+});
+const scheduleWindowSchema = z.object({ date: z.iso.date(), start_time: z.string(), end_time: z.string() });
+const elasticSchedulePreviewSchema = z.object({
+  schedule_id: z.string().uuid(), schedule_updated_at: z.string(), mode: z.enum(["wave", "stream"]),
+  wave_appointment_duration_minutes: z.number().int().positive().nullable(),
+  added_availability: z.array(scheduleWindowSchema),
+  resized_availability: z.array(z.object({ availability_id: z.string().uuid(), date: z.iso.date(), previous_start_time: z.string(), previous_end_time: z.string(), start_time: z.string(), end_time: z.string() })),
+  blocked_availability: z.array(scheduleWindowSchema.extend({ reasons: z.array(z.string()) })),
+  saved_schedule_period_conflicts: z.array(z.object({ weekday: z.number().int(), proposed_start_time: z.string(), proposed_end_time: z.string(), existing_schedule_id: z.string().uuid(), existing_recurrence_type: z.string(), existing_weekday: z.number().int().nullable(), existing_service_date: z.string().nullable(), existing_start_time: z.string(), existing_end_time: z.string() })),
+  can_update: z.boolean(),
+  removed_availability: z.array(z.object({ availability_id: z.string().uuid(), date: z.iso.date(), start_time: z.string(), end_time: z.string(), has_confirmed_appointment: z.boolean(), has_active_allocation: z.boolean(), has_active_payment_hold: z.boolean() })),
+  affected_appointments: z.array(z.object({ id: z.string().uuid(), availability_id: z.string().uuid(), status: z.literal("confirmed"), date: z.iso.date(), start_time: z.string(), end_time: z.string() })),
+  active_payment_holds: z.array(z.object({ id: z.string().uuid(), availability_id: z.string().uuid(), date: z.iso.date(), start_time: z.string(), end_time: z.string(), expires_at: z.string() })),
+  active_allocations: z.array(z.object({ id: z.string().uuid(), availability_id: z.string().uuid(), status: z.enum(["confirmed", "held"]), expires_at: z.string().nullable(), date: z.iso.date(), start_time: z.string(), end_time: z.string() })),
+  unchanged_count: z.number().int().nonnegative(), exceptions_preserved: z.boolean(),
+});
+export type ElasticScheduleInput = z.infer<typeof elasticScheduleInputSchema>;
+export type ElasticSchedulePreview = z.infer<typeof elasticSchedulePreviewSchema>;
+const elasticScheduleUpdateSchema = z.object({ schedule_id: z.string().uuid(), generated: z.array(scheduleWindowSchema.extend({ availability_id: z.string().uuid() })), added_count: z.number().int().nonnegative(), resized_count: z.number().int().nonnegative(), retired: elasticSchedulePreviewSchema.shape.removed_availability, removed_count: z.number().int().nonnegative(), unchanged_count: z.number().int().nonnegative(), blocked_availability: elasticSchedulePreviewSchema.shape.blocked_availability, wave_appointment_duration_minutes: z.number().int().positive().nullable(), exceptions_preserved: z.boolean() });
 export type PaymentOrder = z.infer<typeof paymentOrderSchema>;
 export type PaymentStatus = z.infer<typeof paymentStatusSchema>;
 export type PatientPaymentHistoryItem = z.infer<typeof paymentHistoryItemSchema>;
@@ -184,18 +213,21 @@ export type AppointmentPage = z.infer<typeof appointmentPageSchema>;
 export type CancellationRefundPreview = z.infer<typeof cancellationRefundPreviewSchema>;
 
 type ValidationDetail = { path: string; message: string };
+type ProtectedAppointmentDetail = { appointment_id: string; date: string; start_time: string; end_time: string };
 
 export class ProfileApiError extends Error {
   status: number;
   code?: string;
   details: ValidationDetail[];
+  protectedAppointments: ProtectedAppointmentDetail[];
 
-  constructor(status: number, message: string, code?: string, details: ValidationDetail[] = []) {
+  constructor(status: number, message: string, code?: string, details: ValidationDetail[] = [], protectedAppointments: ProtectedAppointmentDetail[] = []) {
     super(message);
     this.name = "ProfileApiError";
     this.status = status;
     this.code = code;
     this.details = details;
+    this.protectedAppointments = protectedAppointments;
   }
 }
 
@@ -235,14 +267,18 @@ async function request<T>(token: string | undefined, path: string, init: Request
       error: z.object({
         code: z.string().optional(),
         message: z.string().optional(),
-        details: z.array(z.object({ path: z.string(), message: z.string() })).optional(),
+        details: z.unknown().optional(),
       }).optional(),
     }).safeParse(payload);
+    const details = error.success ? error.data.error?.details : undefined;
+    const validationDetails = z.array(z.object({ path: z.string(), message: z.string() })).safeParse(details);
+    const protectedDetails = z.object({ protected_appointments: z.array(z.object({ appointment_id: z.string(), date: z.string(), start_time: z.string(), end_time: z.string() })) }).safeParse(details);
     throw new ProfileApiError(
       response.status,
       error.success ? error.data.error?.message ?? "The request could not be completed." : "The request could not be completed.",
       error.success ? error.data.error?.code : undefined,
-      error.success ? error.data.error?.details : undefined,
+      validationDetails.success ? validationDetails.data : [],
+      protectedDetails.success ? protectedDetails.data.protected_appointments : [],
     );
   }
 
@@ -317,6 +353,24 @@ export async function getDoctorSchedules(token: string, doctorId: string): Promi
   const payload = await request<unknown>(token, `/doctors/${encodeURIComponent(doctorId)}/schedules`);
   const parsed = z.array(doctorScheduleSchema).safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete schedule list.");
+  return parsed.data;
+}
+
+export async function previewDoctorScheduleUpdate(token: string, doctorId: string, scheduleId: string, input: ElasticScheduleInput): Promise<ElasticSchedulePreview> {
+  const validInput = elasticScheduleInputSchema.safeParse(input);
+  if (!validInput.success) throw new ProfileApiError(400, "The schedule changes are invalid.");
+  const payload = await request<unknown>(token, `/doctors/${encodeURIComponent(doctorId)}/schedules/${encodeURIComponent(scheduleId)}/preview`, { method: "POST", body: JSON.stringify(validInput.data) });
+  const parsed = elasticSchedulePreviewSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete schedule preview.");
+  return parsed.data;
+}
+
+export async function updateDoctorSchedule(token: string, doctorId: string, scheduleId: string, input: ElasticScheduleInput): Promise<z.infer<typeof elasticScheduleUpdateSchema>> {
+  const validInput = elasticScheduleInputSchema.safeParse(input);
+  if (!validInput.success) throw new ProfileApiError(400, "The schedule changes are invalid.");
+  const payload = await request<unknown>(token, `/doctors/${encodeURIComponent(doctorId)}/schedules/${encodeURIComponent(scheduleId)}`, { method: "PUT", body: JSON.stringify(validInput.data) });
+  const parsed = elasticScheduleUpdateSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete schedule update.");
   return parsed.data;
 }
 
