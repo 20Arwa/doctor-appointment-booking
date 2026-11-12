@@ -1,10 +1,8 @@
 const appointmentService = require("../services/appointmentService");
+const doctorService = require("../services/doctorService");
 
 async function listDoctors(_request, response) {
-  const result = await response.locals.database.query(
-    "SELECT d.id, u.first_name, u.last_name, d.specialty, d.bio, d.appointment_duration_minutes, d.consultation_fee::float8 AS consultation_fee, d.created_at, d.updated_at FROM doctors d JOIN users u ON u.id = d.user_id WHERE u.is_active = TRUE ORDER BY u.last_name, u.first_name",
-  );
-  return response.json(result.rows);
+  return response.json(await doctorService.listDoctors(response.locals.database));
 }
 
 async function getDoctor(_request, response) {

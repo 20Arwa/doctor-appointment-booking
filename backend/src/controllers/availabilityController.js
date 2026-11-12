@@ -50,9 +50,9 @@ async function getDoctorSlots(_request, response, next) {
     excludedAppointmentId = excluded.rows[0].id;
     excludedAllocationId = excluded.rows[0].allocation_id;
   }
-  const values = [id, now.date, now.time, response.locals.applicationTimezone, isOwnDoctorManagementView, excludedAppointmentId, excludedAllocationId];
+  const values = [id || null, now.date, now.time, response.locals.applicationTimezone, isOwnDoctorManagementView, excludedAppointmentId, excludedAllocationId];
   const filters = [
-    "doctor_id = $1",
+    id ? "doctor_id = $1" : "$1::uuid IS NULL",
     `(deleted_at IS NULL OR ($5::boolean AND (
        EXISTS (
          SELECT 1 FROM appointments a
@@ -80,6 +80,13 @@ async function getDoctorSlots(_request, response, next) {
      )))`,
     "(date > $2::date OR (date = $2::date AND start_time > $3::time))",
   ];
+  if (!id) {
+    filters.push(`EXISTS (
+      SELECT 1 FROM doctors active_doctor
+      JOIN users active_user ON active_user.id = active_doctor.user_id
+      WHERE active_doctor.id = availability.doctor_id AND active_user.is_active = TRUE
+    )`);
+  }
   if (from) {
     values.push(from);
     filters.push(`date >= $${values.length}::date`);
@@ -88,6 +95,7 @@ async function getDoctorSlots(_request, response, next) {
     values.push(to);
     filters.push(`date <= $${values.length}::date`);
   }
+  const limit = response.locals.query.limit === undefined ? "" : ` LIMIT $${values.push(response.locals.query.limit)}`;
 
   try {
     const holdFilter = isOwnDoctorManagementView ? "" : "AND (availability.mode IS NOT NULL OR payment_hold.id IS NULL)";
@@ -174,7 +182,7 @@ async function getDoctorSlots(_request, response, next) {
           ))
          AND (availability.mode IS NULL OR availability.capacity > COALESCE(occupancy.occupied, 0) OR $5::boolean)
           ${holdFilter}
-       ORDER BY date, start_time`,
+       ORDER BY date, start_time${limit}`,
       values,
     );
     return response.json(result.rows);
