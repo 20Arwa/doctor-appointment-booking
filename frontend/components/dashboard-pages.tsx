@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useDashboardProfile } from "@/components/role-application-shell";
 import { PatientDashboardContent } from "@/components/patient-dashboard-content";
+import { AssistantConversationHistory } from "@/components/assistant-conversation-history";
 import { getAppointments, type PatientAppointment } from "@/lib/profile-api";
 import { formatInstantDate } from "@/lib/date-format";
 
@@ -58,6 +59,8 @@ export function PatientDashboardPage() {
       </header>
 
       <PatientDashboardContent />
+
+      <AssistantConversationHistory />
 
       <section aria-labelledby="patient-shortcuts-title">
         <div className="flex items-end justify-between gap-3">
