@@ -8,6 +8,7 @@ import {
   Bell,
   HeartPulse,
   LayoutDashboard,
+  MessageCircle,
   Menu,
   ReceiptText,
   UserRound,
@@ -21,6 +22,7 @@ import { dashboardPath, type AppRole } from "@/lib/roles";
 import { AppShellLoading } from "@/components/app-shell-loading";
 import { HomepageSectionNavigation } from "@/components/homepage-section-navigation";
 import { NotificationBell } from "@/components/notification-bell";
+import { PatientAssistantLauncher } from "@/components/patient-assistant-launcher";
 
 type AppNavigationItem = {
   label: string;
@@ -32,6 +34,7 @@ const patientNavigation: AppNavigationItem[] = [
   { label: "Dashboard", href: "/patient/dashboard", icon: LayoutDashboard },
   { label: "Book Appointment", href: "/patient/book-appointment", icon: CalendarPlus },
   { label: "My Appointments", href: "/patient/appointments", icon: CalendarDays },
+  { label: "AI Assistant", href: "/patient/assistant", icon: MessageCircle },
   { label: "Notifications", href: "/patient/notifications", icon: Bell },
   { label: "Payment History", href: "/patient/payments", icon: ReceiptText },
   { label: "Profile", href: "/patient/profile", icon: UserRound },
@@ -177,6 +180,7 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
           </header>
           <main className="mx-auto w-full max-w-7xl px-5 py-7 sm:px-7 sm:py-9 lg:px-10 lg:py-11">{children}</main>
         </div>
+        {requiredRole === "patient" ? <PatientAssistantLauncher /> : null}
       </div>
       </UpdateProfileContext.Provider>
     </ProfileContext.Provider>
