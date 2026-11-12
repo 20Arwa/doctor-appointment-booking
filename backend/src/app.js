@@ -19,11 +19,12 @@ const { createPaymentService } = require("./services/paymentService");
 const { createNotificationDeliveryService } = require("./services/notificationDeliveryService");
 const notificationRecoveryRoutes = require("./routes/notificationRecoveryRoutes");
 const inAppNotificationRoutes = require("./routes/inAppNotificationRoutes");
+const assistantRoutes = require("./routes/assistantRoutes");
 const { createInAppNotificationService } = require("./services/inAppNotificationService");
 const { createAssistedRescheduleNotificationService } = require("./services/assistedRescheduleNotificationService");
 const { createAppointmentNotificationOutboxService } = require("./services/appointmentNotificationOutboxService");
 
-function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), smsNotificationService = createSmsNotificationService({ config: env }), notificationDeliveryService, inAppNotificationService, reminderService, reminderSecret = env.REMINDER_CRON_SECRET, notificationRecoverySecret = env.NOTIFICATION_RECOVERY_CRON_SECRET, stripeService, paymentService, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
+function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), smsNotificationService = createSmsNotificationService({ config: env }), notificationDeliveryService, inAppNotificationService, reminderService, reminderSecret = env.REMINDER_CRON_SECRET, notificationRecoverySecret = env.NOTIFICATION_RECOVERY_CRON_SECRET, stripeService, paymentService, assistantEngine, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("A PostgreSQL database pool is required");
   }
@@ -62,6 +63,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     response.locals.paymentService = payments;
     response.locals.clerkProfileResolver = clerkProfileResolver;
     response.locals.applicationTimezone = applicationTimezone;
+    response.locals.assistantEngine = assistantEngine;
     response.locals.emailNotificationService = emailNotificationService;
     response.locals.notificationDeliveryService = notificationDeliveries;
     response.locals.inAppNotificationService = inAppNotifications;
@@ -85,6 +87,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
   app.use("/api/v1/doctors", doctorRoutes);
   app.use("/api/v1/appointments", appointmentRoutes);
   app.use("/api/v1/notifications", inAppNotificationRoutes);
+  app.use("/api/v1/assistant", assistantRoutes);
   app.use(notFoundHandler);
   app.use(errorHandler);
 
