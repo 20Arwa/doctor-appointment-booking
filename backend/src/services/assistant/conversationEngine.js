@@ -55,6 +55,11 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
       let providerAttempts = 0;
       let providerRetries = 0;
       const usedResults = [];
+      const resolvedDoctorIds = new Set();
+      const ambiguousDoctorIds = new Map();
+      let namedDoctorSearch = null;
+      const currentUserText = [...messages].reverse().find((message) => message.role === "user")?.content || "";
+      const currentRequestNamesDoctor = /\bDr\.?\s+[\p{L}][\p{L}'-]*/iu.test(currentUserText);
       const started = now();
       const signal = AbortSignal.timeout(deadlineMs);
       const log = (stage, error, attempt = 0, category) => {
@@ -105,6 +110,8 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
           if (completion.toolCalls.some((call) => typeof call.name !== "string" || !call.name || !call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments))) {
             throw new AssistantError("INVALID_TOOL_CALL", 502, "The assistant could not safely process that request. Please rephrase it and try again.");
           }
+          const doctorSearchInBatch = completion.toolCalls.some((call) => call.name === "search_doctors");
+          const namedDoctorSearchInBatch = completion.toolCalls.some((call) => call.name === "search_doctors" && typeof call.arguments.name === "string");
           transcript.push({
             role: "assistant",
             content: completion.text,
@@ -115,8 +122,57 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
           for (const call of completion.toolCalls) {
             calls += 1;
             try {
+              if (call.name === "get_available_slots" && call.arguments.doctor_id) {
+                const candidates = ambiguousDoctorIds.get(call.arguments.doctor_id);
+                if (doctorSearchInBatch) {
+                  results.push({ name: call.name, id: call.id, result: { error: "Resolve the doctor in a separate search turn before checking availability." } });
+                  continue;
+                }
+                if (candidates) {
+                  results.push({ name: call.name, id: call.id, result: { error: "Multiple doctors matched; ask the patient to clarify.", clarification_candidates: candidates } });
+                  continue;
+                }
+                if (!resolvedDoctorIds.has(call.arguments.doctor_id)) {
+                  results.push({ name: call.name, id: call.id, result: { error: "Search for and uniquely resolve this doctor before checking availability." } });
+                  continue;
+                }
+              }
+              if (call.name === "get_available_slots" && namedDoctorSearchInBatch) {
+                results.push({ name: call.name, id: call.id, result: { error: "Resolve the named doctor in a separate search turn before checking availability." } });
+                continue;
+              }
+              if (call.name === "get_available_slots" && namedDoctorSearch?.status === "ambiguous") {
+                results.push({ name: call.name, id: call.id, result: { error: "Multiple doctors matched; ask the patient to clarify.", clarification_candidates: namedDoctorSearch.doctors } });
+                continue;
+              }
+              if (call.name === "get_available_slots" && namedDoctorSearch?.status === "no_match") {
+                results.push({ name: call.name, id: call.id, result: { error: "No doctor matched the name in the current request; do not search general availability." } });
+                continue;
+              }
+              if (call.name === "get_available_slots" && currentRequestNamesDoctor && !namedDoctorSearch) {
+                results.push({ name: call.name, id: call.id, result: { error: "Search the named doctor in the current request before checking availability." } });
+                continue;
+              }
+              if (call.name === "get_available_slots" && namedDoctorSearch?.status === "unique" && !call.arguments.doctor_id) {
+                results.push({ name: call.name, id: call.id, result: { error: "Use the uniquely matched doctor ID for this availability search." } });
+                continue;
+              }
+              if (call.name === "get_available_slots" && namedDoctorSearch?.status === "unique" && call.arguments.doctor_id !== namedDoctorSearch.doctors[0]?.id) {
+                results.push({ name: call.name, id: call.id, result: { error: "Use the doctor ID returned by the current name search." } });
+                continue;
+              }
               log("tool_execution");
+              if (call.name === "search_doctors" && call.arguments?.name) namedDoctorSearch = { status: "pending", doctors: [] };
               const result = await withDeadline(toolExecutor({ name: call.name, args: call.arguments, actor, database, applicationTimezone }), signal);
+              if (call.name === "search_doctors" && Array.isArray(result?.doctors)) {
+                if (call.arguments?.name) namedDoctorSearch = { status: result.doctors.length === 0 ? "no_match" : result.doctors.length > 1 ? "ambiguous" : "unique", doctors: result.doctors };
+                if (result.doctors.length === 1) {
+                  resolvedDoctorIds.add(result.doctors[0].id);
+                  ambiguousDoctorIds.delete(result.doctors[0].id);
+                } else if (result.doctors.length > 1) {
+                  for (const doctor of result.doctors) ambiguousDoctorIds.set(doctor.id, result.doctors);
+                }
+              }
               usedResults.push({ tool: call.name, data: result });
               results.push({ name: call.name, id: call.id, result });
             } catch (error) {
@@ -138,11 +194,12 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
           throw new AssistantError("ASSISTANT_TIMEOUT", 504, "The assistant took too long to respond. Please try again.", { category: "application_deadline", attempt: providerAttempts });
         }
         const status = providerStatus(error);
-        const category = status ? `provider_http_${status}` : error?.category || "provider_error";
+        const category = error?.category || (status ? `provider_http_${status}` : "provider_error");
         log("provider_error", error, providerAttempts, category);
-        if (status === 429) throw new AssistantError("ASSISTANT_RATE_LIMITED", 503, "The assistant is busy right now. Please try again shortly.", { category, providerStatus: status, attempt: providerAttempts });
+        if (status === 429 && category === "provider_daily_quota_exceeded") throw new AssistantError("ASSISTANT_DAILY_QUOTA_EXCEEDED", 503, "The AI assistant has reached its current usage limit. Please try again later.", { category, providerStatus: status, attempt: providerAttempts });
+        if (status === 429) throw new AssistantError("ASSISTANT_PROVIDER_RATE_LIMITED", 503, "The AI assistant is receiving too many requests. Please wait a moment and try again.", { category, providerStatus: status, attempt: providerAttempts });
         if (status === 401 || status === 403) throw new AssistantError("ASSISTANT_CONFIGURATION_ERROR", 503, "The assistant is temporarily unavailable. Please try again shortly.", { category, providerStatus: status, attempt: providerAttempts });
-        if (status === 503) throw new AssistantError("ASSISTANT_PROVIDER_UNAVAILABLE", 503, "The assistant provider is temporarily unavailable. Please try again shortly.", { category, providerStatus: status, attempt: providerAttempts });
+        if (status === 503) throw new AssistantError("ASSISTANT_PROVIDER_UNAVAILABLE", 503, "The AI assistant is temporarily unavailable. Please try again shortly.", { category, providerStatus: status, attempt: providerAttempts });
         if (status === 504) throw new AssistantError("ASSISTANT_PROVIDER_GATEWAY_TIMEOUT", 504, "The assistant provider gateway timed out. Please retry.", { category, providerStatus: status, attempt: providerAttempts });
         throw new AssistantError("ASSISTANT_UNAVAILABLE", 503, "The assistant is temporarily unavailable. Please try again shortly.", { category, providerStatus: status || undefined, attempt: providerAttempts });
       }

@@ -21,6 +21,32 @@ export function isNearMessageListBottom(scrollHeight: number, clientHeight: numb
   return scrollHeight - clientHeight - scrollTop <= 80;
 }
 
+export function isNearMessageListTop(scrollTop: number): boolean {
+  return scrollTop <= 80;
+}
+
+export function getVisibleAssistantResults(content: string, results: AssistantResult[] = []): AssistantResult[] {
+  if (/\b(?:I can(?:not|['’]t)|I['’]?m unable|I am unable|I will not|I won['’]?t)\b/i.test(content)) return [];
+  const visible = results.filter((result) => getAssistantResultRows(result).some((row) => row !== null && typeof row === "object"));
+  if (visible.some((result) => result.tool === "get_available_slots")) return visible.filter((result) => result.tool !== "search_doctors");
+  return visible;
+}
+
+export function getAssistantDisplayContent(content: string, results: AssistantResult[] = []): string {
+  const visible = getVisibleAssistantResults(content, results);
+  if (!visible.length) return content;
+  if (visible.length === 1 && visible[0].tool === "get_available_slots") {
+    const count = getAssistantResultRows(visible[0]).length;
+    return `Here are the ${count} earliest available option${count === 1 ? "" : "s"}:`;
+  }
+  if (visible.length === 1 && visible[0].tool === "get_patient_appointments") {
+    const count = getAssistantResultRows(visible[0]).length;
+    return count === 1 ? "Here is your appointment:" : "Here are your appointments:";
+  }
+  if (visible.length === 1 && visible[0].tool === "search_doctors") return "Here are the matching doctors:";
+  return "Here are the matching results:";
+}
+
 export function preserveScrollAfterPrepend(scrollHeight: number, previousHeight: number, previousTop: number): number {
   return previousTop + scrollHeight - previousHeight;
 }

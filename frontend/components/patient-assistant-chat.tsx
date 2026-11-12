@@ -1,12 +1,12 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
-import { CalendarDays, Clock3, LoaderCircle, MessageCircle, RefreshCw, Search, Send, Sparkles, Stethoscope, UserRound } from "lucide-react";
+import { ArrowDown, ArrowUp, CalendarDays, Clock3, LoaderCircle, MessageCircle, RefreshCw, Search, Send, Sparkles, Stethoscope, UserRound } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { AssistantApiError, createAssistantConversation, getAssistantConversation, listAssistantConversations, sendAssistantMessage, type AssistantResult } from "@/lib/assistant-api";
-import { chatReducer, getAssistantResultRows, initialChatState, isNearMessageListBottom, preserveScrollAfterPrepend } from "@/lib/assistant-chat-state";
+import { chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend } from "@/lib/assistant-chat-state";
 
 function displayTime(value: unknown) {
   if (typeof value !== "string") return "";
@@ -28,9 +28,12 @@ function ResultCards({ result }: { result: AssistantResult }) {
     return <li key={`${String(item.id || item.date || item.name)}-${index}`} className="rounded-xl border border-border bg-background p-3 text-sm">
       <p className="font-semibold text-foreground">{title}</p>
       {typeof item.specialty === "string" ? <p className="mt-1 text-muted-foreground">{item.specialty}</p> : null}
+      {result.tool === "get_available_slots" && item.mode === "wave" ? <p className="mt-1 font-medium text-foreground">Available slot · Wave</p> : null}
+      {result.tool === "get_available_slots" && item.mode === "stream" ? <p className="mt-1 font-medium text-foreground">Available window · Stream</p> : null}
+      {result.tool === "get_available_slots" && item.mode === "legacy" ? <p className="mt-1 font-medium text-foreground">Legacy availability · mode unknown</p> : null}
       {date ? <p className="mt-1 flex items-center gap-1 text-muted-foreground"><Clock3 aria-hidden="true" className="size-3.5" />{date} · {displayTime(item.start_time)}–{displayTime(item.end_time)}</p> : null}
       {typeof item.consultation_fee === "number" ? <p className="mt-1 text-xs text-muted-foreground">Consultation fee: ₹{item.consultation_fee.toLocaleString("en-IN")}</p> : null}
-      {typeof item.remaining_capacity === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.remaining_capacity} open</p> : null}
+      {typeof item.remaining_capacity === "number" && typeof item.capacity === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.remaining_capacity} of {item.capacity} places remaining{item.mode === "stream" ? " in this window" : " in this slot"}</p> : null}
     </li>;
   })}</ul>;
 }
@@ -42,6 +45,8 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
   const [draft, setDraft] = useState("");
   const [ready, setReady] = useState(false);
   const [history, setHistory] = useState({ hasMore: false, nextBefore: null as string | null, loadingOlder: false, olderError: null as string | null, reachedStart: false });
+  const [nearTop, setNearTop] = useState(false);
+  const [nearLatest, setNearLatest] = useState(true);
   const conversationId = useRef<string | null>(null);
   const requestInFlight = useRef(false);
   const olderLoadInFlight = useRef(false);
@@ -128,8 +133,9 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       {compact ? <><Link href="/patient/assistant" className="text-xs font-medium text-primary hover:underline">Full assistant</Link><Button type="button" variant="ghost" size="sm" onClick={onClose} aria-label="Close assistant">Close</Button></> : null}
     </header>
     <section aria-label="Assistant conversation" aria-live="polite" className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
-      <div ref={messageList} onScroll={(event) => { const element = event.currentTarget; nearBottom.current = isNearMessageListBottom(element.scrollHeight, element.clientHeight, element.scrollTop); }} className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4 sm:p-5">
-        {history.hasMore || history.loadingOlder || history.olderError ? <div className="sticky top-0 z-10 flex flex-col items-center gap-1 bg-card/95 pb-2"><Button type="button" variant="outline" size="sm" disabled={history.loadingOlder} onClick={() => void loadOlderMessages()}>{history.loadingOlder ? "Loading older messages…" : "Load older messages"}</Button>{history.olderError ? <p role="alert" className="text-xs text-destructive">{history.olderError}</p> : null}</div> : history.reachedStart ? <p className="text-center text-xs text-muted-foreground">Beginning of conversation</p> : null}
+      <div className="relative min-h-0 flex-1">
+      <div ref={messageList} onScroll={(event) => { const element = event.currentTarget; const top = isNearMessageListTop(element.scrollTop); const bottom = isNearMessageListBottom(element.scrollHeight, element.clientHeight, element.scrollTop); nearBottom.current = bottom; setNearTop(top); setNearLatest(bottom); }} className="absolute inset-0 space-y-4 overflow-y-auto overscroll-contain p-4 pb-20 sm:p-5 sm:pb-20">
+        {history.hasMore && nearTop ? <div className="flex flex-col gap-1 border-b border-border pb-2"><Button type="button" variant="ghost" size="sm" className="h-8 gap-2 px-2 text-muted-foreground hover:text-foreground" disabled={history.loadingOlder} onClick={() => void loadOlderMessages()}><ArrowUp aria-hidden="true" className="size-4" />{history.loadingOlder ? "Loading older messages…" : "Load older messages"}</Button>{history.olderError ? <p role="alert" className="px-2 text-xs text-destructive">{history.olderError}</p> : null}</div> : null}
         {state.messages.length === 0 ? <div className="mx-auto flex min-h-64 max-w-lg flex-col items-center justify-center text-center">
           <span className="flex size-12 items-center justify-center rounded-full bg-secondary text-secondary-foreground"><Sparkles aria-hidden="true" className="size-5" /></span>
           <h2 className="mt-4 text-lg font-semibold text-card-foreground">Your care, easier to navigate</h2>
@@ -139,8 +145,8 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
           <div className={`flex max-w-[94%] items-end gap-2 sm:max-w-[82%] ${message.role === "user" ? "flex-row-reverse" : ""}`}>
           {message.role === "user" ? <span aria-label="Patient" className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><UserRound aria-hidden="true" className="size-4" /></span> : null}
           <div className={`min-w-0 rounded-2xl p-3 ${message.role === "user" ? "rounded-br-md bg-primary text-primary-foreground" : "rounded-bl-md border border-border bg-background text-foreground"}`}>
-            {message.role === "assistant" ? <p className="mb-1 text-xs font-semibold opacity-75">Medrella Assistant</p> : null}<p className="whitespace-pre-wrap text-sm leading-6">{message.content}</p>
-            {message.results?.map((result, index) => <section key={`${result.tool}-${index}`} className="mt-3 rounded-xl border border-border bg-card p-3 text-card-foreground"><h3 className="flex items-center gap-2 text-xs font-semibold"><ResultIcon result={result} />{result.tool === "search_doctors" ? "Doctors" : result.tool === "get_available_slots" ? "Available times" : "Appointments"}</h3><ResultCards result={result} /></section>)}
+            {message.role === "assistant" ? <p className="mb-1 text-xs font-semibold opacity-75">Medrella Assistant</p> : null}<p className="whitespace-pre-wrap text-sm leading-6">{message.role === "assistant" ? getAssistantDisplayContent(message.content, message.results) : message.content}</p>
+            {message.role === "assistant" ? getVisibleAssistantResults(message.content, message.results).map((result, index) => <section key={`${result.tool}-${index}`} className="mt-3 rounded-xl border border-border bg-card p-3 text-card-foreground"><h3 className="flex items-center gap-2 text-xs font-semibold"><ResultIcon result={result} />{result.tool === "search_doctors" ? "Doctors" : result.tool === "get_available_slots" ? "Available times" : "Appointments"}</h3><ResultCards result={result} /></section>) : null}
           </div>
           </div>
           {message.failed && message.requestId ? <div className="mt-1 flex w-full justify-end pr-10">
@@ -154,11 +160,13 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
         </article>)}
         {state.loading && state.messages.length ? <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Checking that for you…</div> : null}
       </div>
+      {!nearLatest && state.messages.length ? <Button type="button" variant="outline" size="icon" className="absolute bottom-4 right-4 z-20 rounded-full border border-border bg-background text-foreground shadow-lg hover:bg-muted" aria-label="Scroll to latest messages" onClick={() => { const element = messageList.current; if (element) element.scrollTo({ top: element.scrollHeight, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }); }}><ArrowDown aria-hidden="true" className="size-4" /></Button> : null}
+      </div>
       {state.error ? <div role="alert" className="mx-3 mb-2 flex items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-foreground"><span>{state.error}</span><Button type="button" variant="default" size="sm" disabled={state.loading} onClick={retry}>Retry</Button></div> : null}
       {state.loading && !state.messages.length ? <div className="flex items-center gap-2 px-4 pb-2 text-xs text-muted-foreground" role="status"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Loading your conversation…</div> : null}
       <form onSubmit={submit} className="sticky bottom-0 z-10 shrink-0 border-t border-border bg-card p-3">
         <label htmlFor={compact ? "assistant-panel-message" : "assistant-message"} className="sr-only">Message Medrella Assistant</label>
-        <div className="mx-auto flex w-full max-w-3xl items-end gap-2 rounded-2xl border border-input bg-background p-2 focus-within:ring-2 focus-within:ring-ring">
+        <div className="mx-auto flex w-full items-end gap-2 rounded-2xl border border-input bg-background p-2 focus-within:ring-2 focus-within:ring-ring">
           <textarea id={compact ? "assistant-panel-message" : "assistant-message"} value={draft} onChange={(event) => setDraft(event.target.value.slice(0, 1000))} maxLength={1000} rows={1} placeholder="Ask about appointments, doctors, or available times…" className="max-h-28 min-h-10 flex-1 resize-y bg-transparent px-2 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
           <Button type="submit" size="icon" aria-label="Send message" disabled={!ready || state.loading || !draft.trim()}><Send aria-hidden="true" /></Button>
         </div>

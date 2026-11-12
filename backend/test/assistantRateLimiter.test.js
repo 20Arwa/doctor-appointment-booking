@@ -27,7 +27,7 @@ describe("assistant user rate limiter", () => {
     assert.equal(limited.response.statusCode, 429);
     assert.equal(limited.response.headers["Retry-After"], "60");
     assert.deepEqual(limited.response.body, {
-      error: { code: "RATE_LIMITED", message: "Too many assistant requests. Please try again shortly." },
+      error: { code: "RATE_LIMITED", message: "You're sending messages too quickly. Please wait a moment before trying again." },
     });
     currentTime += 60_000;
     assert.equal(sendRequest(limiter, "patient-a").nextCalls, 1);

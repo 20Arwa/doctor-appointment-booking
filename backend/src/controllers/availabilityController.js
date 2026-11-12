@@ -28,7 +28,7 @@ async function getDoctorSlots(_request, response, next) {
   const now = requireTimezone(response);
   if (!now) return;
   const { id } = response.locals.params;
-  const { from, to } = response.locals.query;
+  const { from, to, specialty } = response.locals.query;
   let isOwnDoctorManagementView = false;
   if (response.locals.user.role === "doctor") {
     const ownership = await getOwnDoctorId(response);
@@ -80,7 +80,7 @@ async function getDoctorSlots(_request, response, next) {
      )))`,
     "(date > $2::date OR (date = $2::date AND start_time > $3::time))",
   ];
-  if (!id) {
+  if (!isOwnDoctorManagementView) {
     filters.push(`EXISTS (
       SELECT 1 FROM doctors active_doctor
       JOIN users active_user ON active_user.id = active_doctor.user_id
@@ -95,12 +95,18 @@ async function getDoctorSlots(_request, response, next) {
     values.push(to);
     filters.push(`date <= $${values.length}::date`);
   }
+  if (specialty) {
+    values.push(specialty);
+    filters.push(`EXISTS (SELECT 1 FROM doctors specialty_doctor JOIN users specialty_user ON specialty_user.id = specialty_doctor.user_id WHERE specialty_doctor.id = availability.doctor_id AND specialty_user.is_active = TRUE AND specialty_doctor.specialty ILIKE '%' || $${values.length} || '%')`);
+  }
   const limit = response.locals.query.limit === undefined ? "" : ` LIMIT $${values.push(response.locals.query.limit)}`;
 
   try {
     const holdFilter = isOwnDoctorManagementView ? "" : "AND (availability.mode IS NOT NULL OR payment_hold.id IS NULL)";
     const result = await response.locals.database.query(
       `SELECT availability.id, availability.doctor_id, availability.schedule_id,
+              users.first_name AS doctor_first_name, users.last_name AS doctor_last_name,
+              doctors.specialty, doctors.consultation_fee::float8 AS consultation_fee,
               availability.deleted_at IS NOT NULL AS reservation_only,
               EXISTS (SELECT 1 FROM appointments a WHERE a.availability_id = availability.id AND a.status = 'confirmed'
                 AND ((a.scheduled_date + a.scheduled_end_time) AT TIME ZONE $4) > NOW()) AS has_confirmed_appointment,
@@ -125,6 +131,8 @@ async function getDoctorSlots(_request, response, next) {
               availability.created_at, availability.updated_at,
               payment_hold.status AS hold_status, payment_hold.expires_at AS hold_expires_at
        FROM availability
+       JOIN doctors ON doctors.id = availability.doctor_id
+       JOIN users ON users.id = doctors.user_id
        LEFT JOIN LATERAL (
          SELECT COUNT(DISTINCT reservation.patient_id)::int AS occupied
          FROM (

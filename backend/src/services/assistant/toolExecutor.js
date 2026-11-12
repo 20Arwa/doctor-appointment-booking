@@ -75,17 +75,17 @@ async function executeTool({ name, args, actor, database, applicationTimezone, n
   }
 
   if (name === "get_available_slots") {
-    const slotLimit = input.from ? 30 : 1;
+    const slotLimit = 5;
     const response = controllerResponse({
       database, applicationTimezone: applicationTimezone || "Asia/Kolkata", user: actor,
-      params: { id: input.doctor_id }, query: { from: input.from, to: input.to, limit: slotLimit },
+      params: { id: input.doctor_id }, query: { from: input.from, to: input.to, specialty: input.specialty, limit: slotLimit },
     });
     let controllerError;
     await getDoctorSlots({}, response, (error) => { controllerError = error; });
     if (controllerError) throw controllerError;
     if ((response.statusCode || 200) >= 400) throw Object.assign(new Error("Availability could not be loaded"), { code: "TOOL_QUERY_FAILED" });
-    return { slots: (response.body || []).slice(0, slotLimit).map(({ date, start_time, end_time, doctor_id, remaining_capacity }) => ({
-      date, start_time, end_time, doctor_id, remaining_capacity,
+    return { slots: (response.body || []).slice(0, slotLimit).map(({ date, start_time, end_time, doctor_id, doctor_first_name, doctor_last_name, specialty, consultation_fee, mode, capacity, remaining_capacity }) => ({
+      date, start_time, end_time, doctor_id, doctor: { id: doctor_id, name: `Dr. ${doctor_first_name} ${doctor_last_name}`.trim() }, specialty, consultation_fee, mode: mode || "legacy", capacity, remaining_capacity,
     })) };
   }
 

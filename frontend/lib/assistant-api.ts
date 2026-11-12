@@ -12,7 +12,7 @@ export type StoredAssistantMessage = z.infer<typeof messageSchema>;
 export type AssistantConversation = z.infer<typeof conversationSchema>;
 
 export class AssistantApiError extends Error {
-  constructor(public readonly status: number, message: string) { super(message); this.name = "AssistantApiError"; }
+  constructor(public readonly status: number, message: string, public readonly code?: string) { super(message); this.name = "AssistantApiError"; }
 }
 
 async function request<T>(token: string, path: string, init: RequestInit, schema: z.ZodType<T>): Promise<T> {
@@ -26,8 +26,15 @@ async function request<T>(token: string, path: string, init: RequestInit, schema
   let payload: unknown;
   try { payload = await response.json(); } catch { throw new AssistantApiError(response.status, "The assistant returned an unexpected response. Please try again."); }
   if (!response.ok) {
-    const parsed = z.object({ error: z.object({ message: z.string().optional() }).optional() }).safeParse(payload);
-    throw new AssistantApiError(response.status, parsed.success ? parsed.data.error?.message || "The assistant couldn't respond. Please try again." : "The assistant couldn't respond. Please try again.");
+    const parsed = z.object({ error: z.object({ code: z.string().optional(), message: z.string().optional() }).optional() }).safeParse(payload);
+    const code = parsed.success ? parsed.data.error?.code : undefined;
+    const safeMessages: Record<string, string> = {
+      RATE_LIMITED: "You're sending messages too quickly. Please wait a moment before trying again.",
+      ASSISTANT_DAILY_QUOTA_EXCEEDED: "The AI assistant has reached its current usage limit. Please try again later.",
+      ASSISTANT_PROVIDER_RATE_LIMITED: "The AI assistant is receiving too many requests. Please wait a moment and try again.",
+      ASSISTANT_PROVIDER_UNAVAILABLE: "The AI assistant is temporarily unavailable. Please try again shortly.",
+    };
+    throw new AssistantApiError(response.status, (code && safeMessages[code]) || "The assistant couldn't respond. Please try again.", code);
   }
   const parsed = schema.safeParse(payload);
   if (!parsed.success) throw new AssistantApiError(502, "The assistant returned an incomplete response. Please try again.");
