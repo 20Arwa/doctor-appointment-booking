@@ -279,10 +279,10 @@ async function listAppointments(database, user, filters, timeZone = "Asia/Kolkat
   const where = [ownership];
   if (filters.view === "upcoming") {
     values.push(timeZone);
-    where.push(`a.status = 'confirmed' AND ((a.scheduled_date + a.scheduled_end_time) AT TIME ZONE $${values.length}) > NOW()`);
+    where.push(`a.status = 'confirmed' AND ((a.scheduled_date + a.scheduled_start_time) AT TIME ZONE $${values.length}) > NOW()`);
   } else if (filters.view === "past") {
     values.push(timeZone);
-    where.push(`(a.status = 'completed' OR (a.status = 'confirmed' AND ((a.scheduled_date + a.scheduled_end_time) AT TIME ZONE $${values.length}) <= NOW()))`);
+    where.push(`(a.status = 'completed' OR (a.status = 'confirmed' AND ((a.scheduled_date + a.scheduled_start_time) AT TIME ZONE $${values.length}) <= NOW()))`);
   } else if (filters.view === "cancelled") {
     where.push("a.status = 'cancelled'");
   }

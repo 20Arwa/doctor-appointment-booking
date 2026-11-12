@@ -1,6 +1,18 @@
 const { GoogleGenAI } = require("@google/genai");
 const GEMINI_REQUEST_TIMEOUT_MS = 30000;
 
+function providerErrorCategory(error, status) {
+  if (status === 429) {
+    const details = Array.isArray(error?.error?.details) ? error.error.details : Array.isArray(error?.details) ? error.details : [];
+    const quotaFailure = details.find((detail) => String(detail?.reason || detail?.['@type'] || '').toLowerCase().includes('quota'));
+    const violations = Array.isArray(quotaFailure?.violations) ? quotaFailure.violations : [];
+    const dailyQuota = violations.some((violation) => /per.?day|daily|requests_per_day/i.test(`${violation?.quotaId || ''} ${violation?.quotaMetric || ''}`));
+    if (dailyQuota || /daily.?limit|quota.?exceeded/i.test(String(error?.error?.status || error?.statusText || ''))) return "provider_daily_quota_exceeded";
+    return "provider_rate_limited";
+  }
+  return status ? `provider_http_${status}` : error?.name === "AbortError" ? "sdk_timeout" : "provider_error";
+}
+
 function readRetryAfterMs(headers, now = Date.now) {
   const retryAfterMs = headers.get("retry-after-ms");
   if (retryAfterMs !== null) {
@@ -59,7 +71,7 @@ function createGeminiProvider({ apiKey, model = "gemini-3.8-flash", client } = {
       } catch (error) {
         const safe = new Error("Gemini request failed");
         safe.status = error?.status || error?.statusCode;
-        safe.category = Number.isFinite(Number(safe.status)) ? "provider_http_error" : error?.name === "AbortError" ? "sdk_timeout" : "provider_error";
+        safe.category = providerErrorCategory(error, Number(safe.status));
         safe.retryAfterMs = Number.isFinite(error?.retryAfterMs) ? error.retryAfterMs : retryAfterMs;
         safe.name = error?.name;
         throw safe;
@@ -80,4 +92,4 @@ function createGeminiProvider({ apiKey, model = "gemini-3.8-flash", client } = {
   };
 }
 
-module.exports = { createGeminiProvider, readRetryAfterMs };
+module.exports = { createGeminiProvider, providerErrorCategory, readRetryAfterMs };

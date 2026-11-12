@@ -30,7 +30,7 @@ function createAssistantRateLimiter({ limit = DEFAULT_LIMIT, windowMs = DEFAULT_
       const retryAfter = Math.max(1, Math.ceil((userWindow.resetAt - currentTime) / 1000));
       response.set("Retry-After", String(retryAfter));
       return response.status(429).json({
-        error: { code: "RATE_LIMITED", message: "Too many assistant requests. Please try again shortly." },
+        error: { code: "RATE_LIMITED", message: "You're sending messages too quickly. Please wait a moment before trying again." },
       });
     }
 
