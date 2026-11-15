@@ -47,7 +47,7 @@ function ResultCards({ result }: { result: AssistantResult }) {
       </> : null}
       {result.tool === "get_doctor_schedule_exceptions" && Array.isArray(item.periods) ? <p className="mt-1 text-xs text-muted-foreground">{(item.periods as Record<string, unknown>[]).map((period) => `${displayTime(period.start_time)}–${displayTime(period.end_time)}`).join(", ") || "No hours"}</p> : null}
       {result.tool === "get_doctor_schedule_conflicts" && Array.isArray(item.conflicts) ? <p className="mt-1 text-xs text-muted-foreground">{(item.conflicts as unknown[]).map((conflict) => String(conflict).replaceAll("_", " ")).join(" · ")}</p> : null}
-      {result.tool === "get_doctor_schedule_conflicts" && typeof item.occupied === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.occupied} occupied · {item.remaining_capacity} remaining of {item.capacity}</p> : null}
+      {result.tool === "get_doctor_schedule_conflicts" && typeof item.occupied === "number" && typeof item.remaining_capacity === "number" && typeof item.capacity === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.occupied} occupied · {item.remaining_capacity} remaining of {item.capacity}</p> : null}
     </li>;
   })}</ul>{doctorTool && typeof result.data.notice === "string" ? <p className="mt-3 text-xs text-muted-foreground">{result.data.notice}</p> : null}</div>;
 }
