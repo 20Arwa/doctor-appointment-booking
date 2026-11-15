@@ -43,6 +43,7 @@ const patientNavigation: AppNavigationItem[] = [
 const doctorNavigation: AppNavigationItem[] = [
   { label: "Dashboard", href: "/doctor/dashboard", icon: LayoutDashboard },
   { label: "My Appointments", href: "/doctor/appointments", icon: CalendarDays },
+  { label: "AI Assistant", href: "/doctor/assistant", icon: MessageCircle },
   { label: "Notifications", href: "/doctor/notifications", icon: Bell },
   { label: "Manage Availability", href: "/doctor/availability", icon: CalendarRange },
   { label: "Profile", href: "/doctor/profile", icon: UserRound },

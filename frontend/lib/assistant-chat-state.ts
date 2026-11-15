@@ -41,7 +41,8 @@ export function shouldShowHistoryRecovery(errorCode: string | null | undefined):
 }
 
 export function getAssistantResultRows(result: AssistantResult): unknown[] {
-  const rows = result.data.appointments || result.data.doctors || result.data.slots;
+  const rows = result.data.appointments || result.data.doctors || result.data.slots
+    || result.data.schedules || result.data.exceptions || result.data.conflicts;
   return Array.isArray(rows) ? rows : [];
 }
 
@@ -55,7 +56,8 @@ export function isNearMessageListTop(scrollTop: number): boolean {
 
 export function getVisibleAssistantResults(content: string, results: AssistantResult[] = []): AssistantResult[] {
   if (/\b(?:I can(?:not|['’]t)|I['’]?m unable|I am unable|I will not|I won['’]?t)\b/i.test(content)) return [];
-  const visible = results.filter((result) => getAssistantResultRows(result).some((row) => row !== null && typeof row === "object"));
+  const visible = results.filter((result) => getAssistantResultRows(result).some((row) => row !== null && typeof row === "object")
+    || result.tool.startsWith("get_doctor_") && typeof result.data.notice === "string");
   if (visible.some((result) => result.tool === "get_available_slots")) return visible.filter((result) => result.tool !== "search_doctors");
   return visible;
 }
@@ -63,7 +65,7 @@ export function getVisibleAssistantResults(content: string, results: AssistantRe
 export function getAssistantDisplayContent(content: string, results: AssistantResult[] = []): string {
   const visible = getVisibleAssistantResults(content, results);
   if (!visible.length) return content;
-  if (visible.length === 1 && visible[0].tool === "get_available_slots") {
+  if (visible.length === 1 && ["get_available_slots", "get_doctor_nearest_slots"].includes(visible[0].tool)) {
     const count = getAssistantResultRows(visible[0]).length;
     return `Here are the ${count} earliest available option${count === 1 ? "" : "s"}:`;
   }

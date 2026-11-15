@@ -20,23 +20,36 @@ function dateLabel(value: unknown) {
 }
 function ResultCards({ result }: { result: AssistantResult }) {
   const rows = getAssistantResultRows(result);
-  if (!rows.length) return null;
-  return <ul className="mt-3 grid gap-2 sm:grid-cols-2">{rows.map((entry, index) => {
+  const doctorTool = result.tool.startsWith("get_doctor_");
+  if (!rows.length) return doctorTool ? <p className="mt-2 text-sm text-muted-foreground">No matching records were found for this range.{typeof result.data.notice === "string" ? ` ${result.data.notice}` : ""}</p> : null;
+  return <div><ul className="mt-3 grid gap-2 sm:grid-cols-2">{rows.map((entry, index) => {
     if (!entry || typeof entry !== "object") return null;
     const item = entry as Record<string, unknown>; const doctor = item.doctor as Record<string, unknown> | undefined;
-    const title = typeof doctor?.name === "string" ? doctor.name : typeof item.name === "string" ? item.name : result.tool === "get_available_slots" ? "Available appointment" : "Appointment";
+    const title = result.tool === "get_doctor_schedules" ? `${String(item.mode || "Doctor")} schedule`
+      : result.tool === "get_doctor_schedule_exceptions" ? String(item.exception_type || "Schedule exception").replaceAll("_", " ")
+        : result.tool === "get_doctor_schedule_conflicts" ? "Scheduling conflict"
+          : typeof doctor?.name === "string" ? doctor.name : typeof item.name === "string" ? item.name
+            : ["get_available_slots", "get_doctor_nearest_slots"].includes(result.tool) ? "Available appointment" : "Appointment";
     const date = dateLabel(item.date);
     return <li key={`${String(item.id || item.date || item.name)}-${index}`} className="rounded-xl border border-border bg-background p-3 text-sm">
       <p className="font-semibold text-foreground">{title}</p>
       {typeof item.specialty === "string" ? <p className="mt-1 text-muted-foreground">{item.specialty}</p> : null}
-      {result.tool === "get_available_slots" && item.mode === "wave" ? <p className="mt-1 font-medium text-foreground">Available slot · Wave</p> : null}
-      {result.tool === "get_available_slots" && item.mode === "stream" ? <p className="mt-1 font-medium text-foreground">Available window · Stream</p> : null}
+      {["get_available_slots", "get_doctor_nearest_slots"].includes(result.tool) && item.mode === "wave" ? <p className="mt-1 font-medium text-foreground">Available slot · Wave</p> : null}
+      {["get_available_slots", "get_doctor_nearest_slots"].includes(result.tool) && item.mode === "stream" ? <p className="mt-1 font-medium text-foreground">Available window · Stream</p> : null}
       {result.tool === "get_available_slots" && item.mode === "legacy" ? <p className="mt-1 font-medium text-foreground">Legacy availability · mode unknown</p> : null}
       {date ? <p className="mt-1 flex items-center gap-1 text-muted-foreground"><Clock3 aria-hidden="true" className="size-3.5" />{date} · {displayTime(item.start_time)}–{displayTime(item.end_time)}</p> : null}
       {typeof item.consultation_fee === "number" ? <p className="mt-1 text-xs text-muted-foreground">Consultation fee: ₹{item.consultation_fee.toLocaleString("en-IN")}</p> : null}
       {typeof item.remaining_capacity === "number" && typeof item.capacity === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.remaining_capacity} of {item.capacity} places remaining{item.mode === "stream" ? " in this window" : " in this slot"}</p> : null}
+      {result.tool === "get_doctor_schedules" ? <>
+        {typeof item.recurrence_type === "string" ? <p className="mt-1 text-xs capitalize text-muted-foreground">{item.recurrence_type.replaceAll("_", " ")} · {String(item.visibility || "private")} schedule</p> : null}
+        {typeof item.starts_on === "string" || typeof item.ends_on === "string" ? <p className="mt-1 text-xs text-muted-foreground">Active {typeof item.starts_on === "string" ? `from ${dateLabel(item.starts_on)}` : "from its start date"}{typeof item.ends_on === "string" ? ` through ${dateLabel(item.ends_on)}` : " with no end date"}</p> : null}
+        {Array.isArray(item.periods) ? <ul className="mt-2 space-y-1 text-xs text-muted-foreground">{(item.periods as Record<string, unknown>[]).slice(0, 14).map((period, periodIndex) => <li key={periodIndex}>{typeof period.service_date === "string" ? dateLabel(period.service_date) : ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][Number(period.weekday)] || "Weekly"}: {displayTime(period.start_time)}–{displayTime(period.end_time)}</li>)}</ul> : null}
+      </> : null}
+      {result.tool === "get_doctor_schedule_exceptions" && Array.isArray(item.periods) ? <p className="mt-1 text-xs text-muted-foreground">{(item.periods as Record<string, unknown>[]).map((period) => `${displayTime(period.start_time)}–${displayTime(period.end_time)}`).join(", ") || "No hours"}</p> : null}
+      {result.tool === "get_doctor_schedule_conflicts" && Array.isArray(item.conflicts) ? <p className="mt-1 text-xs text-muted-foreground">{(item.conflicts as unknown[]).map((conflict) => String(conflict).replaceAll("_", " ")).join(" · ")}</p> : null}
+      {result.tool === "get_doctor_schedule_conflicts" && typeof item.occupied === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.occupied} occupied · {item.remaining_capacity} remaining of {item.capacity}</p> : null}
     </li>;
-  })}</ul>;
+  })}</ul>{doctorTool && typeof result.data.notice === "string" ? <p className="mt-3 text-xs text-muted-foreground">{result.data.notice}</p> : null}</div>;
 }
 function ResultIcon({ result }: { result: AssistantResult }) { return result.tool === "search_doctors" ? <Stethoscope aria-hidden="true" className="size-4" /> : <CalendarDays aria-hidden="true" className="size-4" />; }
 
@@ -165,7 +178,9 @@ function AssistantActionProposal({ result, assistantMessageId, conversationId, g
   </section>;
 }
 
-export function PatientAssistantChat({ compact = false, onClose }: { compact?: boolean; onClose?: () => void }) {
+export function PatientAssistantChat({ compact = false, onClose, audience = "patient" }: { compact?: boolean; onClose?: () => void; audience?: "patient" | "doctor" }) {
+  const assistantPath = audience === "doctor" ? "/doctor/assistant" : "/patient/assistant";
+  const doctorMode = audience === "doctor";
   const { getToken } = useAuth();
   const [state, dispatch] = useReducer(chatReducer, initialChatState);
   const [draft, setDraft] = useState("");
@@ -249,14 +264,14 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       if (!token) throw new AssistantApiError(401, "Your secure sign-in session is not ready. Please sign in again.");
       if (!conversationId.current) {
         const id = crypto.randomUUID(); await createAssistantConversation(token, id); conversationId.current = id;
-        if (!compact) window.history.replaceState(null, "", `/patient/assistant?conversation=${id}`);
+        if (!compact) window.history.replaceState(null, "", `${assistantPath}?conversation=${id}`);
       }
       const reply = await sendAssistantMessage(token, conversationId.current, requestId, content);
       setHistoryLoadFailed(false);
       dispatch({ type: "success", requestId, user: { id: reply.user_message.id, requestId, role: "user", content, createdAt: reply.user_message.created_at || new Date().toISOString() }, assistant: { id: reply.assistant_message.id, role: "assistant", content: reply.assistant_message.content, createdAt: reply.assistant_message.created_at || new Date().toISOString(), results: reply.assistant_message.results || [] } });
     } catch (error) { setDraft((current) => restoreDraftAfterFailedSubmission(current, content)); dispatch({ type: "failure", requestId, message: error instanceof Error ? error.message : "We couldn't get a reply. Please try again.", code: error instanceof AssistantApiError ? error.code : undefined, source: "send" }); }
     finally { requestInFlight.current = false; }
-  }, [compact, getToken, historyLoadFailed]);
+  }, [assistantPath, compact, getToken, historyLoadFailed]);
 
   const startNewConversation = useCallback(async () => {
     if (requestInFlight.current) return;
@@ -273,14 +288,14 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       setHistory({ hasMore: false, nextBefore: null, loadingOlder: false, olderError: null, reachedStart: false });
       setRecoveryConversations([]);
       dispatch({ type: "clear" });
-      if (!compact) window.history.replaceState(null, "", `/patient/assistant?conversation=${id}`);
+      if (!compact) window.history.replaceState(null, "", `${assistantPath}?conversation=${id}`);
     } catch (error) {
       dispatch({ type: "failure", requestId: "start-new", message: error instanceof Error ? error.message : "A new conversation couldn't be started.", code: error instanceof AssistantApiError ? error.code : undefined, source: "new_conversation" });
     } finally {
       requestInFlight.current = false;
       dispatch({ type: "loading", value: false });
     }
-  }, [compact, getToken]);
+  }, [assistantPath, compact, getToken]);
 
   const findSavedConversations = useCallback(async () => {
     if (requestInFlight.current) return;
@@ -315,14 +330,14 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       setHistory({ hasMore: stored.has_more, nextBefore: stored.next_before, loadingOlder: false, olderError: null, reachedStart: false });
       setHistoryLoadFailed(false);
       setRecoveryConversations([]);
-      if (!compact) window.history.replaceState(null, "", `/patient/assistant?conversation=${stored.conversation.id}`);
+      if (!compact) window.history.replaceState(null, "", `${assistantPath}?conversation=${stored.conversation.id}`);
     } catch (error) {
       dispatch({ type: "failure", requestId: "recover", message: error instanceof Error ? error.message : "The saved conversation couldn't be opened.", code: error instanceof AssistantApiError ? error.code || "HISTORY_LOAD_FAILED" : "HISTORY_LOAD_FAILED", source: "history" });
     } finally {
       requestInFlight.current = false;
       dispatch({ type: "loading", value: false });
     }
-  }, [compact, getToken]);
+  }, [assistantPath, compact, getToken]);
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const content = draft.trim(); if (!canSendAssistantMessage({ ready, loading: state.loading || requestInFlight.current, draft: content, historyLoadFailed, hasConversation: Boolean(conversationId.current) })) return;
@@ -342,9 +357,9 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
   const content = <>
     <header className={`flex items-center gap-3 ${compact ? "px-4 py-3" : "mb-5"}`}>
       <span className="flex size-10 items-center justify-center rounded-2xl bg-secondary text-secondary-foreground"><MessageCircle aria-hidden="true" className="size-5" /></span>
-      <div className="min-w-0 flex-1"><p className="text-sm font-medium text-primary">Medrella Assistant</p><h1 className="text-xl font-semibold tracking-tight text-foreground">How can I help?</h1></div>
+      <div className="min-w-0 flex-1"><p className="text-sm font-medium text-primary">Medrella Assistant</p><h1 className="text-xl font-semibold tracking-tight text-foreground">{doctorMode ? "Doctor AI Assistant" : "How can I help?"}</h1></div>
       <Button type="button" variant="outline" size="sm" className="shrink-0 gap-2" disabled={state.loading || requestInFlight.current} onClick={() => void startNewConversation()}><MessageSquarePlus aria-hidden="true" className="size-4" />New Chat</Button>
-      {compact ? <><Link href="/patient/assistant" className="text-xs font-medium text-primary hover:underline">Full assistant</Link><Button type="button" variant="ghost" size="sm" onClick={onClose} aria-label="Close assistant">Close</Button></> : null}
+      {compact ? <><Link href={assistantPath} className="text-xs font-medium text-primary hover:underline">Full assistant</Link><Button type="button" variant="ghost" size="sm" onClick={onClose} aria-label="Close assistant">Close</Button></> : null}
     </header>
     <section aria-label="Assistant conversation" aria-live="polite" className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
       <div className="relative min-h-0 flex-1">
@@ -352,16 +367,16 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
         {history.hasMore && nearTop ? <div className="flex flex-col gap-1 border-b border-border pb-2"><Button type="button" variant="ghost" size="sm" className="h-8 gap-2 px-2 text-muted-foreground hover:text-foreground" disabled={history.loadingOlder} onClick={() => void loadOlderMessages()}><ArrowUp aria-hidden="true" className="size-4" />{history.loadingOlder ? "Loading older messages…" : "Load older messages"}</Button>{history.olderError ? <p role="alert" className="px-2 text-xs text-destructive">{history.olderError}</p> : null}</div> : null}
         {state.messages.length === 0 ? <div className="mx-auto flex min-h-64 max-w-lg flex-col items-center justify-center text-center">
           <span className="flex size-12 items-center justify-center rounded-full bg-secondary text-secondary-foreground"><Sparkles aria-hidden="true" className="size-5" /></span>
-          <h2 className="mt-4 text-lg font-semibold text-card-foreground">Your care, easier to navigate</h2>
-          <p className="mt-2 text-sm leading-6 text-muted-foreground">Ask about your upcoming or previous appointments, find a doctor, or check available appointment times.</p>
-          <p className="mt-4 flex items-center gap-2 text-xs text-muted-foreground"><Search aria-hidden="true" className="size-3.5" /> For example: “Find a cardiologist”</p>
+          <h2 className="mt-4 text-lg font-semibold text-card-foreground">{doctorMode ? "Your schedule, easier to manage" : "Your care, easier to navigate"}</h2>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">{doctorMode ? "Ask about your schedules, exceptions, conflicts, or nearest available slots." : "Ask about your upcoming or previous appointments, find a doctor, or check available appointment times."}</p>
+          <p className="mt-4 flex items-center gap-2 text-xs text-muted-foreground"><Search aria-hidden="true" className="size-3.5" /> {doctorMode ? "For example: ‘What open times do I have this week?’" : "For example: ‘Find a cardiologist’"}</p>
         </div> : state.messages.map((message, index) => <article key={message.id || message.requestId || `${message.role}-${index}`} className={`flex flex-col ${message.role === "user" ? "items-end" : "items-start"}`}>
           {shouldShowAssistantDateSeparator(state.messages, index) && message.createdAt ? <div className="my-1 flex w-full items-center gap-3 text-xs text-muted-foreground" role="separator"><span className="h-px flex-1 bg-border" /><span>{assistantMessageDateLabel(message.createdAt)}</span><span className="h-px flex-1 bg-border" /></div> : null}
           <div className={`flex max-w-[94%] items-end gap-2 sm:max-w-[82%] ${message.role === "user" ? "flex-row-reverse" : ""}`}>
-          {message.role === "assistant" ? <span aria-label="AI assistant" className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><Bot aria-hidden="true" className="size-4" /></span> : <span aria-label="Patient" className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><UserRound aria-hidden="true" className="size-4" /></span>}
+          {message.role === "assistant" ? <span aria-label="AI assistant" className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><Bot aria-hidden="true" className="size-4" /></span> : <span aria-label={doctorMode ? "Doctor" : "Patient"} className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><UserRound aria-hidden="true" className="size-4" /></span>}
           <div className={`min-w-0 rounded-2xl p-3 ${message.role === "user" ? "rounded-br-md bg-primary text-primary-foreground" : "rounded-bl-md border border-border bg-background text-foreground"}`}>
             {message.role === "assistant" ? <p className="mb-1 text-xs font-semibold opacity-75">Medrella Assistant</p> : null}<p className="whitespace-pre-wrap text-sm leading-6">{message.role === "assistant" ? getAssistantDisplayContent(message.content, message.results) : message.content}</p>
-            {message.role === "assistant" ? getVisibleAssistantResults(message.content, message.results).map((result, index) => <section key={`${result.tool}-${index}`} className="mt-3 rounded-xl border border-border bg-card p-3 text-card-foreground"><h3 className="flex items-center gap-2 text-xs font-semibold"><ResultIcon result={result} />{result.tool === "search_doctors" ? "Doctors" : result.tool === "get_available_slots" ? "Available times" : "Appointments"}</h3><ResultCards result={result} /></section>) : null}
+            {message.role === "assistant" ? getVisibleAssistantResults(message.content, message.results).map((result, index) => <section key={`${result.tool}-${index}`} className="mt-3 rounded-xl border border-border bg-card p-3 text-card-foreground"><h3 className="flex items-center gap-2 text-xs font-semibold"><ResultIcon result={result} />{result.tool === "search_doctors" ? "Doctors" : result.tool === "get_available_slots" || result.tool === "get_doctor_nearest_slots" ? "Available times" : result.tool === "get_doctor_schedules" ? "Schedules" : result.tool === "get_doctor_schedule_exceptions" ? "Schedule exceptions" : result.tool === "get_doctor_schedule_conflicts" ? "Scheduling conflicts" : "Appointments"}</h3><ResultCards result={result} /></section>) : null}
           </div>
           </div>
           <time className={`mt-1 px-10 text-xs text-muted-foreground ${message.role === "user" ? "text-right" : "text-left"}`} dateTime={message.createdAt}>{assistantMessageTimeLabel(message.createdAt)}</time>
@@ -373,7 +388,7 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
               <span id={`retry-tooltip-${message.requestId}`} role="tooltip" className="pointer-events-none absolute bottom-full right-0 z-10 mb-1 whitespace-nowrap rounded-md bg-popover px-2 py-1 text-xs text-popover-foreground opacity-0 shadow-md transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">Retry this message</span>
             </span>
           </div> : null}
-          {message.role === "assistant" && message.id && conversationId.current ? message.results?.map((result, resultIndex) => proposalTypeForResult(result) ? <AssistantActionProposal key={`${message.id}-${result.tool}-${resultIndex}`} result={result} assistantMessageId={message.id!} conversationId={conversationId.current!} getToken={getToken} /> : null) : null}
+          {!doctorMode && message.role === "assistant" && message.id && conversationId.current ? message.results?.map((result, resultIndex) => proposalTypeForResult(result) ? <AssistantActionProposal key={`${message.id}-${result.tool}-${resultIndex}`} result={result} assistantMessageId={message.id!} conversationId={conversationId.current!} getToken={getToken} /> : null) : null}
         </article>)}
         {state.loading && state.messages.length ? <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Checking that for you…</div> : null}
       </div>
@@ -385,7 +400,7 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       <form onSubmit={submit} className="sticky bottom-0 z-10 shrink-0 border-t border-border bg-card p-3">
         <label htmlFor={compact ? "assistant-panel-message" : "assistant-message"} className="sr-only">Message Medrella Assistant</label>
         <div className="mx-auto flex w-full items-end gap-2 rounded-2xl border border-input bg-background p-2 focus-within:ring-2 focus-within:ring-ring">
-          <textarea id={compact ? "assistant-panel-message" : "assistant-message"} value={draft} onChange={(event) => setDraft(event.target.value.slice(0, 1000))} maxLength={1000} rows={1} placeholder="Ask about appointments, doctors, or available times…" className="max-h-28 min-h-10 flex-1 resize-y bg-transparent px-2 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
+          <textarea id={compact ? "assistant-panel-message" : "assistant-message"} value={draft} onChange={(event) => setDraft(event.target.value.slice(0, 1000))} maxLength={1000} rows={1} placeholder={doctorMode ? "Ask about your schedule, exceptions, or availability…" : "Ask about appointments, doctors, or available times…"} className="max-h-28 min-h-10 flex-1 resize-y bg-transparent px-2 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
           <Button type="submit" size="icon" aria-label="Send message" disabled={!canSendAssistantMessage({ ready, loading: state.loading, draft, historyLoadFailed, hasConversation: Boolean(conversationId.current) })}><Send aria-hidden="true" /></Button>
         </div>
       </form>
