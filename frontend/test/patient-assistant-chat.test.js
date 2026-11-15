@@ -13,10 +13,34 @@ function loadTs(relativePath) {
   loadedModule._compile(ts.transpileModule(fs.readFileSync(filename, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, baseUrl: projectRoot, paths: { "@/*": ["./*"] } } }).outputText, filename);
   return loadedModule.exports;
 }
-const { canSendAssistantMessage, chatReducer, classifyAssistantError, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, shouldShowHistoryRecovery, retryOperation } = loadTs("lib/assistant-chat-state.ts");
-const { getAssistantConversation, listAssistantConversations, sendAssistantMessage } = loadTs("lib/assistant-api.ts");
+const { assistantMessageDateKey, assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, classifyAssistantError, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery, retryOperation } = loadTs("lib/assistant-chat-state.ts");
+const { AssistantApiError, confirmAssistantAction, dismissAssistantProposal, getAssistantActionStatus, getAssistantConversation, listAssistantConversations, prepareAssistantAction, sendAssistantMessage } = loadTs("lib/assistant-api.ts");
+const { confirmationStatus, isProposalExpired, preserveDismissalOnPrepare, proposalDescription, proposalStatusFromBackend, proposalTitle, proposalTypeForResult, reconcileActionStatus } = loadTs("lib/assistant-action-state.ts");
 
 describe("patient assistant chat", () => {
+  it("formats message timestamps in Asia/Kolkata and separates only the first message of each day", () => {
+    const messages = [
+      { role: "user", content: "first", createdAt: "2026-04-10T19:00:00.000Z" },
+      { role: "assistant", content: "reply", createdAt: "2026-04-10T19:30:00.000Z" },
+      { role: "user", content: "next day", createdAt: "2026-04-11T19:00:00.000Z" },
+    ];
+    assert.equal(assistantMessageDateKey(messages[0].createdAt), "2026-04-11");
+    assert.equal(assistantMessageTimeLabel(messages[0].createdAt), "12:30 am");
+    assert.match(assistantMessageDateLabel(messages[0].createdAt), /11 Apr 2026/);
+    assert.deepEqual(messages.map((_, index) => shouldShowAssistantDateSeparator(messages, index)), [true, false, true]);
+  });
+
+  it("starts New Chat through explicit conversation creation without deleting saved conversations", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    const start = chat.indexOf("const startNewConversation = useCallback");
+    const end = chat.indexOf("const findSavedConversations", start);
+    const implementation = chat.slice(start, end);
+    assert.match(chat, /MessageSquarePlus[\s\S]*New Chat/);
+    assert.match(implementation, /createAssistantConversation\(token, id\)/);
+    assert.match(implementation, /dispatch\(\{ type: "clear" \}\)/);
+    assert.doesNotMatch(implementation, /deleteAssistantConversation|DELETE/);
+  });
+
   it("shows saved-history recovery controls only for conversation/history failures", () => {
     for (const code of ["CONVERSATION_NOT_FOUND", "HISTORY_LOAD_FAILED", "CONVERSATION_HISTORY_UNAVAILABLE"]) assert.equal(shouldShowHistoryRecovery(code), true);
     for (const code of ["ASSISTANT_UNAVAILABLE", "TOOL_LIMIT_EXCEEDED", "TOOL_QUERY_FAILED", "ASSISTANT_RESPONSE_INVALID", "UNAUTHORIZED", "RATE_LIMITED"]) assert.equal(shouldShowHistoryRecovery(code), false);
@@ -61,6 +85,165 @@ describe("patient assistant chat", () => {
         const result = await sendAssistantMessage("token", "conversation", "request", "Do this");
         assert.equal(result.assistant_message.results[0].tool, tool);
       }
+    } finally {
+      global.fetch = previousFetch;
+      if (previousUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL;
+      else process.env.NEXT_PUBLIC_API_URL = previousUrl;
+    }
+  });
+
+  it("recognizes only verified booking, cancellation, and rescheduling proposal results", () => {
+    const cases = [
+      ["prepare_booking_action", "book", "Booking proposal"],
+      ["prepare_cancellation_action", "cancel", "Cancellation proposal"],
+      ["prepare_reschedule_action", "reschedule", "Rescheduling proposal"],
+    ];
+    for (const [tool, action, title] of cases) {
+      const result = { tool, data: { requires_patient_confirmation: true, proposal: { action_type: action, action_args: {} } } };
+      assert.equal(proposalTypeForResult(result), action);
+      assert.equal(proposalTitle(action), title);
+    }
+    assert.equal(proposalTypeForResult({ tool: "prepare_booking_action", data: { proposal: { action_type: "cancel" }, requires_patient_confirmation: true } }), null);
+    assert.equal(proposalTypeForResult({ tool: "prepare_booking_action", data: { proposal: { action_type: "book" }, requires_patient_confirmation: false } }), null);
+  });
+
+  it("represents action confirmation outcomes without claiming booking before backend completion", () => {
+    assert.equal(confirmationStatus("completed"), "completed");
+    assert.equal(confirmationStatus("checkout_pending"), "checkout_pending");
+    assert.equal(confirmationStatus("refund_pending"), "refund_pending");
+    assert.equal(confirmationStatus("executing"), "failed");
+    assert.equal(proposalStatusFromBackend("completed", "2099-01-01T00:00:00Z"), "completed");
+    assert.equal(proposalStatusFromBackend("checkout_pending", "2000-01-01T00:00:00Z"), "checkout_pending");
+    assert.equal(proposalStatusFromBackend("expired", "2099-01-01T00:00:00Z"), "expired");
+    assert.equal(isProposalExpired("2026-11-15T12:00:00Z", Date.parse("2026-11-15T12:00:01Z")), true);
+    assert.equal(isProposalExpired("2026-11-15T12:00:00Z", Date.parse("2026-11-15T11:59:59Z")), false);
+    assert.equal(isProposalExpired("not-a-date"), true);
+    const component = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(component, /Confirm/);
+    assert.match(component, /Dismiss/);
+    assert.match(component, /Your appointment is not confirmed yet/);
+    assert.match(component, /if \(!intent \|\| inFlight\.current/);
+    assert.match(component, /status === "pending" && isProposalExpired\(intent\.expires_at\)/);
+  });
+
+  it("shows confirmation-specific copy and no proposal controls for a backend-completed booking", () => {
+    const completed = proposalStatusFromBackend("completed", "2099-01-01T00:00:00Z");
+    assert.equal(completed, "completed");
+    assert.equal(proposalTitle("book", completed), "Booking confirmed");
+    assert.equal(proposalDescription("book", completed), "Your appointment has been successfully confirmed.");
+    assert.equal(proposalTitle("book", "pending"), "Booking proposal");
+    const component = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(component, /const completedBooking = actionType === "book" && status === "completed"/);
+    assert.match(component, /\{completedBooking \? null : <Button[^>]*aria-label="Dismiss proposal"/);
+    assert.match(component, /\{status === "pending" \? <div/);
+    assert.match(component, /onClick=\{\(\) => void confirm\(\)\}>Confirm/);
+    assert.match(component, /status === "completed" && !completedBooking/);
+  });
+
+  it("does not let a late prepare response revive a dismissing or dismissed card", () => {
+    const future = "2099-01-01T00:00:00Z";
+    assert.equal(preserveDismissalOnPrepare("dismissing", "pending", future), "dismissing");
+    assert.equal(preserveDismissalOnPrepare("dismissed", "pending", future), "dismissed");
+    const component = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(component, /if \(!active \|\| dismissed\.current\) return/);
+    assert.match(component, /await dismissAssistantProposal\(/);
+  });
+
+  it("keeps a backend dismissal after the conversation is reopened", async () => {
+    const previousFetch = global.fetch;
+    const previousUrl = process.env.NEXT_PUBLIC_API_URL;
+    const calls = [];
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    global.fetch = async (url, options) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify({ status: "dismissed" }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      const dismissed = await dismissAssistantProposal("token", "conversation", "assistant-message", "cancel");
+      const reopened = await prepareAssistantAction("token", "conversation", "assistant-message", "cancel");
+      assert.equal(dismissed.status, "dismissed");
+      assert.equal(reopened.status, "dismissed");
+      assert.deepEqual(JSON.parse(calls[0].options.body), { assistant_message_id: "assistant-message", action_type: "cancel" });
+      assert.equal(calls[0].url.endsWith("/actions/dismiss"), true);
+    } finally {
+      global.fetch = previousFetch;
+      if (previousUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL;
+      else process.env.NEXT_PUBLIC_API_URL = previousUrl;
+    }
+  });
+
+  it("recovers a completed booking from status after checkout and checks status after confirm network failure", async () => {
+    const now = Date.now();
+    const restoredCheckout = await reconcileActionStatus(async () => ({ status: "checkout_pending", expires_at: new Date(now - 1000).toISOString() }), "failed", now);
+    assert.equal(restoredCheckout.status, "checkout_pending");
+
+    const previousFetch = global.fetch;
+    const previousUrl = process.env.NEXT_PUBLIC_API_URL;
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    global.fetch = async () => new Response(JSON.stringify({ id: "44444444-4444-4444-8444-444444444444", action_type: "book", status: "completed", expires_at: new Date(now - 1000).toISOString(), summary: { doctor: "Dr. Dee Doctor" } }), { status: 200, headers: { "content-type": "application/json" } });
+    try {
+      const completed = await reconcileActionStatus(() => getAssistantActionStatus("token", "conversation", "44444444-4444-4444-8444-444444444444"), "checkout_pending", now);
+      assert.equal(completed.status, "completed");
+      assert.deepEqual(completed.summary, { doctor: "Dr. Dee Doctor" });
+    } catch (error) {
+      global.fetch = previousFetch;
+      if (previousUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL;
+      else process.env.NEXT_PUBLIC_API_URL = previousUrl;
+      throw error;
+    }
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("connection reset");
+      return new Response(JSON.stringify({ id: "44444444-4444-4444-8444-444444444444", action_type: "book", status: "pending", expires_at: new Date(now + 60000).toISOString() }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      await assert.rejects(confirmAssistantAction("token", "conversation", "44444444-4444-4444-8444-444444444444"), AssistantApiError);
+      const recovered = await reconcileActionStatus(() => getAssistantActionStatus("token", "conversation", "44444444-4444-4444-8444-444444444444"), "failed", now);
+      assert.equal(recovered.status, "pending");
+      assert.equal(calls, 2);
+    } finally {
+      global.fetch = previousFetch;
+      if (previousUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL;
+      else process.env.NEXT_PUBLIC_API_URL = previousUrl;
+    }
+    const component = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(component, /reconcileActionStatus\(async \(\) =>/);
+  });
+
+  it("prepares proposals without sending record IDs and accepts checkout-pending confirmation", async () => {
+    const previousFetch = global.fetch;
+    const previousUrl = process.env.NEXT_PUBLIC_API_URL;
+    const calls = [];
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    global.fetch = async (url, options) => {
+      calls.push({ url, options });
+      if (options.method === "POST" && !url.endsWith("/confirm")) return new Response(JSON.stringify({ id: "44444444-4444-4444-8444-444444444444", action_type: "book", status: "pending", expires_at: "2099-01-01T00:00:00Z", summary: { doctor: "Dr. Dee Doctor", date: "2099-01-01", start_time: "09:00", consultation_fee: "500.00", currency: "INR" } }), { status: 201, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ status: "checkout_pending", checkout_url: "https://checkout.example.test/session" }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      const prepared = await prepareAssistantAction("token", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333", "book");
+      const requestBody = JSON.parse(calls[0].options.body);
+      assert.deepEqual(requestBody, { assistant_message_id: "33333333-3333-4333-8333-333333333333", action_type: "book" });
+      assert.equal(prepared.summary.doctor, "Dr. Dee Doctor");
+      const confirmed = await confirmAssistantAction("token", "22222222-2222-4222-8222-222222222222", prepared.id);
+      assert.equal(confirmed.status, "checkout_pending");
+      assert.equal(confirmed.checkout_url, "https://checkout.example.test/session");
+      assert.equal(calls[1].options.method, "POST");
+    } finally {
+      global.fetch = previousFetch;
+      if (previousUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL;
+      else process.env.NEXT_PUBLIC_API_URL = previousUrl;
+    }
+  });
+
+  it("surfaces expired action API responses with their stable code", async () => {
+    const previousFetch = global.fetch;
+    const previousUrl = process.env.NEXT_PUBLIC_API_URL;
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    global.fetch = async () => new Response(JSON.stringify({ error: { code: "ACTION_EXPIRED", message: "expired" } }), { status: 409, headers: { "content-type": "application/json" } });
+    try {
+      await assert.rejects(confirmAssistantAction("token", "conversation", "intent"), (error) => error instanceof AssistantApiError && error.code === "ACTION_EXPIRED" && /expired/i.test(error.message));
     } finally {
       global.fetch = previousFetch;
       if (previousUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL;
@@ -364,7 +547,7 @@ describe("patient assistant chat", () => {
     assert.match(chat, /text-destructive hover:bg-destructive\/10/);
     assert.match(chat, /aria-label="Retry this message"[^\n]*onClick=\{\(\) => void deliver\(message\.requestId!, message\.content\)\}/);
     assert.match(chat, /if \(requestInFlight\.current\) return/);
-    assert.match(chat, /<\/div>\s*<\/div>\s*\{message\.failed && message\.requestId \? <div className="mt-1/);
+    assert.match(chat, /<\/div>\s*<\/div>\s*<time[\s\S]*?<\/time>\s*\{message\.failed && message\.requestId \? <div className="mt-1/);
     assert.match(chat, /Your care, easier to navigate/);
   });
 

@@ -1,12 +1,13 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
-import { ArrowDown, ArrowUp, CalendarDays, Clock3, LoaderCircle, MessageCircle, RefreshCw, Search, Send, Sparkles, Stethoscope, UserRound } from "lucide-react";
+import { ArrowDown, ArrowUp, Bot, CalendarDays, Check, Clock3, LoaderCircle, MessageCircle, MessageSquarePlus, RefreshCw, Search, Send, Sparkles, Stethoscope, UserRound, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
-import { AssistantApiError, createAssistantConversation, getAssistantConversation, listAssistantConversations, sendAssistantMessage, type AssistantConversation, type AssistantResult } from "@/lib/assistant-api";
-import { canSendAssistantMessage, chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, retryOperation, shouldShowHistoryRecovery } from "@/lib/assistant-chat-state";
+import { AssistantApiError, confirmAssistantAction, createAssistantConversation, dismissAssistantProposal, getAssistantActionStatus, getAssistantConversation, listAssistantConversations, prepareAssistantAction, sendAssistantMessage, type AssistantActionIntent, type AssistantActionType, type AssistantConversation, type AssistantResult } from "@/lib/assistant-api";
+import { assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, retryOperation, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery } from "@/lib/assistant-chat-state";
+import { isProposalExpired, proposalDescription, proposalStatusFromBackend, proposalTitle, proposalTypeForResult, reconcileActionStatus, type ProposalStatus } from "@/lib/assistant-action-state";
 
 function displayTime(value: unknown) {
   if (typeof value !== "string") return "";
@@ -38,6 +39,131 @@ function ResultCards({ result }: { result: AssistantResult }) {
   })}</ul>;
 }
 function ResultIcon({ result }: { result: AssistantResult }) { return result.tool === "search_doctors" ? <Stethoscope aria-hidden="true" className="size-4" /> : <CalendarDays aria-hidden="true" className="size-4" />; }
+
+function AssistantActionProposal({ result, assistantMessageId, conversationId, getToken }: { result: AssistantResult; assistantMessageId: string; conversationId: string; getToken: () => Promise<string | null>; }) {
+  const actionType = proposalTypeForResult(result);
+  const [status, setStatus] = useState<ProposalStatus>("loading");
+  const [intent, setIntent] = useState<AssistantActionIntent | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [checkoutUrl, setCheckoutUrl] = useState<string | null>(null);
+  const inFlight = useRef(false);
+  const dismissed = useRef(false);
+  useEffect(() => {
+    if (!actionType) return;
+    let active = true;
+    void (async () => {
+      try {
+        const token = await getToken();
+        if (!token) throw new AssistantApiError(401, "Your secure sign-in session is not ready. Please sign in again.");
+        const prepared = await prepareAssistantAction(token, conversationId, assistantMessageId, actionType as AssistantActionType);
+        if (!active || dismissed.current) return;
+        if (prepared.status === "dismissed") {
+          dismissed.current = true;
+          setStatus("dismissed");
+          return;
+        }
+        setIntent(prepared);
+        const fallbackStatus = proposalStatusFromBackend(prepared.status, prepared.expires_at);
+        setStatus(fallbackStatus);
+        const latest = await reconcileActionStatus(() => getAssistantActionStatus(token, conversationId, prepared.id), fallbackStatus);
+        if (active && !dismissed.current) {
+          if (latest.summary) setIntent((current) => current ? { ...current, summary: latest.summary } : current);
+          setStatus(latest.status);
+        }
+      } catch (cause) {
+        if (!active || dismissed.current) return;
+        setError(cause instanceof Error ? cause.message : "This proposal could not be verified. Ask the assistant to prepare it again.");
+        setStatus(cause instanceof AssistantApiError && cause.code === "ACTION_EXPIRED" ? "expired" : "failed");
+      }
+    })();
+    return () => { active = false; };
+  }, [actionType, assistantMessageId, conversationId, getToken]);
+  useEffect(() => {
+    if (!intent || status !== "pending") return;
+    const remaining = Math.max(0, Date.parse(intent.expires_at) - Date.now());
+    const timer = window.setTimeout(() => setStatus("expired"), remaining);
+    return () => window.clearTimeout(timer);
+  }, [intent, status]);
+  if (!actionType) return null;
+  const summary = intent?.summary || {};
+  const completedBooking = actionType === "book" && status === "completed";
+  const date = dateLabel(summary.date);
+  const dateTime = [date, displayTime(summary.start_time)].filter(Boolean).join(" · ");
+  const fee = summary.consultation_fee;
+  async function confirm() {
+    if (!intent || inFlight.current || !actionType) return;
+    if (status === "pending" && isProposalExpired(intent.expires_at)) { setStatus("expired"); return; }
+    inFlight.current = true;
+    setStatus("confirming");
+    setError(null);
+    try {
+      const token = await getToken();
+      if (!token) throw new AssistantApiError(401, "Your secure sign-in session is not ready. Please sign in again.");
+      const outcome = await confirmAssistantAction(token, conversationId, intent.id);
+      const next = proposalStatusFromBackend(outcome.status, outcome.expires_at || intent.expires_at);
+      setStatus(next);
+      if (outcome.checkout_url) setCheckoutUrl(outcome.checkout_url);
+      if (next === "failed") setError("The action could not be completed. Refresh the proposal and try again.");
+      if (next === "expired") setError("This proposal expired. Ask the assistant to prepare it again.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "We couldn't complete this action. Please try again.");
+      const latest = await reconcileActionStatus(async () => {
+        const token = await getToken();
+        if (!token) throw new Error("Session unavailable");
+        return getAssistantActionStatus(token, conversationId, intent.id);
+      }, cause instanceof AssistantApiError && cause.code === "ACTION_EXPIRED" ? "expired" : "failed");
+      if (latest.summary) setIntent((current) => current ? { ...current, summary: latest.summary } : current);
+      setStatus(latest.status);
+      if (latest.status === "completed") setError(null);
+    } finally { inFlight.current = false; }
+  }
+  async function dismiss() {
+    if (!actionType || inFlight.current || ["loading", "confirming", "dismissing", "checkout_pending", "refund_pending", "completed"].includes(status)) return;
+    dismissed.current = true;
+    inFlight.current = true;
+    setStatus("dismissing");
+    setError(null);
+    try {
+      const token = await getToken();
+      if (!token) throw new AssistantApiError(401, "Your secure sign-in session is not ready. Please sign in again.");
+      await dismissAssistantProposal(token, conversationId, assistantMessageId, actionType as AssistantActionType);
+      setStatus("dismissed");
+    } catch (cause) {
+      dismissed.current = false;
+      setError(cause instanceof Error ? cause.message : "We couldn't dismiss this proposal. Please check its status and try again.");
+      if (intent) {
+        setStatus("dismissing");
+        try {
+          const token = await getToken();
+          if (!token) throw new Error("Session unavailable");
+          const latest = await getAssistantActionStatus(token, conversationId, intent.id);
+          setStatus(proposalStatusFromBackend(latest.status, latest.expires_at));
+        } catch { setStatus("failed"); }
+      } else setStatus("failed");
+    } finally { inFlight.current = false; }
+  }
+  const details = <>
+    {typeof summary.doctor === "string" ? <p className="font-medium text-foreground">{summary.doctor}{typeof summary.specialty === "string" ? ` · ${summary.specialty}` : ""}</p> : null}
+    {dateTime ? <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"><Clock3 aria-hidden="true" className="size-3.5" />{dateTime}{typeof summary.end_time === "string" ? `–${displayTime(summary.end_time)}` : ""} IST</p> : null}
+    {typeof fee === "string" || typeof fee === "number" ? <p className="mt-1 text-sm text-muted-foreground">Consultation fee: {String(summary.currency || "INR")} {Number(fee).toLocaleString("en-IN")}</p> : null}
+    {actionType === "cancel" && (typeof summary.estimated_refund_amount === "string" || typeof summary.estimated_additional_refund_amount === "string") ? <p className="mt-2 text-sm text-muted-foreground">Estimated additional refund: {String(summary.currency || "INR")} {String(summary.estimated_additional_refund_amount || summary.estimated_refund_amount)}. Final refund is recalculated when processed.</p> : null}
+    {actionType === "reschedule" && typeof summary.previous_date === "string" ? <p className="mt-2 text-sm text-muted-foreground">Current appointment: {dateLabel(summary.previous_date)}{typeof summary.previous_start_time === "string" ? ` at ${displayTime(summary.previous_start_time)} IST` : ""}</p> : null}
+  </>;
+  return <section aria-label={proposalTitle(actionType, status)} className="mt-3 w-full max-w-[94%] rounded-xl border border-border bg-card p-4 text-card-foreground shadow-sm sm:max-w-[82%]">
+    <div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">{proposalTitle(actionType, status)}</p><p className="mt-1 text-xs text-muted-foreground">{proposalDescription(actionType, status)}</p></div>{completedBooking ? null : <Button type="button" variant="ghost" size="icon-sm" aria-label="Dismiss proposal" onClick={() => void dismiss()} disabled={["loading", "confirming", "dismissing", "checkout_pending", "refund_pending", "completed"].includes(status)}><X aria-hidden="true" className="size-4" /></Button>}</div>
+    {status === "loading" ? <p role="status" className="mt-3 flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Verifying proposal details…</p> : null}
+    {status !== "loading" && status !== "dismissed" ? <div className="mt-3">{details}</div> : null}
+    {error ? <p role="alert" className="mt-3 text-sm text-destructive">{error}</p> : null}
+    {status === "pending" ? <div className="mt-4 flex flex-wrap gap-2"><Button type="button" size="sm" disabled={!intent} onClick={() => void confirm()}>Confirm</Button><Button type="button" size="sm" variant="outline" onClick={() => void dismiss()}>Dismiss</Button></div> : null}
+    {status === "dismissing" ? <p role="status" className="mt-3 flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Saving dismissal…</p> : null}
+    {status === "confirming" ? <p role="status" className="mt-3 flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Confirming with Medrella…</p> : null}
+    {status === "expired" ? <p className="mt-3 text-sm text-muted-foreground">This proposal expired. Ask the assistant to prepare it again.</p> : null}
+    {status === "completed" && !completedBooking ? <p role="status" className="mt-3 flex items-center gap-2 text-sm font-medium text-foreground"><Check aria-hidden="true" className="size-4" />{actionType === "cancel" ? "Cancellation confirmed." : "Appointment rescheduled."}</p> : null}
+    {status === "checkout_pending" ? <div role="status" className="mt-3"><p className="text-sm font-medium">Payment is required. Your appointment is not confirmed yet.</p>{checkoutUrl ? <Button asChild size="sm" className="mt-3"><a href={checkoutUrl}>Continue to secure checkout</a></Button> : <Button type="button" size="sm" className="mt-3" onClick={() => void confirm()}>Retrieve secure checkout</Button>}</div> : null}
+    {status === "refund_pending" ? <p role="status" className="mt-3 text-sm">Cancellation confirmed. Your refund is being processed.</p> : null}
+    {status === "dismissed" ? <p className="mt-3 text-xs text-muted-foreground">Proposal dismissed.</p> : null}
+  </section>;
+}
 
 export function PatientAssistantChat({ compact = false, onClose }: { compact?: boolean; onClose?: () => void }) {
   const { getToken } = useAuth();
@@ -82,7 +208,7 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
         conversationId.current = id;
         const stored = await getAssistantConversation(token, id, { limit: 20 });
         conversationId.current = stored.conversation.id;
-        dispatch({ type: "restore", messages: stored.messages.map((message) => ({ id: message.id, requestId: message.request_id, role: message.role, content: message.content, results: message.results, failed: message.request_status === "failed" })) });
+        dispatch({ type: "restore", messages: stored.messages.map((message) => ({ id: message.id, requestId: message.request_id, role: message.role, content: message.content, createdAt: message.created_at, results: message.results, failed: message.request_status === "failed" })) });
         setHistory({ hasMore: stored.has_more, nextBefore: stored.next_before, loadingOlder: false, olderError: null, reachedStart: false });
       }
       setHistoryLoadFailed(false);
@@ -104,7 +230,7 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       const container = messageList.current;
       const page = await getAssistantConversation(token, conversationId.current, { limit: 20, before: history.nextBefore });
       if (container) prependAnchor.current = { scrollHeight: container.scrollHeight, scrollTop: container.scrollTop };
-      dispatch({ type: "prepend", messages: page.messages.map((message) => ({ id: message.id, requestId: message.request_id, role: message.role, content: message.content, results: message.results, failed: message.request_status === "failed" })) });
+      dispatch({ type: "prepend", messages: page.messages.map((message) => ({ id: message.id, requestId: message.request_id, role: message.role, content: message.content, createdAt: message.created_at, results: message.results, failed: message.request_status === "failed" })) });
       setHistory({ hasMore: page.has_more, nextBefore: page.next_before, loadingOlder: false, olderError: null, reachedStart: !page.has_more });
     } catch (error) {
       prependAnchor.current = null;
@@ -127,7 +253,7 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       }
       const reply = await sendAssistantMessage(token, conversationId.current, requestId, content);
       setHistoryLoadFailed(false);
-      dispatch({ type: "success", requestId, user: { id: reply.user_message.id, requestId, role: "user", content }, assistant: { id: reply.assistant_message.id, role: "assistant", content: reply.assistant_message.content, results: reply.assistant_message.results || [] } });
+      dispatch({ type: "success", requestId, user: { id: reply.user_message.id, requestId, role: "user", content, createdAt: reply.user_message.created_at || new Date().toISOString() }, assistant: { id: reply.assistant_message.id, role: "assistant", content: reply.assistant_message.content, createdAt: reply.assistant_message.created_at || new Date().toISOString(), results: reply.assistant_message.results || [] } });
     } catch (error) { setDraft((current) => restoreDraftAfterFailedSubmission(current, content)); dispatch({ type: "failure", requestId, message: error instanceof Error ? error.message : "We couldn't get a reply. Please try again.", code: error instanceof AssistantApiError ? error.code : undefined, source: "send" }); }
     finally { requestInFlight.current = false; }
   }, [compact, getToken, historyLoadFailed]);
@@ -185,7 +311,7 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       const stored = await getAssistantConversation(token, id, { limit: 20 });
       conversationId.current = stored.conversation.id;
       recoveryTargetId.current = null;
-      dispatch({ type: "restore", messages: stored.messages.map((message) => ({ id: message.id, requestId: message.request_id, role: message.role, content: message.content, results: message.results, failed: message.request_status === "failed" })) });
+      dispatch({ type: "restore", messages: stored.messages.map((message) => ({ id: message.id, requestId: message.request_id, role: message.role, content: message.content, createdAt: message.created_at, results: message.results, failed: message.request_status === "failed" })) });
       setHistory({ hasMore: stored.has_more, nextBefore: stored.next_before, loadingOlder: false, olderError: null, reachedStart: false });
       setHistoryLoadFailed(false);
       setRecoveryConversations([]);
@@ -217,6 +343,7 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
     <header className={`flex items-center gap-3 ${compact ? "px-4 py-3" : "mb-5"}`}>
       <span className="flex size-10 items-center justify-center rounded-2xl bg-secondary text-secondary-foreground"><MessageCircle aria-hidden="true" className="size-5" /></span>
       <div className="min-w-0 flex-1"><p className="text-sm font-medium text-primary">Medrella Assistant</p><h1 className="text-xl font-semibold tracking-tight text-foreground">How can I help?</h1></div>
+      <Button type="button" variant="outline" size="sm" className="shrink-0 gap-2" disabled={state.loading || requestInFlight.current} onClick={() => void startNewConversation()}><MessageSquarePlus aria-hidden="true" className="size-4" />New Chat</Button>
       {compact ? <><Link href="/patient/assistant" className="text-xs font-medium text-primary hover:underline">Full assistant</Link><Button type="button" variant="ghost" size="sm" onClick={onClose} aria-label="Close assistant">Close</Button></> : null}
     </header>
     <section aria-label="Assistant conversation" aria-live="polite" className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
@@ -229,13 +356,15 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
           <p className="mt-2 text-sm leading-6 text-muted-foreground">Ask about your upcoming or previous appointments, find a doctor, or check available appointment times.</p>
           <p className="mt-4 flex items-center gap-2 text-xs text-muted-foreground"><Search aria-hidden="true" className="size-3.5" /> For example: “Find a cardiologist”</p>
         </div> : state.messages.map((message, index) => <article key={message.id || message.requestId || `${message.role}-${index}`} className={`flex flex-col ${message.role === "user" ? "items-end" : "items-start"}`}>
+          {shouldShowAssistantDateSeparator(state.messages, index) && message.createdAt ? <div className="my-1 flex w-full items-center gap-3 text-xs text-muted-foreground" role="separator"><span className="h-px flex-1 bg-border" /><span>{assistantMessageDateLabel(message.createdAt)}</span><span className="h-px flex-1 bg-border" /></div> : null}
           <div className={`flex max-w-[94%] items-end gap-2 sm:max-w-[82%] ${message.role === "user" ? "flex-row-reverse" : ""}`}>
-          {message.role === "user" ? <span aria-label="Patient" className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><UserRound aria-hidden="true" className="size-4" /></span> : null}
+          {message.role === "assistant" ? <span aria-label="AI assistant" className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><Bot aria-hidden="true" className="size-4" /></span> : <span aria-label="Patient" className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><UserRound aria-hidden="true" className="size-4" /></span>}
           <div className={`min-w-0 rounded-2xl p-3 ${message.role === "user" ? "rounded-br-md bg-primary text-primary-foreground" : "rounded-bl-md border border-border bg-background text-foreground"}`}>
             {message.role === "assistant" ? <p className="mb-1 text-xs font-semibold opacity-75">Medrella Assistant</p> : null}<p className="whitespace-pre-wrap text-sm leading-6">{message.role === "assistant" ? getAssistantDisplayContent(message.content, message.results) : message.content}</p>
             {message.role === "assistant" ? getVisibleAssistantResults(message.content, message.results).map((result, index) => <section key={`${result.tool}-${index}`} className="mt-3 rounded-xl border border-border bg-card p-3 text-card-foreground"><h3 className="flex items-center gap-2 text-xs font-semibold"><ResultIcon result={result} />{result.tool === "search_doctors" ? "Doctors" : result.tool === "get_available_slots" ? "Available times" : "Appointments"}</h3><ResultCards result={result} /></section>) : null}
           </div>
           </div>
+          <time className={`mt-1 px-10 text-xs text-muted-foreground ${message.role === "user" ? "text-right" : "text-left"}`} dateTime={message.createdAt}>{assistantMessageTimeLabel(message.createdAt)}</time>
           {message.failed && message.requestId ? <div className="mt-1 flex w-full justify-end pr-10">
             <span className="group relative inline-flex">
               <Button type="button" variant="ghost" size="icon-sm" className="text-destructive hover:bg-destructive/10 hover:text-destructive focus-visible:ring-destructive" aria-label="Retry this message" aria-describedby={`retry-tooltip-${message.requestId}`} disabled={state.loading} onClick={() => void deliver(message.requestId!, message.content)}>
@@ -244,6 +373,7 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
               <span id={`retry-tooltip-${message.requestId}`} role="tooltip" className="pointer-events-none absolute bottom-full right-0 z-10 mb-1 whitespace-nowrap rounded-md bg-popover px-2 py-1 text-xs text-popover-foreground opacity-0 shadow-md transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">Retry this message</span>
             </span>
           </div> : null}
+          {message.role === "assistant" && message.id && conversationId.current ? message.results?.map((result, resultIndex) => proposalTypeForResult(result) ? <AssistantActionProposal key={`${message.id}-${result.tool}-${resultIndex}`} result={result} assistantMessageId={message.id!} conversationId={conversationId.current!} getToken={getToken} /> : null) : null}
         </article>)}
         {state.loading && state.messages.length ? <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Checking that for you…</div> : null}
       </div>
