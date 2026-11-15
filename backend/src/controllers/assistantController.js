@@ -2,9 +2,11 @@ const { randomUUID } = require("node:crypto");
 const assistantEngine = require("../services/assistant");
 const { AssistantError } = require("../services/assistant/conversationEngine");
 const { AssistantConversationError, createAssistantConversationService } = require("../services/assistantConversationService");
+const { AssistantActionError } = require("../services/assistantActionService");
 
 function errorResponse(response, error) {
-  if (error instanceof AssistantError || error instanceof AssistantConversationError) {
+  if (error instanceof AssistantError || error instanceof AssistantConversationError || error instanceof AssistantActionError
+      || (Number.isInteger(error?.status) && typeof error?.code === "string")) {
     return response.status(error.status).json({ error: { code: error.code, message: error.message } });
   }
   return response.status(503).json({ error: { code: "ASSISTANT_UNAVAILABLE", message: "The assistant is temporarily unavailable. Please try again shortly." } });
@@ -13,6 +15,8 @@ function errorResponse(response, error) {
 function getService(response) {
   return response.locals.assistantConversationService || createAssistantConversationService({ engine: response.locals.assistantEngine || assistantEngine });
 }
+
+function getActionService(response) { return response.locals.assistantActionService; }
 
 function patientOnly(response) {
   return response.locals.user?.role === "patient";
@@ -62,7 +66,7 @@ async function send(request, response) {
     },
   };
   try {
-    const result = await getService(response).send({ database: response.locals.database, user: response.locals.user, conversationId: response.locals.params.conversationId, requestId: response.locals.body.request_id, diagnosticRequestId: requestId, content: response.locals.body.content, applicationTimezone: response.locals.applicationTimezone, logger });
+    const result = await getService(response).send({ database: response.locals.database, user: response.locals.user, conversationId: response.locals.params.conversationId, requestId: response.locals.body.request_id, diagnosticRequestId: requestId, content: response.locals.body.content, applicationTimezone: response.locals.applicationTimezone, paymentService: response.locals.paymentService, logger });
     return response.json(result);
   } catch (error) {
     const assistantError = error instanceof AssistantError || error instanceof AssistantConversationError;
@@ -75,4 +79,29 @@ async function send(request, response) {
   }
 }
 
-module.exports = { create, list, open, remove, send };
+async function prepareAction(request, response) {
+  if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can prepare appointment actions" } });
+  try {
+    const { assistant_message_id, action_type, action_args } = response.locals.body;
+    const intent = await getActionService(response).prepare(response.locals.user, response.locals.params.conversationId, assistant_message_id, action_type, action_args);
+    return response.status(201).json(intent);
+  } catch (error) { return errorResponse(response, error); }
+}
+
+async function confirmAction(_request, response) {
+  if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can confirm appointment actions" } });
+  try {
+    const { conversationId, intentId } = response.locals.params;
+    return response.json(await getActionService(response).confirm(response.locals.user, conversationId, intentId));
+  } catch (error) { return errorResponse(response, error); }
+}
+
+async function getActionStatus(_request, response) {
+  if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can view appointment actions" } });
+  try {
+    const { conversationId, intentId } = response.locals.params;
+    return response.json(await getActionService(response).intentView(response.locals.user, conversationId, intentId));
+  } catch (error) { return errorResponse(response, error); }
+}
+
+module.exports = { create, list, open, remove, send, prepareAction, confirmAction, getActionStatus };

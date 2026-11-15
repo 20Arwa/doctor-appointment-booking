@@ -74,7 +74,7 @@ function createIdempotentStripeClient({ loseFirstResponse = false } = {}) {
   return { providerSessions, stripeClient, stripe: createStripeService({ config, stripeClient }) };
 }
 
-function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 60 * 1000).toISOString(), failPersistOrder = false, slotDeleted = false, competingHold = false } = {}) {
+function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 60 * 1000).toISOString(), failPersistOrder = false, slotDeleted = false, competingHold = false, currentFee = "500.00" } = {}) {
   const state = { payment: null, hold: null, appointments: [], allocations: [], calls: [], holdCount: 0, paymentCount: 0, appointmentCount: 0, competingHold };
   let shouldFailPersistOrder = failPersistOrder;
   const reservationRow = () => state.payment && state.hold ? [{
@@ -108,7 +108,7 @@ function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 
           state.calls.push(sql);
           if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
           if (sql === "SELECT id FROM patients WHERE user_id = $1") return { rows: [{ id: patientId }] };
-          if (sql.includes("FOR UPDATE OF av, d")) return { rows: [{ ...slot, deleted_at: slotDeleted ? "2026-10-30T00:00:00.000Z" : null }] };
+          if (sql.includes("FOR UPDATE OF av, d")) return { rows: [{ ...slot, fee: currentFee, deleted_at: slotDeleted ? "2026-10-30T00:00:00.000Z" : null }] };
           if (sql.includes("pg_advisory_xact_lock")) {
             if (heldLocks.length) return { rows: [] };
             const previous = advisoryLockTail;
@@ -132,6 +132,7 @@ function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 
             return { rows: hasAppointment || hasAllocation || hasActiveHold ? [{ "?column?": 1 }] : [] };
           }
           if (sql.includes("p.idempotency_key = $1")) return { rows: state.payment?.idempotency_key === values[0] ? reservationRow() : [] };
+          if (sql.startsWith("SELECT status, appointment_id, slot_hold_id FROM payments")) return { rows: state.payment ? [{ status: state.payment.status, appointment_id: state.payment.appointment_id || null, slot_hold_id: state.payment.slot_hold_id }] : [] };
           if (sql.includes("FROM payments p JOIN appointment_slot_holds h")) {
             const payment = state.payment;
             const hold = state.hold;
@@ -164,6 +165,7 @@ function createReservationDatabase({ holdExpiresAt = new Date(Date.now() + 40 * 
           if (sql.startsWith("UPDATE payments SET status = 'failed'")) { state.payment.status = "failed"; return { rows: [] }; }
           if (sql.startsWith("UPDATE appointment_slot_holds SET status = 'released'")) { state.hold.status = "released"; return { rows: [] }; }
           if (sql.startsWith("UPDATE appointment_slot_holds SET status = $2")) { state.hold.status = values[1]; return { rows: [] }; }
+          if (sql.startsWith("UPDATE assistant_action_intents")) return { rows: [], rowCount: 0 };
           throw new Error(`Unexpected client query: ${sql}`);
         },
         release() { for (const unlock of heldLocks.reverse()) unlock(); },
@@ -249,6 +251,7 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
           }
           if (sql.startsWith("UPDATE payments SET status = 'pending'")) { state.payment.status = "pending"; state.payment.provider_payment_id ||= values[1]; return { rows: [] }; }
           if (sql.startsWith("UPDATE payments SET appointment_id")) { state.payment.appointment_id = values[1]; state.payment.slot_hold_id = null; return { rows: [] }; }
+          if (sql.startsWith("UPDATE assistant_action_intents")) return { rows: [], rowCount: 0 };
           if (sql.startsWith("UPDATE appointment_slot_holds SET status = 'consumed'")) { state.hold.status = "consumed"; return { rows: [] }; }
           if (sql.includes("SELECT 1 FROM appointment_slot_holds") && sql.includes("status = 'consumed'")) return { rows: state.hold.status === "consumed" ? [{ id: holdId }] : [] };
           if (sql.includes("COUNT(DISTINCT reservation.patient_id)")) return { rows: [{ occupied: 0 }] };
@@ -500,6 +503,43 @@ describe("Stripe appointment Checkout", () => {
     assert.match(sdk.calls[0].params.success_url, /\{CHECKOUT_SESSION_ID\}/);
     assert.ok(database.state.calls.some((sql) => sql.includes("INTERVAL '40 minutes'")));
     assert.equal(database.state.payment.amount, "500.00");
+  });
+
+  it("rejects a prepared fee change before creating a payment or checkout, including on repeat", async () => {
+    const database = createReservationDatabase({ currentFee: "600.00" });
+    let checkoutCalls = 0;
+    const service = createPaymentService({ database, stripe: { async createCheckoutSession() { checkoutCalls += 1; } }, frontendOrigin: "https://medrella.example" });
+    const request = { availability_id: availabilityId, idempotency_key: paymentId, expected_fee_minor: 50000 };
+    await assert.rejects(service.createCheckoutSession(patient, request), { code: "BOOKING_FEE_CHANGED" });
+    await assert.rejects(service.createCheckoutSession(patient, request), { code: "BOOKING_FEE_CHANGED" });
+    assert.equal(database.state.paymentCount, 0);
+    assert.equal(database.state.holdCount, 0);
+    assert.equal(checkoutCalls, 0);
+  });
+
+  it("reconciles a locally discovered expired Checkout and retries reconciliation if its first write fails", async () => {
+    const database = createReservationDatabase();
+    database.state.payment = { id: paymentId, status: "pending", provider_order_id: sessionId, provider_payment_id: null, amount: "500.00", currency: "INR", idempotency_key: paymentId, slot_hold_id: holdId };
+    database.state.hold = { id: holdId, availability_id: availabilityId, patient_id: patientId, status: "active", expires_at: new Date(Date.now() + 40 * 60 * 1000).toISOString() };
+    let reconciliations = 0;
+    const stripe = {
+      async retrieveCheckoutSession(id) {
+        return { id, client_reference_id: paymentId, metadata: { payment_id: paymentId }, amount_total: 50000, currency: "inr", status: "expired", payment_status: "unpaid" };
+      },
+      async createCheckoutSession() { throw new Error("must reuse the existing session"); },
+    };
+    const service = createPaymentService({ database, stripe, frontendOrigin: "https://medrella.example", logger: { error() {} }, reconcileAssistantAction: async (id, outcome) => {
+      assert.equal(id, paymentId);
+      assert.equal(outcome, "expired");
+      reconciliations += 1;
+      if (reconciliations === 1) throw new Error("temporary intent reconciliation failure");
+    } });
+    await assert.rejects(service.createCheckoutSession(patient, { availability_id: availabilityId, idempotency_key: paymentId }), { code: "STRIPE_SESSION_FAILED" });
+    assert.equal(database.state.payment.status, "expired");
+    await assert.rejects(service.createCheckoutSession(patient, { availability_id: availabilityId, idempotency_key: paymentId }), { code: "PAYMENT_ATTEMPT_CLOSED" });
+    assert.equal(reconciliations, 2);
+    assert.equal(database.state.holdCount, 0);
+    assert.equal(database.state.paymentCount, 0);
   });
 
   it("releases a hold after definite Stripe API failure", async () => {

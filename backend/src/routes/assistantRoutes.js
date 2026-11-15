@@ -12,5 +12,8 @@ router.get("/conversations", validate(schemas.listConversationsQuerySchema, "que
 router.get("/conversations/:conversationId", validate(schemas.conversationIdParamsSchema, "params"), validate(schemas.openConversationQuerySchema, "query"), controller.open);
 router.delete("/conversations/:conversationId", validate(schemas.conversationIdParamsSchema, "params"), controller.remove);
 router.post("/conversations/:conversationId/messages", assistantRateLimiter, validate(schemas.conversationIdParamsSchema, "params"), validate(schemas.sendConversationMessageSchema, "body"), controller.send);
+router.post("/conversations/:conversationId/actions", validate(schemas.conversationIdParamsSchema, "params"), validate(schemas.prepareActionSchema, "body"), controller.prepareAction);
+router.get("/conversations/:conversationId/actions/:intentId", validate(schemas.actionIntentParamsSchema, "params"), controller.getActionStatus);
+router.post("/conversations/:conversationId/actions/:intentId/confirm", validate(schemas.actionIntentParamsSchema, "params"), controller.confirmAction);
 
 module.exports = router;

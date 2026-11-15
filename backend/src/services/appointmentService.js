@@ -53,7 +53,8 @@ function timeContext(timeZone) {
   return now;
 }
 
-async function withTransaction(database, callback) {
+async function withTransaction(database, callback, transactionClient = null) {
+  if (transactionClient) return callback(transactionClient);
   const client = await database.connect();
   let started = false;
   try {
@@ -84,7 +85,7 @@ async function requireOwnDoctorId(database, user) {
   return result.rows[0].id;
 }
 
-async function lockBookableSlot(client, availabilityId, now, { allowDeleted = false } = {}) {
+async function lockBookableSlot(client, availabilityId, now, { allowDeleted = false, requirePublic = false } = {}) {
   const result = await client.query(
     `SELECT av.id, av.doctor_id, av.deleted_at, av.booking_visibility, av.date::text AS date,
             av.start_time::text AS start_time, av.end_time::text AS end_time,
@@ -98,7 +99,7 @@ async function lockBookableSlot(client, availabilityId, now, { allowDeleted = fa
   );
   const slot = result.rows[0];
   if (!slot) fail(404, "SLOT_NOT_FOUND", "Availability slot not found");
-  if (slot.deleted_at && !allowDeleted) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer bookable");
+  if ((slot.deleted_at && !allowDeleted) || (requirePublic && slot.booking_visibility !== "public")) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer bookable");
   if (!slotStartsInFuture(slot, now)) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer bookable");
   return slot;
 }
@@ -399,7 +400,7 @@ async function getAppointment(database, user, appointmentId) {
   return result.rows[0];
 }
 
-async function cancelAppointment(database, user, appointmentId) {
+async function cancelAppointment(database, user, appointmentId, transactionClient = null) {
   if (user.role !== "patient") fail(403, "FORBIDDEN", "Only the owning patient may cancel this appointment");
   return withTransaction(database, async (client) => {
     const initial = await client.query(
@@ -427,10 +428,10 @@ async function cancelAppointment(database, user, appointmentId) {
     const appointment = await readDetails(client, appointmentId);
     await enqueueAppointmentNotification(client, "appointment.cancelled", appointment, user.role);
     return appointment;
-  });
+  }, transactionClient);
 }
 
-async function rescheduleAppointment(database, user, timeZone, appointmentId, newAvailabilityId) {
+async function rescheduleAppointment(database, user, timeZone, appointmentId, newAvailabilityId, transactionClient = null, { requirePublic = false } = {}) {
   if (user.role !== "patient") fail(403, "FORBIDDEN", "Only the owning patient may reschedule this appointment");
   const now = timeContext(timeZone);
   return withTransaction(database, async (client) => {
@@ -454,7 +455,7 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
     if (original.availability_id === newAvailabilityId) fail(409, "SLOT_UNAVAILABLE", "Choose a different availability slot");
     const previousAppointment = await readDetails(client, appointmentId);
 
-    const slot = await lockBookableSlot(client, newAvailabilityId, now);
+    const slot = await lockBookableSlot(client, newAvailabilityId, now, { requirePublic });
     if (!slot.mode) await ensureNoActivePaymentHold(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time);
     const conflict = slot.mode ? { rows: [] } : await client.query(
       `SELECT 1 FROM appointments other JOIN availability other_av ON other_av.id = other.availability_id
@@ -489,7 +490,7 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
     const result = { ...appointment, previous_date: previousAppointment.date, previous_start_time: previousAppointment.start_time };
     await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role);
     return result;
-  });
+  }, transactionClient);
 }
 
 async function supersedeOpenAssistedRescheduleRequests(client, appointmentId, exceptRequestId = null) {

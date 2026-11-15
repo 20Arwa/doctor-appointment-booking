@@ -23,6 +23,7 @@ const assistantRoutes = require("./routes/assistantRoutes");
 const { createInAppNotificationService } = require("./services/inAppNotificationService");
 const { createAssistedRescheduleNotificationService } = require("./services/assistedRescheduleNotificationService");
 const { createAppointmentNotificationOutboxService } = require("./services/appointmentNotificationOutboxService");
+const { createAssistantActionService } = require("./services/assistantActionService");
 
 function createApp({ database, frontendOrigin, applicationTimezone, emailNotificationService = createEmailNotificationService({ config: env }), smsNotificationService = createSmsNotificationService({ config: env }), notificationDeliveryService, inAppNotificationService, reminderService, reminderSecret = env.REMINDER_CRON_SECRET, notificationRecoverySecret = env.NOTIFICATION_RECOVERY_CRON_SECRET, stripeService, paymentService, assistantEngine, paymentConfig = env, clerkAuthMiddleware = clerkMiddleware(), clerkProfileResolver = getClerkProfile }) {
   if (!database || typeof database.query !== "function") {
@@ -44,6 +45,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     inAppNotificationService: inAppNotifications,
     frontendOrigin: frontendOrigin || env.FRONTEND_ORIGIN,
   });
+  let assistantActions;
   const payments = paymentService || createPaymentService({
     database,
     stripe,
@@ -52,7 +54,11 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     inAppNotificationService: inAppNotifications,
     frontendOrigin: frontendOrigin || env.FRONTEND_ORIGIN,
     timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata",
+    reconcileAssistantAction: (id, outcome) => outcome.startsWith("refund:")
+      ? assistantActions?.reconcileRefund(id, outcome.slice(7))
+      : assistantActions?.reconcileCheckout(id, outcome),
   });
+  assistantActions = createAssistantActionService({ database, paymentService: payments, timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata" });
 
   app.use(cors({ origin: frontendOrigin, credentials: true }));
   app.use("/api/v1/payments/webhook", paymentRoutes({ service: payments, webhook: true }));
@@ -64,6 +70,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     response.locals.clerkProfileResolver = clerkProfileResolver;
     response.locals.applicationTimezone = applicationTimezone;
     response.locals.assistantEngine = assistantEngine;
+    response.locals.assistantActionService = assistantActions;
     response.locals.emailNotificationService = emailNotificationService;
     response.locals.notificationDeliveryService = notificationDeliveries;
     response.locals.inAppNotificationService = inAppNotifications;

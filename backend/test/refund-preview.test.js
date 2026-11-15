@@ -78,6 +78,8 @@ describe("cancellation refund preview", () => {
     assert.deepEqual(await response.json(), {
       original_payment: { amount: "100.00", currency: "INR", status: "captured" },
       refund_percentage: 100,
+      processed_refund_amount: "0.00",
+      pending_refund_amount: "0.00",
       estimated_refund_amount: "100.00",
       currency: "INR",
       refund_expected: true,
@@ -101,6 +103,8 @@ describe("cancellation refund preview", () => {
   it("subtracts processed refunds and caps the estimate by the remaining captured amount", async () => {
     const local = createFixture({ processed: "70.00", pending: "10.00" });
     const preview = await local.paymentService.previewCancellationRefund({ id: patientUserId, role: "patient" }, appointmentId);
+    assert.equal(preview.processed_refund_amount, "70.00");
+    assert.equal(preview.pending_refund_amount, "10.00");
     assert.equal(preview.refund_percentage, 100);
     assert.equal(preview.estimated_refund_amount, "20.00");
     assert.equal(preview.refund_expected, true);
