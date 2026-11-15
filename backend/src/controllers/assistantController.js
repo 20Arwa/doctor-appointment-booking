@@ -13,7 +13,7 @@ function errorResponse(response, error) {
 }
 
 function getService(response) {
-  return response.locals.assistantConversationService || createAssistantConversationService({ engine: response.locals.assistantEngine || assistantEngine });
+  return response.locals.assistantConversationService || createAssistantConversationService({ engine: response.locals.assistantEngine || assistantEngine, actionService: getActionService(response) });
 }
 
 function getActionService(response) { return response.locals.assistantActionService; }

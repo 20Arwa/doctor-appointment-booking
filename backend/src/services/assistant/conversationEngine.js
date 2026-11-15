@@ -74,9 +74,13 @@ function toolCacheKey(name, args) {
 }
 
 function contextualReference(text, rows, noun) {
+  const numericChoice = text.trim().match(/^\d{1,2}$/)?.[0];
+  if (numericChoice && /appointment/i.test(noun)) return rows[Number(numericChoice) - 1] ? { row: rows[Number(numericChoice) - 1] } : { ambiguous: true };
   const ordinal = text.match(/\b(first|second|third|fourth|fifth)\b/i)?.[1]?.toLowerCase();
   const ordinalIndex = ordinal ? ["first", "second", "third", "fourth", "fifth"].indexOf(ordinal) : null;
   if (ordinalIndex !== null) return rows[ordinalIndex] ? { row: rows[ordinalIndex] } : { ambiguous: true };
+  const numbered = text.match(new RegExp(`\\b(?:${noun})\\s+(?:number\\s+)?(\\d{1,2})\\b`, "i"))?.[1];
+  if (numbered) return rows[Number(numbered) - 1] ? { row: rows[Number(numbered) - 1] } : { ambiguous: true };
   if (new RegExp(`\\b(?:this|that|the)\\s+(?:${noun})\\b`, "i").test(text)) {
     if (rows.length === 1) return { row: rows[0] };
     if (rows.length > 1) return { ambiguous: true };
@@ -85,6 +89,11 @@ function contextualReference(text, rows, noun) {
 }
 
 function slotChoice(text, slots) {
+  const explicit = text.trim().match(/^(?:book|reschedule\s+my\s+appointment\s+to)\s+(?:the\s+)?slot\s+(?:number\s+)?(\d{1,2})$/i)?.[1];
+  if (explicit) {
+    const index = Number(explicit) - 1;
+    return index >= 0 && index < slots.length ? [slots[index]] : [];
+  }
   const value = text.trim().match(/^(\d{1,2})$/)?.[1];
   if (!value || !slots.length) return null;
   const number = Number(value);
@@ -124,13 +133,17 @@ function doctorNameContains(doctorName, candidate) {
   return candidateWords.length > 0 && nameWords.some((_, start) => candidateWords.every((word, index) => nameWords[start + index] === word));
 }
 
+function requestedDoctorName(text) {
+  return String(text || "").match(/\bDr\.?\s*([\p{L}][\p{L}'-]*(?:\s+(?!on\b|for\b|at\b|appointment\b|booking\b|date\b|time\b|available\b|availability\b|slot\b|slots\b|to\b|with\b)[\p{L}][\p{L}'-]*)?)/iu)?.[1]?.trim() || null;
+}
+
 function matchingAppointments(rows, text, times, dates, targetTime, targetDate) {
   const identifyingTimes = times.filter(({ index }) => !targetTime || index < targetTime.index);
   const identifyingDates = dates.filter(({ index }) => !targetDate || index < targetDate.index);
   const appointmentTime = targetTime && identifyingTimes.length
     ? selectedAppointmentTimes(text, identifyingTimes) || { start: identifyingTimes[0].candidates }
     : selectedAppointmentTimes(text, identifyingTimes);
-  const doctorWords = text.match(/\bDr\.?\s+([\p{L}][\p{L}'-]*(?:\s+[\p{L}][\p{L}'-]*)?)/iu)?.[1]?.toLowerCase().split(/\s+/) || [];
+  const doctorWords = requestedDoctorName(text)?.toLowerCase().split(/\s+/) || [];
   const doctorCandidates = doctorWords.length > 1 ? [doctorWords.join(" "), doctorWords[0]] : doctorWords;
   const doctorMention = doctorCandidates.find((candidate) => rows.some((row) => doctorNameContains(row.doctor?.name, candidate))) || doctorCandidates[0];
   const hasSelector = identifyingTimes.length > 0 || identifyingDates.length > 0 || Boolean(doctorMention);
@@ -163,7 +176,7 @@ function meridiemClarification(rows, times) {
 }
 
 function requestedDoctorMatches(text, doctorName) {
-  const words = text.match(/\bDr\.?\s+([\p{L}][\p{L}'-]*(?:\s+[\p{L}][\p{L}'-]*)?)/iu)?.[1]?.toLowerCase().split(/\s+/) || [];
+  const words = requestedDoctorName(text)?.toLowerCase().split(/\s+/) || [];
   if (!words.length) return true;
   const candidates = words.length > 1 ? [words.join(" "), words[0]] : words;
   const normalizedDoctorName = String(doctorName || "").toLowerCase();
@@ -171,7 +184,7 @@ function requestedDoctorMatches(text, doctorName) {
 }
 
 function requestedTargetDoctorName(text) {
-  const nonNameStarts = new Set(["a", "an", "appointment", "book", "booking", "change", "my", "move", "reschedule", "rescheduling", "schedule", "the", "visit"]);
+  const nonNameStarts = new Set(["a", "an", "appointment", "book", "booking", "change", "date", "my", "move", "option", "reschedule", "rescheduling", "schedule", "slot", "the", "time", "visit", "jan", "january", "feb", "february", "mar", "march", "apr", "april", "may", "jun", "june", "jul", "july", "aug", "august", "sep", "september", "oct", "october", "nov", "november", "dec", "december"]);
   const candidates = [...String(text).matchAll(/\bto\s+(?:Dr\.?\s+)?([\p{L}][\p{L}'-]*(?:\s+(?!on\b|for\b|at\b|to\b|jan(?:uary)?\b|feb(?:ruary)?\b|mar(?:ch)?\b|apr(?:il)?\b|may\b|jun(?:e)?\b|jul(?:y)?\b|aug(?:ust)?\b|sep(?:tember)?\b|oct(?:ober)?\b|nov(?:ember)?\b|dec(?:ember)?\b)[\p{L}][\p{L}'-]*)?)/giu)];
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
     const candidate = candidates[index][1].trim();
@@ -248,8 +261,14 @@ function privateCancellationContext(preparation) {
   return typeof appointmentId === "string" ? { action_type: "cancel", appointment_id: appointmentId } : undefined;
 }
 
-function pendingCancellationContext(now) {
-  return { action_type: "cancel_pending", expires_at: new Date(now() + 5 * 60 * 1000).toISOString() };
+function pendingCancellationContext(now, details = {}) {
+  return {
+    action_type: "cancel_pending",
+    expires_at: new Date(now() + 5 * 60 * 1000).toISOString(),
+    ...(typeof details.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(details.date) ? { date: details.date } : {}),
+    ...(typeof details.time === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(details.time) ? { time: details.time } : {}),
+    ...(typeof details.doctor_name === "string" ? { doctor_name: details.doctor_name.slice(0, 120) } : {}),
+  };
 }
 
 function unverifiedActionClaim(answer) {
@@ -258,9 +277,17 @@ function unverifiedActionClaim(answer) {
     || /\b(?:confirmation\s+)?intent\s+(?:was|has been|is)\s+(?:created|prepared|confirmed)\b/i.test(answer);
 }
 
+function rejectsCancellationProposal(text) {
+  return /\b(?:don't|do not)\s+(?:want\s+to\s+)?(?:cancel|proceed|go ahead|do it|do that)\b/i.test(text)
+    || /\b(?:never|stop)\s+(?:cancel|proceed|go ahead|do it|do that)\b/i.test(text)
+    || /\b(?:i\s+)?changed\s+my\s+mind\b/i.test(text)
+    || /\b(?:never mind|forget it|not anymore|no thanks|keep the appointment|leave the appointment)\b/i.test(text)
+    || /^\s*(?:no|nope|nah)\b/i.test(text);
+}
+
 function createConversationEngine({ provider, toolExecutor, logger = console, now = Date.now, deadlineMs = 35000 }) {
   return {
-    async respond({ actor, messages, database, applicationTimezone, paymentService, previousActionContext, previousReferences, tools = [], systemInstruction = "", requestId = "unknown", logger: requestLogger = logger }) {
+    async respond({ actor, messages, database, applicationTimezone, paymentService, previousActionContext, previousProposal, previousReferences, tools = [], systemInstruction = "", requestId = "unknown", logger: requestLogger = logger }) {
       // This history is loaded from the server-owned conversation record.
       const transcript = messages.slice(-12).map((message) => ({ ...message }));
       let calls = 0;
@@ -280,8 +307,22 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         appointments: referenceIsFresh("appointments") && Array.isArray(previousReferences?.appointments) ? previousReferences.appointments : [],
         slots: referenceIsFresh("slots") && Array.isArray(previousReferences?.slots) ? previousReferences.slots : [],
         doctors: referenceIsFresh("doctors") && Array.isArray(previousReferences?.doctors) ? previousReferences.doctors : [],
-        ...(referenceIsFresh("slots") && (previousReferences?.pending_action === "book" || previousReferences?.pending_action === "reschedule") ? { pending_action: previousReferences.pending_action } : {}),
+        ...(previousReferences?.pending_action === "cancel" ? { pending_action: "cancel" }
+          : (referenceIsFresh("slots") || referenceIsFresh("appointments")) && (previousReferences?.pending_action === "book" || previousReferences?.pending_action === "reschedule") ? { pending_action: previousReferences.pending_action } : {}),
+        ...(referenceIsFresh("appointments") && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(previousReferences?.pending_appointment_id || "") ? { pending_appointment_id: previousReferences.pending_appointment_id } : {}),
+        ...(typeof previousReferences?.pending_target_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(previousReferences.pending_target_date) ? { pending_target_date: previousReferences.pending_target_date } : {}),
         ...(referenceIsFresh("appointments") && previousReferences?.history_page && typeof previousReferences.history_page === "object" ? { history_page: previousReferences.history_page } : {}),
+      };
+      // Keep the numbered cancellation list separate from general appointment
+      // history, which may replace `appointments` on a later conversation turn.
+      let cancellationChoices = Array.isArray(previousReferences?.cancellation_choices) ? previousReferences.cancellation_choices
+        : Array.isArray(previousReferences?.appointments) ? previousReferences.appointments : [];
+      let cancellationChoicesAt = previousReferences?.cancellation_choices_at
+        || referenceTimestamps.appointments;
+      const cancellationChoicesAreFresh = () => {
+        if (!cancellationChoicesAt) return false;
+        const age = now() - Date.parse(cancellationChoicesAt);
+        return Number.isFinite(age) && age >= 0 && age <= 5 * 60 * 1000;
       };
       const resolvedDoctorIds = new Set();
       const ambiguousDoctorIds = new Map();
@@ -310,7 +351,8 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
       for (const doctor of referenceContext.doctors) if (doctor.id) resolvedDoctorIds.add(doctor.id);
       let namedDoctorSearch = null;
       const currentUserText = [...messages].reverse().find((message) => message.role === "user")?.content || "";
-      const currentRequestNamesDoctor = /\bDr\.?\s+[\p{L}][\p{L}'-]*/iu.test(currentUserText);
+      const explicitSlotCommand = /^(?:book|reschedule\s+my\s+appointment\s+to)\s+(?:the\s+)?slot\s+(?:number\s+)?\d{1,2}$/i.test(currentUserText.trim());
+      const currentRequestNamesDoctor = Boolean(requestedDoctorName(currentUserText));
       const requestedTimes = timeReferences(currentUserText);
       const requestedDates = dateReferences(currentUserText);
       const requestedDate = requestedDates.at(-1);
@@ -332,11 +374,26 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
       let internalProposalEvidence = null;
       let successfulRefundPreview = null;
       const pendingCancellation = previousActionContext?.action_type === "cancel_pending";
-      const cancellationClarification = pendingCancellation
+      const pendingCancellationSelection = previousReferences?.pending_action === "cancel";
+      const cancellationChoiceText = /^\s*\d{1,2}\s*$|\b(?:first|second|third|fourth|fifth)\s+(?:appointment|one)\b|\bappointment\s+(?:number\s+)?\d+\b|\b(?:this|that)\s+appointment\b/i.test(currentUserText);
+      const cancellationDetailsFollowup = requestedDates.length > 0 || requestedTimes.length > 0 || currentRequestNamesDoctor;
+      const cancellationClarification = (pendingCancellation
         && !actionRequest
         && canonicalIntent.category !== "appointment_history"
-        && canonicalIntent.category !== "refund_preview";
+        && canonicalIntent.category !== "refund_preview")
+        || (pendingCancellationSelection && !actionRequest && canonicalIntent.category !== "appointment_history"
+          && canonicalIntent.category !== "refund_preview" && (cancellationChoiceText || cancellationDetailsFollowup));
       const cancellationRequest = canonicalIntent.category === "cancellation" || cancellationClarification;
+      const priorCancellationDetails = pendingCancellation ? previousActionContext : {};
+      const cancellationDate = requestedDateIso || priorCancellationDetails.date || null;
+      const cancellationTime = requestedTime || priorCancellationDetails.time || null;
+      const cancellationDoctorName = requestedDoctorName(currentUserText)
+        || priorCancellationDetails.doctor_name || null;
+      const pendingCancellationForTurn = () => pendingCancellationContext(now, {
+        date: cancellationDate,
+        time: canonicalIntent.timeInterpretation === "explicit" || !requestedTime ? cancellationTime : priorCancellationDetails.time,
+        doctor_name: cancellationDoctorName,
+      });
       let exactActionCandidates = [];
       let exactActionOutcome = null;
       const started = now();
@@ -351,11 +408,37 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         executedToolResults.set(key, result);
         return result;
       };
-      const internalState = () => ({
-        ...(referenceContext.appointments.length || referenceContext.slots.length || referenceContext.doctors.length || referenceContext.pending_action || Object.values(referenceTimestamps).some(Boolean)
-          ? { internalReferences: { ...referenceContext, version: 1, reference_timestamps: referenceTimestamps } } : {}),
-      });
+      const internalState = () => {
+        const appointmentsForPersistence = referenceContext.pending_action === "cancel"
+          && !referenceIsFresh("appointments") && !referenceContext.appointments.length
+          ? cancellationChoices : referenceContext.appointments;
+        return {
+          ...(appointmentsForPersistence.length || cancellationChoices.length || referenceContext.slots.length || referenceContext.doctors.length || referenceContext.pending_action || referenceContext.pending_appointment_id || Object.values(referenceTimestamps).some(Boolean)
+            ? { internalReferences: { ...referenceContext, appointments: appointmentsForPersistence, ...(cancellationChoices.length ? { cancellation_choices: cancellationChoices, cancellation_choices_at: cancellationChoicesAt } : {}), version: 1, reference_timestamps: referenceTimestamps } } : {}),
+        };
+      };
       const markReferenceFresh = (kind) => { referenceTimestamps[kind] = new Date(now()).toISOString(); };
+      const checkedBookingTargets = new Map();
+      const existingConfirmedAppointmentForSlot = async (doctorId, date, startTime) => {
+        if (actor.role !== "patient" || !doctorId || !date || !startTime) return { appointment: null };
+        const normalizedStart = String(startTime).slice(0, 5);
+        const key = `${doctorId}|${date}|${normalizedStart}`;
+        if (checkedBookingTargets.has(key)) return checkedBookingTargets.get(key);
+        const page = await executeTool({
+          name: "get_patient_appointments",
+          args: { view: "upcoming", scope: "all", from: date, to: date },
+          actor, database, applicationTimezone, paymentService,
+        });
+        const appointments = Array.isArray(page?.appointments) ? page.appointments : [];
+        const match = appointments.find((appointment) => appointment.status === "confirmed"
+          && appointment.doctor?.id === doctorId
+          && appointment.date === date
+          && String(appointment.start_time).slice(0, 5) === normalizedStart);
+        const result = { appointment: match || null, uncertain: !match && page?.has_more === true };
+        checkedBookingTargets.set(key, result);
+        return result;
+      };
+      const alreadyBookedReply = (appointment, doctorName) => `You already have a confirmed appointment${doctorName ? ` with ${doctorName}` : ""} on ${appointment.date} at ${String(appointment.start_time).slice(0, 5)}. I haven't prepared another booking proposal.`;
       const assistantContextInstruction = referenceContext.appointments.length || referenceContext.slots.length || referenceContext.doctors.length
         ? `${systemInstruction}\nVerified recent results: ${JSON.stringify(modelReferenceSummary(referenceContext))}. Resolve follow-up references only against these returned records. Ask for clarification when ambiguous. Never search for a doctor using a numeric or pronoun-only reply, and never invent record IDs.`
         : systemInstruction;
@@ -364,6 +447,14 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         const errorCategory = category || error?.category || (status ? `provider_http_${status}` : undefined);
         requestLogger?.info?.(stage, { requestId, attempt, elapsedMs: now() - started, ...(errorCategory ? { category: errorCategory } : {}), ...(status ? { providerStatus: status } : {}) });
       };
+      if (actor.role === "patient" && previousProposal?.action_type === "cancel" && rejectsCancellationProposal(currentUserText)) {
+        return {
+          answer: "Understood. I dismissed the cancellation proposal and won't prepare it again.",
+          results: [],
+          dismissProposal: { assistant_message_id: previousProposal.assistant_message_id, action_type: "cancel" },
+          ...internalState(),
+        };
+      }
       const isRefundFollowup = canonicalIntent.category === "refund_preview"
         && /\b(?:this|that)\s+(?:appointment|visit|booking)\b/i.test(currentUserText);
       if (isRefundFollowup) {
@@ -404,15 +495,15 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
           return { answer, results: [], ...(activeActionContext ? { internalActionContext: activeActionContext } : {}), ...internalState() };
         }
       }
-      if ((actionRequest || cancellationRequest) && canonicalIntent.timePrecision === "approximate") {
+      if (!explicitSlotCommand && (actionRequest || cancellationRequest) && canonicalIntent.timePrecision === "approximate") {
         return {
           answer: "Please give the exact appointment start time so I can check the correct slot or appointment.",
           results: [],
-          ...(pendingCancellation ? { internalActionContext: pendingCancellationContext(now) } : {}),
+          ...(pendingCancellation ? { internalActionContext: pendingCancellationForTurn() } : {}),
           ...internalState(),
         };
       }
-      if ((actionRequest === "book" || actionRequest === "reschedule" || cancellationRequest) && targetTime?.start?.candidates?.length > 1) {
+      if (!explicitSlotCommand && (actionRequest === "book" || actionRequest === "reschedule" || cancellationRequest) && targetTime?.start?.candidates?.length > 1) {
         const labels = targetTime.start.candidates.map((time) => {
           const [hour, minute] = time.split(":").map(Number);
           return `${hour % 12 || 12}:${String(minute).padStart(2, "0")} ${hour >= 12 ? "PM" : "AM"}`;
@@ -420,11 +511,24 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         return {
           answer: `Did you mean ${labels.join(" or ")}? Please clarify before I prepare a proposal.`,
           results: [],
-          ...(pendingCancellation ? { internalActionContext: pendingCancellationContext(now) } : {}),
+          ...(pendingCancellation ? { internalActionContext: pendingCancellationForTurn() } : {}),
           ...internalState(),
         };
       }
       const historyContinuation = /^\s*(?:(?:please|can you|could you|would you)\s+)*(?:continue(?:\s+(?:to\s+)?(?:the\s+)?(?:next page|list|history|appointments))?|(?:(?:show|give|load|fetch)\s+(?:(?:me|us)\s+)?(?:the\s+)?(?:next page|more appointments|more results))|next page|show more|more appointments|more results|keep going)\b/i.test(currentUserText);
+      if (cancellationChoices.length
+        && /\b(?:which|what)\b[\s\S]{0,50}\b(?:appointment|one)\b[\s\S]{0,40}\b(?:latest|most recent|newest|last)\b/i.test(currentUserText)) {
+        const latestChoice = cancellationChoices
+          .map((row, index) => ({ row, index }))
+          .sort((left, right) => `${right.row.date || ""} ${right.row.start_time || ""}`.localeCompare(`${left.row.date || ""} ${left.row.start_time || ""}`))[0];
+        return {
+          answer: latestChoice
+            ? `The latest appointment in the displayed list is number ${latestChoice.index + 1}: ${appointmentChoiceDescription(latestChoice.row)}.`
+            : "I don't have the displayed appointment choices available. Please ask me to show your upcoming appointments again.",
+          results: [],
+          ...internalState(),
+        };
+      }
       const historyQuery = canonicalIntent.category === "appointment_history" ? canonicalIntent.historyQuery : null;
       const refundHistoryQuery = canonicalIntent.historyQuery;
       const resolvedHistoryQuery = historyContinuation ? referenceContext.history_page?.query : historyQuery;
@@ -433,6 +537,19 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
       }
       if (historyContinuation && referenceContext.history_page.has_more === false) {
         return { answer: "There are no more appointment pages in that list.", results: [], ...internalState() };
+      }
+      if (canonicalIntent.category === "payment_history") {
+        try {
+          const history = await executeTool({ name: "get_patient_payment_history", args: {}, actor, database, applicationTimezone, paymentService });
+          const items = Array.isArray(history?.items) ? history.items : [];
+          return {
+            answer: items.length ? `Here are your ${items.length} most recent payment and refund records${history.has_more ? ". Ask me to show more for earlier records." : "."}` : "There are no payment records in your history.",
+            results: [{ tool: "get_patient_payment_history", data: publicToolResult(history) }],
+            ...internalState(),
+          };
+        } catch {
+          return { answer: "I couldn't load your payment history just now. Please try again.", results: [], ...internalState() };
+        }
       }
       if (canonicalIntent.category === "refund_preview" && (refundHistoryQuery || /\b(?:appointment|visit|booking)\b/i.test(currentUserText))) {
         const explicitTarget = /\bDr\.?\s+[\p{L}]/iu.test(currentUserText) || dateReferences(currentUserText).length > 0;
@@ -501,6 +618,10 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         delete referenceTimestamps.doctors;
         referenceContext.history_page = { query: effectiveHistoryQuery, next_offset: initialOffset + history.next_offset, has_more: history.has_more, seen_appointment_ids: [...seenIds].slice(-1000) };
         markReferenceFresh("appointments");
+        if (appointmentListRequest && history.appointments.length) {
+          cancellationChoices = history.appointments;
+          cancellationChoicesAt = new Date(now()).toISOString();
+        }
         const category = effectiveHistoryQuery.scope === "nearest" ? "next upcoming appointment"
           : effectiveHistoryQuery.scope === "last" ? "most recent past appointment"
             : effectiveHistoryQuery.scope === "last_completed" ? "most recently completed appointment"
@@ -523,6 +644,11 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         const targetCandidates = targetTime?.start?.candidates || [];
         if (!targetCandidates.length || !requestedDateIso || !doctor?.id) return { status: "not_applicable" };
         if (targetCandidates.length > 1) return { status: "ambiguous_time" };
+        if (action === "book") {
+          const existing = await existingConfirmedAppointmentForSlot(doctor.id, requestedDateIso, targetCandidates[0]);
+          if (existing.appointment) return { status: "duplicate_booking", appointment: existing.appointment };
+          if (existing.uncertain) return { status: "duplicate_check_incomplete" };
+        }
         const exactSlotsById = new Map();
         for (const exactStartTime of targetCandidates) {
           const slotQuery = { doctor_id: doctor.id, from: requestedDateIso, to: requestedDateIso, exact_start_time: exactStartTime };
@@ -565,9 +691,59 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         return { status: "prepared" };
       };
       const availabilityIntent = /\b(?:availability|available|open slots?|time slots?)\b/i.test(currentUserText);
-      const namedAvailabilityDoctor = currentUserText.match(/\bDr\.?\s+([\p{L}][\p{L}'-]*(?:\s+(?!on\b|for\b|at\b|availability\b|available\b|open\b|slots?\b|time\b|in\b)[\p{L}][\p{L}'-]*)?)/iu)?.[1]?.trim().replace(/\s+(?:availability|available|slots?)$/i, "");
+      const namedAvailabilityDoctor = requestedDoctorName(currentUserText);
       const dateOnlyDoctorFollowup = !availabilityIntent && requestedDates.length > 0 && referenceContext.doctors.length === 1
         && !/\b(?:appointment|cancel|reschedul|book|refund)\b/i.test(currentUserText);
+      if (actionRequest === "book" && namedAvailabilityDoctor && requestedDateIso) {
+        const search = await executeTool({ name: "search_doctors", args: { name: namedAvailabilityDoctor }, actor, database, applicationTimezone, paymentService });
+        const doctors = Array.isArray(search?.doctors) ? search.doctors : [];
+        referenceContext.doctors = doctors;
+        markReferenceFresh("doctors");
+        if (doctors.length !== 1) {
+          const answer = doctors.length ? `More than one doctor matches ${namedAvailabilityDoctor}. Please choose a doctor by name.` : `I could not find an active doctor matching ${namedAvailabilityDoctor}. Please check the doctor name.`;
+          return { answer, results: [{ tool: "search_doctors", data: publicToolResult(search), ui_actions: patientUiActions("search_doctors", search) }], ...internalState() };
+        }
+        const doctor = doctors[0];
+        if (requestedTime) {
+          const outcome = await prepareForExactTarget("book", doctor);
+          if (outcome.status === "prepared") {
+            referenceContext.pending_action = undefined;
+            return { answer: preparationReply("book", successfulPreparation.slot), results: publicResults, ...(internalProposalEvidence ? { internalProposalEvidence } : {}), ...internalState() };
+          }
+          if (outcome.status === "unavailable") {
+            const [hourText, minute] = requestedTime.split(":");
+            const hour = Number(hourText);
+            const requestedTimeLabel = `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
+            const alternatives = await executeTool({ name: "get_available_slots", args: { doctor_id: doctor.id, from: requestedDateIso, to: requestedDateIso }, actor, database, applicationTimezone, paymentService });
+            referenceContext.slots = Array.isArray(alternatives?.slots) ? alternatives.slots : [];
+            referenceContext.slot_query = { doctor_id: doctor.id, from: requestedDateIso, to: requestedDateIso };
+            referenceContext.pending_action = referenceContext.slots.length ? "book" : undefined;
+            markReferenceFresh("slots");
+            return {
+              answer: referenceContext.slots.length
+                ? `The requested ${requestedTimeLabel} time is not available with ${doctor.name}. Here are other available times on ${requestedDateIso}. Choose one to prepare a booking proposal.`
+                : `The requested ${requestedTimeLabel} time is not available with ${doctor.name}, and I couldn't find other available times on ${requestedDateIso}. Please choose another date.`,
+              results: [{ tool: "get_available_slots", data: publicToolResult({ slots: referenceContext.slots }), ui_actions: patientUiActions("get_available_slots", { slots: referenceContext.slots }) }],
+              ...internalState(),
+            };
+          }
+          if (outcome.status === "duplicate_booking") return { answer: alreadyBookedReply(outcome.appointment, doctor.name), results: [], ...internalState() };
+          if (outcome.status === "duplicate_check_incomplete") return { answer: "I couldn't verify your existing appointments, so I haven't prepared a duplicate booking. Please try again in a moment.", results: [], ...internalState() };
+          return { answer: outcome.status === "ambiguous_slot" ? "More than one slot matches that exact time. Please clarify which slot you want." : "I couldn't verify that exact time for booking. Please try another time.", results: [], ...internalState() };
+        }
+        const args = { doctor_id: doctor.id, from: requestedDateIso, to: requestedDateIso };
+        const availability = await executeTool({ name: "get_available_slots", args, actor, database, applicationTimezone, paymentService });
+        referenceContext.slots = Array.isArray(availability?.slots) ? availability.slots : [];
+        referenceContext.slot_query = args;
+        referenceContext.pending_action = referenceContext.slots.length ? "book" : undefined;
+        markReferenceFresh("slots");
+        const slots = { slots: referenceContext.slots };
+        return {
+          answer: referenceContext.slots.length ? `Here are the available appointment times with ${doctor.name}. Choose one by its displayed time and I can prepare a booking proposal.` : `I could not find available appointment times with ${doctor.name} for that date.`,
+          results: [{ tool: "get_available_slots", data: publicToolResult(slots), ui_actions: patientUiActions("get_available_slots", slots) }],
+          ...internalState(),
+        };
+      }
       if (!actionRequest && ((availabilityIntent && namedAvailabilityDoctor) || dateOnlyDoctorFollowup)) {
         const search = dateOnlyDoctorFollowup ? { doctors: [referenceContext.doctors[0]] }
           : await executeTool({ name: "search_doctors", args: { name: namedAvailabilityDoctor }, actor, database, applicationTimezone, paymentService });
@@ -592,32 +768,121 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         return { answer: availability.slots?.length ? `Here are the available appointment times with ${doctor.name}.` : `I could not find available appointment times with ${doctor.name} for that date.`, results, ...internalState() };
       }
       if (cancellationRequest) {
-        if (!requestedDateIso || !requestedTime) {
+        const choicesForSelection = cancellationChoices.length
+          ? cancellationChoices
+          : referenceContext.appointments;
+        const selectedReference = contextualReference(currentUserText, choicesForSelection, "appointment");
+        if (selectedReference?.ambiguous) {
+          if (cancellationChoices.length && !cancellationChoicesAreFresh()) {
+            const page = await executeTool({ name: "get_patient_appointments", args: { view: "upcoming", scope: "all" }, actor, database, applicationTimezone, paymentService });
+            const refreshedChoices = (Array.isArray(page?.appointments) ? page.appointments : []).filter((row) => row.status === "confirmed");
+            referenceContext.appointments = refreshedChoices;
+            referenceContext.pending_action = refreshedChoices.length ? "cancel" : undefined;
+            cancellationChoices = refreshedChoices;
+            cancellationChoicesAt = new Date(now()).toISOString();
+            markReferenceFresh("appointments");
+            if (!refreshedChoices.length) return { answer: "Those appointment choices expired. I refreshed your upcoming appointments but found no confirmed appointments to cancel.", results: [], ...internalState() };
+            return { answer: "Those appointment choices expired, so I refreshed your upcoming appointments. Choose again from this current list.", results: [{ tool: "get_patient_appointments", data: publicToolResult({ appointments: refreshedChoices }), ui_actions: patientUiActions("get_patient_appointments", { appointments: refreshedChoices }) }], ...internalState() };
+          }
+          if (!choicesForSelection.length && cancellationChoiceText) {
+            const page = await executeTool({ name: "get_patient_appointments", args: { view: "upcoming", scope: "all" }, actor, database, applicationTimezone, paymentService });
+            const refreshedChoices = (Array.isArray(page?.appointments) ? page.appointments : []).filter((row) => row.status === "confirmed");
+            referenceContext.appointments = refreshedChoices;
+            referenceContext.pending_action = refreshedChoices.length ? "cancel" : undefined;
+            cancellationChoices = refreshedChoices;
+            cancellationChoicesAt = new Date(now()).toISOString();
+            markReferenceFresh("appointments");
+            if (!refreshedChoices.length) return { answer: "I couldn't find confirmed upcoming appointments to cancel. Please ask for your current appointment list.", results: [], ...internalState() };
+            return { answer: "I couldn't verify the old numbered choice, so I refreshed your upcoming appointments. Choose again from this current list.", results: [{ tool: "get_patient_appointments", data: publicToolResult({ appointments: refreshedChoices }), ui_actions: patientUiActions("get_patient_appointments", { appointments: refreshedChoices }) }], ...internalState() };
+          }
+          return { answer: "Which of the displayed appointments do you want to cancel? Choose one by its number.", results: [], internalActionContext: pendingCancellationForTurn(), ...internalState() };
+        }
+        if (!selectedReference && !choicesForSelection.length && cancellationChoiceText) {
+          const page = await executeTool({ name: "get_patient_appointments", args: { view: "upcoming", scope: "all" }, actor, database, applicationTimezone, paymentService });
+          const refreshedChoices = (Array.isArray(page?.appointments) ? page.appointments : []).filter((row) => row.status === "confirmed");
+          referenceContext.appointments = refreshedChoices;
+          referenceContext.pending_action = refreshedChoices.length ? "cancel" : undefined;
+          cancellationChoices = refreshedChoices;
+          cancellationChoicesAt = new Date(now()).toISOString();
+          markReferenceFresh("appointments");
+          if (!refreshedChoices.length) return { answer: "I couldn't find confirmed upcoming appointments to cancel. Please ask for your current appointment list.", results: [], ...internalState() };
+          return { answer: "I couldn't verify the old numbered choice, so I refreshed your upcoming appointments. Choose again from this current list.", results: [{ tool: "get_patient_appointments", data: publicToolResult({ appointments: refreshedChoices }), ui_actions: patientUiActions("get_patient_appointments", { appointments: refreshedChoices }) }], ...internalState() };
+        }
+        let appointment = selectedReference?.row || null;
+        let matches = appointment ? [appointment] : [];
+        let appointmentPage = null;
+        if (appointment && cancellationChoices.length && !cancellationChoicesAreFresh()) {
+          const previousChoice = appointment;
+          appointmentPage = await executeTool({
+            name: "get_patient_appointments",
+            args: { view: "upcoming", scope: "all", ...(previousChoice.date ? { from: previousChoice.date, to: previousChoice.date } : {}) },
+            actor, database, applicationTimezone, paymentService,
+          });
+          const refreshedRows = Array.isArray(appointmentPage?.appointments) ? appointmentPage.appointments : [];
+          const confirmedRows = refreshedRows.filter((row) => row.status === "confirmed");
+          const sameDoctorRows = previousChoice.doctor?.id
+            ? confirmedRows.filter((row) => row.doctor?.id === previousChoice.doctor.id)
+            : confirmedRows;
+          const refreshedChoices = sameDoctorRows.length ? sameDoctorRows : confirmedRows;
+          referenceContext.appointments = refreshedChoices;
+          referenceContext.pending_action = refreshedChoices.length ? "cancel" : undefined;
+          markReferenceFresh("appointments");
+          cancellationChoices = refreshedChoices;
+          cancellationChoicesAt = new Date(now()).toISOString();
+          const refreshedActionContext = pendingCancellationContext(now, {
+            date: previousChoice.date,
+            time: typeof previousChoice.start_time === "string" ? previousChoice.start_time.slice(0, 5) : undefined,
+            doctor_name: previousChoice.doctor?.name,
+          });
+          if (!refreshedChoices.length) {
+            return { answer: `That numbered choice expired. I refreshed your appointments for ${previousChoice.date || "the upcoming period"}, but found no confirmed appointment there. Please ask for the current appointment list.`, results: [], internalActionContext: refreshedActionContext, ...internalState() };
+          }
           return {
-            answer: "Please identify the appointment by its date and start time so I can find the correct patient-owned appointment.",
-            results: [],
-            internalActionContext: pendingCancellationContext(now),
+            answer: `That numbered choice expired, so I refreshed your upcoming appointments. Choose the appointment you want to cancel from this current list of ${refreshedChoices.length}.`,
+            results: [{ tool: "get_patient_appointments", data: publicToolResult({ appointments: refreshedChoices }), ui_actions: patientUiActions("get_patient_appointments", { appointments: refreshedChoices }) }],
+            internalActionContext: refreshedActionContext,
             ...internalState(),
           };
         }
-        const appointmentPage = await executeTool({
-          name: "get_patient_appointments",
-          args: { view: "upcoming", scope: "all", from: requestedDateIso, to: requestedDateIso },
-          actor, database, applicationTimezone, paymentService,
-        });
-        const rows = Array.isArray(appointmentPage?.appointments) ? appointmentPage.appointments : [];
-        referenceContext.appointments = rows;
-        markReferenceFresh("appointments");
-        const matches = matchingAppointments(rows, currentUserText, requestedTimes, requestedDates, undefined, undefined);
-        if (matches.length !== 1 || appointmentPage.has_more === true) {
-          const answer = matches.length > 1
-            ? `I found multiple matching appointments: ${matches.map(appointmentChoiceDescription).join("; ")}. Which one do you want to cancel?`
-            : appointmentPage.has_more === true
-              ? "I found more appointments on that date than I can verify in one request. Please add the doctor's name or a more exact appointment detail."
-              : "I couldn't find a confirmed patient-owned appointment matching that date and start time. Please check the details.";
-          return { answer, results: [], internalActionContext: pendingCancellationContext(now), ...internalState() };
+        if (!appointment) {
+          if (!cancellationDate && !cancellationTime && !cancellationDoctorName) {
+            return { answer: "Please identify the appointment by its date and start time so I can find the correct patient-owned appointment.", results: [], internalActionContext: pendingCancellationForTurn(), ...internalState() };
+          }
+          appointmentPage = await executeTool({
+            name: "get_patient_appointments",
+            args: { view: "upcoming", scope: "all", ...(cancellationDate ? { from: cancellationDate, to: cancellationDate } : {}) },
+            actor, database, applicationTimezone, paymentService,
+          });
+          const rows = Array.isArray(appointmentPage?.appointments) ? appointmentPage.appointments : [];
+          referenceContext.appointments = rows;
+          markReferenceFresh("appointments");
+          const cancellationText = [currentUserText, cancellationDoctorName, cancellationDate, cancellationTime].filter(Boolean).join(" ");
+          const cancellationTimes = requestedTimes.length ? requestedTimes : cancellationTime ? timeReferences(cancellationTime) : [];
+          const cancellationDates = requestedDates.length ? requestedDates : cancellationDate ? dateReferences(cancellationDate) : [];
+          matches = matchingAppointments(rows, cancellationText, cancellationTimes, cancellationDates, undefined, undefined);
+          if (matches.length !== 1 || appointmentPage.has_more === true) {
+            if (matches.length > 1) {
+              referenceContext.appointments = matches;
+              referenceContext.pending_action = "cancel";
+              cancellationChoices = matches;
+              cancellationChoicesAt = new Date(now()).toISOString();
+              const selectionAnswer = `I found multiple matching appointments that are confirmed (${matches.length}): ${matches.map(appointmentChoiceDescription).join("; ")}. Choose the appointment you want to cancel.`;
+              return { answer: selectionAnswer, results: [{ tool: "get_patient_appointments", data: publicToolResult({ appointments: matches }), ui_actions: patientUiActions("get_patient_appointments", { appointments: matches }) }], internalActionContext: pendingCancellationForTurn(), ...internalState() };
+            }
+            const answer = appointmentPage.has_more === true
+              ? "I found more upcoming appointments than I can verify in one request. Please add the doctor's name or appointment date."
+              : cancellationDoctorName && cancellationDate && cancellationTime
+                ? `I couldn't find a confirmed appointment matching Dr. ${cancellationDoctorName} on ${cancellationDate} at ${cancellationTime}.`
+                : cancellationDoctorName && cancellationDate
+                  ? `I couldn't find a confirmed appointment matching Dr. ${cancellationDoctorName} on ${cancellationDate}.`
+                  : cancellationDoctorName && cancellationTime
+                    ? `I couldn't find a confirmed appointment matching Dr. ${cancellationDoctorName} at ${cancellationTime}.`
+                    : "I couldn't find one confirmed appointment matching those details.";
+            return { answer, results: [], internalActionContext: pendingCancellationForTurn(), ...internalState() };
+          }
+          appointment = matches[0];
         }
-        const appointment = matches[0];
+        if (appointment.status !== "confirmed") return { answer: "That appointment is no longer confirmed and cannot be cancelled. Please refresh your appointment list.", results: [], ...internalState() };
         const appointmentId = appointment.appointment_id || appointment.id;
         const args = { appointment_id: appointmentId };
         const proposal = await executeTool({ name: "prepare_cancellation_action", args, actor, database, applicationTimezone, paymentService });
@@ -626,6 +891,7 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         }
         const result = { ...proposal, persisted_intent_created: false };
         successfulPreparation = { action: "cancel", slot: appointment };
+        referenceContext.pending_action = undefined;
         return {
           answer: preparationReply("cancel", appointment),
           results: [{ tool: "prepare_cancellation_action", data: publicToolResult(result) }],
@@ -635,6 +901,95 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         };
       }
       const explicitTargetDoctorName = actionRequest === "reschedule" ? requestedTargetDoctorName(currentUserText) : null;
+      if (actionRequest === "reschedule" && referenceContext.pending_action === "reschedule" && referenceContext.pending_target_date) {
+        const selectedAppointment = contextualReference(currentUserText, referenceContext.appointments, "appointment");
+        if (selectedAppointment?.ambiguous) return { answer: "Which of the displayed appointments do you want to reschedule? Choose one by its number.", results: [], ...internalState() };
+        if (selectedAppointment?.row) {
+          const appointment = selectedAppointment.row;
+          if (appointment.status !== "confirmed") return { answer: "That appointment is no longer eligible for rescheduling. Please refresh your appointment list.", results: [], ...internalState() };
+          const args = { doctor_id: appointment.doctor?.id, from: referenceContext.pending_target_date, to: referenceContext.pending_target_date };
+          if (!args.doctor_id) return { answer: "I couldn't verify the doctor for that appointment. Please refresh your appointment list and try again.", results: [], ...internalState() };
+          const availability = await executeTool({ name: "get_available_slots", args, actor, database, applicationTimezone, paymentService });
+          referenceContext.slots = Array.isArray(availability?.slots) ? availability.slots : [];
+          referenceContext.slot_query = args;
+          referenceContext.pending_appointment_id = appointment.appointment_id || appointment.id;
+          referenceContext.pending_action = referenceContext.slots.length ? "reschedule" : undefined;
+          markReferenceFresh("slots");
+          return { answer: referenceContext.slots.length ? `Here are available times to reschedule with ${appointment.doctor.name} on ${referenceContext.pending_target_date}. Choose a time to prepare the rescheduling proposal.` : `I couldn't find available times with ${appointment.doctor.name} on ${referenceContext.pending_target_date}. Please choose another date.`, results: [{ tool: "get_available_slots", data: publicToolResult(availability), ui_actions: patientUiActions("get_available_slots", availability) }], ...internalState() };
+        }
+      }
+      const sourceDoctorName = requestedDoctorName(currentUserText);
+      if (actionRequest === "reschedule" && sourceDoctorName && requestedDates.length >= 2) {
+        const sourceDate = resolveDateReference(requestedDates[0], applicationTimezone, now());
+        const targetDate = requestedDateIso;
+        const targetDateReference = requestedDates.at(-1);
+        const targetTimeProvided = requestedTimes.some((reference) => reference.index > targetDateReference.index);
+        const sourceMatchTargetTime = targetTimeProvided ? targetTime : null;
+        const sourcePage = await executeTool({ name: "get_patient_appointments", args: { view: "upcoming", scope: "all", from: sourceDate, to: sourceDate }, actor, database, applicationTimezone, paymentService });
+        const sourceRows = Array.isArray(sourcePage?.appointments) ? sourcePage.appointments : [];
+        const matches = matchingAppointments(sourceRows, currentUserText, requestedTimes, requestedDates, sourceMatchTargetTime, requestedDate)
+          .filter((appointment) => appointment.status === "confirmed");
+        referenceContext.appointments = matches;
+        markReferenceFresh("appointments");
+        referenceContext.pending_action = "reschedule";
+        referenceContext.pending_target_date = targetDate;
+        if (matches.length !== 1 || sourcePage?.has_more === true) {
+          const answer = matches.length > 1
+            ? `I found ${matches.length} confirmed appointments matching Dr. ${sourceDoctorName} on ${sourceDate}. Choose which appointment you want to reschedule.`
+            : "I couldn't verify one confirmed appointment matching that doctor and date. Please provide its exact start time.";
+          return {
+            answer,
+            results: matches.length ? [{ tool: "get_patient_appointments", data: publicToolResult({ appointments: matches }), ui_actions: patientUiActions("get_patient_appointments", { appointments: matches }) }] : [],
+            ...internalState(),
+          };
+        }
+        const appointment = matches[0];
+        referenceContext.pending_appointment_id = appointment.appointment_id || appointment.id;
+        let targetDoctor = appointment.doctor;
+        if (explicitTargetDoctorName && !doctorNameContains(targetDoctor?.name, explicitTargetDoctorName)) {
+          const doctorSearch = await executeTool({ name: "search_doctors", args: { name: explicitTargetDoctorName }, actor, database, applicationTimezone, paymentService });
+          const doctors = Array.isArray(doctorSearch?.doctors) ? doctorSearch.doctors : [];
+          if (doctors.length !== 1) return { answer: doctors.length ? `More than one doctor matches ${explicitTargetDoctorName}. Please choose a doctor by name.` : `I could not find an active doctor matching ${explicitTargetDoctorName}.`, results: [{ tool: "search_doctors", data: publicToolResult(doctorSearch), ui_actions: patientUiActions("search_doctors", doctorSearch) }], ...internalState() };
+          targetDoctor = doctors[0];
+        }
+        if (targetTimeProvided && requestedTime) {
+          const outcome = await prepareForExactTarget("reschedule", targetDoctor, appointment);
+          if (outcome.status === "prepared") {
+            referenceContext.pending_action = undefined;
+            return { answer: preparationReply("reschedule", successfulPreparation.slot), results: publicResults, ...(internalProposalEvidence ? { internalProposalEvidence } : {}), ...internalState() };
+          }
+          if (outcome.status !== "not_applicable") return { answer: outcome.status === "unavailable" ? "That exact target time is no longer available. Please choose another time." : "I couldn't prepare that rescheduling proposal. Please check the target date and time.", results: [], ...internalState() };
+        }
+        const args = { doctor_id: targetDoctor?.id, from: targetDate, to: targetDate };
+        const availability = await executeTool({ name: "get_available_slots", args, actor, database, applicationTimezone, paymentService });
+        referenceContext.slots = Array.isArray(availability?.slots) ? availability.slots : [];
+        referenceContext.slot_query = args;
+        referenceContext.pending_action = referenceContext.slots.length ? "reschedule" : undefined;
+        markReferenceFresh("slots");
+        return {
+          answer: referenceContext.slots.length ? `Here are available times to reschedule your appointment with ${targetDoctor.name} on ${targetDate}. Choose a time to prepare the rescheduling proposal.` : `I couldn't find available times with ${targetDoctor.name} on ${targetDate}. Please choose another date.`,
+          results: [{ tool: "get_available_slots", data: publicToolResult(availability), ui_actions: patientUiActions("get_available_slots", availability) }],
+          ...internalState(),
+        };
+      }
+      const targetDateOnlyDoctorReschedule = actionRequest === "reschedule" && sourceDoctorName
+        && requestedDates.length === 1 && requestedTimes.length === 0
+        && /\bto\s+(?:the\s+)?(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2}\b)/i.test(currentUserText);
+      if (actionRequest === "reschedule" && sourceDoctorName
+          && ((requestedDates.length === 0 && requestedTimes.length === 0) || targetDateOnlyDoctorReschedule)) {
+        const page = await executeTool({ name: "get_patient_appointments", args: { view: "upcoming", scope: "all" }, actor, database, applicationTimezone, paymentService });
+        const matches = (Array.isArray(page?.appointments) ? page.appointments : [])
+          .filter((appointment) => appointment.status === "confirmed" && doctorNameContains(appointment.doctor?.name, sourceDoctorName));
+        referenceContext.appointments = matches;
+        markReferenceFresh("appointments");
+        referenceContext.pending_target_date = targetDateOnlyDoctorReschedule ? requestedDateIso : undefined;
+        referenceContext.pending_action = targetDateOnlyDoctorReschedule && matches.length ? "reschedule" : undefined;
+        referenceContext.pending_appointment_id = matches.length === 1 ? (matches[0].appointment_id || matches[0].id) : undefined;
+        const answer = matches.length
+          ? `I found ${matches.length} confirmed upcoming appointment${matches.length === 1 ? "" : "s"} with Dr. ${sourceDoctorName}. Choose the appointment you want to reschedule${targetDateOnlyDoctorReschedule ? ` to ${requestedDateIso}` : ", then tell me the target date and time"}.`
+          : `I couldn't find a confirmed upcoming appointment with Dr. ${sourceDoctorName}.`;
+        return { answer, results: matches.length ? [{ tool: "get_patient_appointments", data: publicToolResult({ appointments: matches }), ui_actions: patientUiActions("get_patient_appointments", { appointments: matches }) }] : [], ...internalState() };
+      }
       if (actionRequest === "reschedule" && explicitTargetDoctorName) {
         let sourceAppointment = null;
         const selectedReference = contextualReference(currentUserText, referenceContext.appointments, "appointment");
@@ -711,15 +1066,19 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
       const shortSlotMatches = slotChoice(currentUserText, referenceContext.slots);
       const contextualSlotSelection = contextualReference(currentUserText, referenceContext.slots, "slot|availability option");
       const selectedSlots = shortSlotMatches || (contextualSlotSelection?.row ? [contextualSlotSelection.row] : null);
-      if (/^\s*\d{1,2}\s*$/.test(currentUserText) && !selectedSlots?.length) {
+      const isExplicitSlotChoice = /^(?:book|reschedule\s+my\s+appointment\s+to)\s+(?:the\s+)?slot\s+(?:number\s+)?\d{1,2}$/i.test(currentUserText.trim());
+      if ((/^\s*\d{1,2}\s*$/.test(currentUserText) || isExplicitSlotChoice) && !selectedSlots?.length) {
         return { answer: "I don't have a recent displayed slot list to resolve that number against. Please ask me to check current availability again.", results: [], ...internalState() };
       }
-      if (((/^\s*\d{1,2}\s*$/.test(currentUserText) || contextualSlotSelection) && selectedSlots) || contextualSlotSelection?.ambiguous) {
+      if (((/^\s*\d{1,2}\s*$/.test(currentUserText) || isExplicitSlotChoice || contextualSlotSelection) && selectedSlots) || contextualSlotSelection?.ambiguous) {
         if (contextualSlotSelection?.ambiguous || selectedSlots.length > 1) {
           return { answer: "More than one displayed slot could match that choice. Please choose one by its exact displayed time.", results: [], ...internalState() };
         }
         const slot = selectedSlots[0];
-        if (referenceContext.pending_action === "book") {
+        if (referenceContext.pending_action === "book" || (isExplicitSlotChoice && actionRequest === "book" && /^book\s+slot\b/i.test(currentUserText.trim()))) {
+          const existing = await existingConfirmedAppointmentForSlot(slot.doctor_id || slot.doctor?.id, slot.date, slot.start_time);
+          if (existing.appointment) return { answer: alreadyBookedReply(existing.appointment, slot.doctor?.name), results: [], ...internalState() };
+          if (existing.uncertain) return { answer: "I couldn't verify your existing appointments, so I haven't prepared a duplicate booking. Please try again in a moment.", results: [], ...internalState() };
           const args = { availability_id: slot.availability_id || slot.id };
           const proposal = await executeTool({ name: "prepare_booking_action", args, actor, database, applicationTimezone, paymentService });
           if (isSuccessfulProposal("prepare_booking_action", args, proposal)) {
@@ -729,6 +1088,25 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
               answer: preparationReply("book", slot),
               results: [{ tool: "prepare_booking_action", data: publicToolResult(result) }],
               internalProposalEvidence: verifiedProposalEvidence("book", args, actor, null, slot),
+              ...internalState(),
+            };
+          }
+        }
+        if (referenceContext.pending_action === "reschedule") {
+          const appointment = referenceContext.appointments.find((row) => (row.appointment_id || row.id) === referenceContext.pending_appointment_id);
+          if (!appointment || appointment.status !== "confirmed") {
+            return { answer: "I couldn't verify one confirmed appointment to reschedule. Please identify the appointment again before choosing a time.", results: [], ...internalState() };
+          }
+          const args = { appointment_id: appointment.appointment_id || appointment.id, availability_id: slot.availability_id || slot.id };
+          const proposal = await executeTool({ name: "prepare_reschedule_action", args, actor, database, applicationTimezone, paymentService });
+          if (isSuccessfulProposal("prepare_reschedule_action", args, proposal)) {
+            referenceContext.pending_action = undefined;
+            referenceContext.pending_appointment_id = undefined;
+            const result = { ...proposal, persisted_intent_created: false };
+            return {
+              answer: preparationReply("reschedule", slot),
+              results: [{ tool: "prepare_reschedule_action", data: publicToolResult(result) }],
+              internalProposalEvidence: verifiedProposalEvidence("reschedule", args, actor, appointment, slot),
               ...internalState(),
             };
           }
@@ -922,6 +1300,18 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
                   results.push({ name: call.name, id: call.id, result: { error: "First look up and select a specific available slot." } });
                   continue;
                 }
+                if (expectedAction === "book") {
+                  const existing = await existingConfirmedAppointmentForSlot(slot.doctor_id || slot.doctor?.id, slot.date, slot.start_time);
+                  if (existing.appointment) {
+                    exactActionOutcome = "duplicate_booking";
+                    exactActionCandidates = [existing.appointment];
+                    continue;
+                  }
+                  if (existing.uncertain) {
+                    exactActionOutcome = "duplicate_check_incomplete";
+                    continue;
+                  }
+                }
                 const slotSearch = availabilitySources.get(slotId);
                 if (!slotSearch || (requestedTime && !searchMatchesRequestedTarget(slotSearch, requestedTime, requestedDate))) {
                   results.push({ name: call.name, id: call.id, result: { error: "The selected slot does not match the exact date and time requested. Ask the patient to choose or clarify." } });
@@ -1037,6 +1427,14 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
                     exactActionCandidates = matches;
                   }
                 }
+                if (actionRequest === "reschedule") {
+                  const sourceMatches = matchingAppointments(rows, currentUserText, requestedTimes, requestedDates, requestedTime, requestedDate)
+                    .filter((appointment) => appointment.status === "confirmed");
+                  if (sourceMatches.length === 1) referenceContext.pending_appointment_id = sourceMatches[0].appointment_id || sourceMatches[0].id;
+                  else if (rows.filter((appointment) => appointment.status === "confirmed").length === 1 && requestedDates.length === 0 && requestedTimes.length === 0) {
+                    referenceContext.pending_appointment_id = rows.find((appointment) => appointment.status === "confirmed").appointment_id || rows.find((appointment) => appointment.status === "confirmed").id;
+                  }
+                }
                 if (actionRequest === "reschedule" && requestedTime && requestedDateIso) {
                   const matches = matchingAppointments(rows, currentUserText, requestedTimes, requestedDates, requestedTime, requestedDate);
                   if (matches.length !== 1) {
@@ -1080,6 +1478,13 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
                 const exactMatches = exactRequest ? result.slots.filter((slot) => slot.date === source.args.from
                   && String(slot.start_time).slice(0, 5) === requestedTime
                   && (!requestedEndTime || String(slot.end_time).slice(0, 5) === requestedEndTime)) : [];
+                if (exactRequest && actionRequest === "book" && exactMatches.length === 0 && call.arguments.doctor_id) {
+                  const existing = await existingConfirmedAppointmentForSlot(call.arguments.doctor_id, requestedDateIso, requestedTime);
+                  if (existing.appointment) {
+                    exactActionOutcome = "duplicate_booking";
+                    exactActionCandidates = [existing.appointment];
+                  } else if (existing.uncertain) exactActionOutcome = "duplicate_check_incomplete";
+                }
                 if (exactMatches.length === 1 && (exactMatches[0].availability_id || exactMatches[0].id)) {
                   const selectedSlot = exactMatches[0];
                   let prepareArgs;
@@ -1166,7 +1571,11 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
             }
           }
           if (exactActionOutcome) {
-            const answer = exactActionOutcome === "unavailable"
+            const answer = exactActionOutcome === "duplicate_booking"
+              ? alreadyBookedReply(exactActionCandidates[0], exactActionCandidates[0]?.doctor?.name)
+              : exactActionOutcome === "duplicate_check_incomplete"
+                ? "I couldn't verify your existing appointments, so I haven't prepared a duplicate booking. Please try again in a moment."
+              : exactActionOutcome === "unavailable"
               ? "That exact date and time is not available. Please choose another time."
               : exactActionOutcome === "ambiguous_slot"
                 ? "More than one slot matches that exact date and time. Please clarify which option you want."

@@ -189,6 +189,30 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
     };
   }
 
+  if (name === "get_patient_payment_history") {
+    if (actor?.role !== "patient" || !paymentService?.getPaymentHistory) throw Object.assign(new Error("Payment history is unavailable"), { code: "TOOL_UNAVAILABLE" });
+    const page = await paymentService.getPaymentHistory(actor, { limit: input.limit, offset: input.offset });
+    return {
+      items: (page.items || []).map((payment) => ({
+        amount: payment.amount,
+        currency: payment.currency,
+        status: payment.status,
+        date: payment.date,
+        appointment: payment.appointment ? {
+          status: payment.appointment.status,
+          date: payment.appointment.date,
+          start_time: payment.appointment.start_time,
+          doctor: payment.appointment.doctor ? {
+            name: `Dr. ${payment.appointment.doctor.first_name} ${payment.appointment.doctor.last_name}`.trim(),
+            specialty: payment.appointment.doctor.specialty,
+          } : null,
+        } : null,
+        refunds: (payment.refunds || []).map((refund) => ({ amount: refund.amount, currency: refund.currency, status: refund.status, reason: refund.reason, created_at: refund.created_at, processed_at: refund.processed_at })),
+      })),
+      has_more: page.has_more,
+    };
+  }
+
   const proposalTypes = {
     prepare_booking_action: "book",
     prepare_reschedule_action: "reschedule",
@@ -221,7 +245,7 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
   }
 
   if (name === "search_doctors") {
-    const normalizedName = input.name?.replace(/^\s*Dr\.?\s+/i, "").trim();
+    const normalizedName = input.name?.replace(/^\s*Dr\.?\s*/i, "").trim();
     const matches = await doctorService.listDoctors(database, { name: normalizedName || input.name, specialty: input.specialty, limit: 10 });
     const doctors = matches.map(({ id, first_name, last_name, specialty, consultation_fee, appointment_duration_minutes }) => ({
       id, name: `Dr. ${first_name} ${last_name}`.trim(), specialty, consultation_fee, appointment_duration_minutes,
@@ -242,6 +266,20 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
     if ((response.statusCode || 200) >= 400) throw Object.assign(new Error("Availability could not be loaded"), { code: "TOOL_QUERY_FAILED" });
     let rows = (response.body || []).filter((row) => Number(row.remaining_capacity) > 0);
     if (input.exact_start_time) rows = rows.filter((row) => String(row.start_time).slice(0, 5) === input.exact_start_time);
+    if (actor?.role === "patient" && rows.length) {
+      const dates = rows.map(({ date }) => date).filter(Boolean).sort();
+      if (dates.length) {
+        const bookedAppointments = await appointmentService.listAppointments(database, actor, {
+          view: "upcoming",
+          from: dates[0],
+          to: dates.at(-1),
+        }, applicationTimezone || "Asia/Kolkata");
+        rows = rows.filter((slot) => !bookedAppointments.some((appointment) => appointment.status === "confirmed"
+          && appointment.doctor_id === slot.doctor_id
+          && appointment.date === slot.date
+          && String(appointment.start_time).slice(0, 5) === String(slot.start_time).slice(0, 5)));
+      }
+    }
     return { slots: rows.slice(0, input.exact_start_time ? 2 : slotLimit).map(({ id, date, start_time, end_time, doctor_id, doctor_first_name, doctor_last_name, specialty, consultation_fee, mode, capacity, remaining_capacity }) => ({
       id, availability_id: id, date, start_time, end_time, doctor_id, doctor: { id: doctor_id, name: `Dr. ${doctor_first_name} ${doctor_last_name}`.trim() }, specialty, consultation_fee, mode: mode || "legacy", capacity, remaining_capacity,
     })) };

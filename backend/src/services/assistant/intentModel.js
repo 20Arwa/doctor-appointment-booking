@@ -1,7 +1,7 @@
 const { z } = require("zod");
 
 const canonicalIntentSchema = z.object({
-  category: z.enum(["doctor_search", "availability", "booking", "rescheduling", "cancellation", "refund_preview", "appointment_history", "unknown"]),
+  category: z.enum(["doctor_search", "availability", "booking", "rescheduling", "cancellation", "payment_history", "refund_preview", "appointment_history", "unknown"]),
   historyScope: z.enum(["next_upcoming", "all_upcoming", "past", "last", "last_completed", "cancelled"]).nullable(),
   historyQuery: z.object({
     view: z.enum(["upcoming", "past", "cancelled"]),
@@ -51,6 +51,8 @@ function recognizeCanonicalIntent(text, timeZone = "Asia/Kolkata", nowValue = Da
   const value = String(text || "");
   const historyQuery = recognizeAppointmentHistory(value, timeZone, nowValue);
   const refundRequest = /\b(?:refund|refunded|reimburse|reimbursement|money back)\b/i.test(value);
+  const paymentHistoryRequest = /\b(?:payment|payments|transaction|transactions)\b/i.test(value)
+    && /\b(?:history|status|records?|list|show|display)\b/i.test(value);
   const cancelledHistory = historyQuery?.view === "cancelled";
   const cancellationRequest = isCancellationRequest(value);
   const reschedulingRequest = /\b(?:reschedule|move|change)\b/i.test(value)
@@ -59,7 +61,8 @@ function recognizeCanonicalIntent(text, timeZone = "Asia/Kolkata", nowValue = Da
     && (/\b(?:appointment|doctor|slot|time)\b/i.test(value) || /\bDr\.?\s+/i.test(value));
   // Mixed requests are routed safely: refund questions are always read-only,
   // cancelled-history wording remains history, and mutations precede generic history.
-  const category = refundRequest ? "refund_preview"
+  const category = paymentHistoryRequest ? "payment_history"
+      : refundRequest ? "refund_preview"
       : cancelledHistory ? "appointment_history"
         : cancellationRequest ? "cancellation"
           : reschedulingRequest ? "rescheduling"

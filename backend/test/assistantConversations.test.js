@@ -23,7 +23,7 @@ function memoryDatabase(ownerId = user.id) {
       state.userMessage = { id: "44444444-4444-4444-8444-444444444444", role: "user", content: values[1], request_id: values[2], request_status: "processing", updated_at: new Date() };
       return { rows: [state.userMessage] };
     }
-    if (sql.includes("SELECT role, content, tool_results FROM assistant_messages")) return { rows: state.priorAssistantMessages };
+    if (sql.includes("SELECT id, role, content, tool_results FROM assistant_messages")) return { rows: state.priorAssistantMessages };
     if (sql.includes("INSERT INTO assistant_messages (conversation_id, role, content, reply_to_message_id, tool_results)")) {
       state.assistantInsertCount += 1;
       state.assistantMessage = { id: "55555555-5555-4555-8555-555555555555", role: "assistant", content: values[1], tool_results: JSON.parse(values[3]), created_at: new Date() };
@@ -166,6 +166,34 @@ describe("assistant conversation persistence", () => {
     assert.deepEqual(messageView(database.state.assistantMessage).results, []);
   });
 
+  it("routes a patient cancellation rejection through the existing proposal dismissal API", async () => {
+    const assistantMessageId = "66666666-6666-4666-8666-666666666666";
+    const appointmentId = "77777777-7777-4777-8777-777777777777";
+    const database = memoryDatabase();
+    database.state.priorAssistantMessages = [{
+      id: assistantMessageId,
+      role: "assistant",
+      content: "Cancellation proposal",
+      tool_results: [
+        { tool: "__internal_action_context", data: { action_type: "cancel", appointment_id: appointmentId } },
+        { tool: "__internal_action_context", data: { proposal_evidence: { proposal_succeeded: true, requires_patient_confirmation: true, action_type: "cancel" } } },
+      ],
+    }];
+    const dismissals = [];
+    const actionService = { dismiss: async (...args) => { dismissals.push(args); return { status: "dismissed" }; } };
+    const service = createAssistantConversationService({
+      actionService,
+      engine: { respond: async ({ previousActionContext, previousProposal }) => {
+        assert.deepEqual(previousActionContext, { action_type: "cancel", appointment_id: appointmentId });
+        assert.deepEqual(previousProposal, { assistant_message_id: assistantMessageId, action_type: "cancel" });
+        return { answer: "Understood. I dismissed the cancellation proposal and won't prepare it again.", results: [], dismissProposal: previousProposal };
+      } },
+    });
+    const result = await service.send({ database, user, conversationId, requestId, content: "Don't cancel it" });
+    assert.deepEqual(dismissals, [[user, conversationId, assistantMessageId, "cancel"]]);
+    assert.match(result.assistant_message.content, /dismissed the cancellation proposal/i);
+  });
+
   it("persists server-verified proposal evidence privately bound to the owner, conversation, and assistant message", async () => {
     const database = memoryDatabase();
     const availabilityId = "88888888-8888-4888-8888-888888888888";
@@ -202,12 +230,13 @@ describe("assistant conversation persistence", () => {
     assert.equal(messageView(database.state.assistantMessage).results.some((result) => result?.data?.proposal_evidence), false);
   });
 
-  it("persists a short-lived cancellation clarification and resolves the patient's next-turn appointment", async () => {
+  it("persists partial cancellation details across turns and resolves the patient's appointment", async () => {
     const fixedNow = Date.parse("2026-11-15T00:00:00.000Z");
     const database = memoryDatabase();
     const appointmentId = "77777777-7777-4777-8777-777777777777";
     const doctorId = "66666666-6666-4666-8666-666666666666";
     const appointment = { id: appointmentId, appointment_id: appointmentId, date: "2027-01-20", start_time: "11:00:00", end_time: "11:30:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Example Provider" } };
+    const otherSameDayAppointment = { ...appointment, id: "88888888-8888-4888-8888-888888888888", appointment_id: "88888888-8888-4888-8888-888888888888", start_time: "12:00:00", end_time: "12:30:00" };
     const calls = [];
     const engineContexts = [];
     const engineUserTexts = [];
@@ -216,7 +245,7 @@ describe("assistant conversation persistence", () => {
       provider: { generate: async () => { throw new Error("a pending cancellation clarification should route before Gemini"); } },
       toolExecutor: async ({ name, args }) => {
         calls.push({ name, args });
-        if (name === "get_patient_appointments") return { appointments: [appointment], has_more: false };
+        if (name === "get_patient_appointments") return { appointments: [appointment, otherSameDayAppointment], has_more: false };
         return { proposal: { action_type: "cancel", action_args: args }, requires_patient_confirmation: true };
       },
     });
@@ -237,15 +266,31 @@ describe("assistant conversation persistence", () => {
     database.state.priorAssistantMessages = [database.state.assistantMessage];
     database.state.userMessage = null;
     database.state.assistantMessage = null;
-    const followup = await service.send({
+    const dateClarification = await service.send({
       database, user, conversationId,
       requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      content: `Dr Example Provider on 20 January 2027 at 11:00 AM`,
+      content: "2027-01-20",
     });
-    assert.deepEqual(engineContexts, [null, { action_type: "cancel_pending", expires_at: new Date(fixedNow + 5 * 60 * 1000).toISOString() }]);
-    assert.equal(engineUserTexts[1], "Dr Example Provider on 20 January 2027 at 11:00 AM");
-    assert.deepEqual(calls.map(({ name }) => name), ["get_patient_appointments", "prepare_cancellation_action"]);
-    assert.deepEqual(calls[1].args, { appointment_id: appointmentId });
+    assert.match(dateClarification.assistant_message.content, /multiple matching appointments/i);
+    const dateContext = database.state.assistantMessage.tool_results.at(-1).data;
+    assert.equal(dateContext.date, "2027-01-20");
+
+    database.state.priorAssistantMessages = [...database.state.priorAssistantMessages, database.state.assistantMessage];
+    database.state.userMessage = null;
+    database.state.assistantMessage = null;
+    const followup = await service.send({
+      database, user, conversationId,
+      requestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      content: "Dr Example Provider at 11:00 AM",
+    });
+    assert.deepEqual(engineContexts, [
+      null,
+      { action_type: "cancel_pending", expires_at: new Date(fixedNow + 5 * 60 * 1000).toISOString() },
+      { action_type: "cancel_pending", expires_at: new Date(fixedNow + 5 * 60 * 1000).toISOString(), date: "2027-01-20" },
+    ]);
+    assert.equal(engineUserTexts[2], "Dr Example Provider at 11:00 AM");
+    assert.deepEqual(calls.map(({ name }) => name), ["get_patient_appointments", "get_patient_appointments", "prepare_cancellation_action"]);
+    assert.deepEqual(calls[2].args, { appointment_id: appointmentId });
     assert.match(followup.assistant_message.content, /cancellation proposal.*2027-01-20 at 11:00.*11:30/i);
     const cancellationContext = database.state.assistantMessage.tool_results.find((result) => result?.data?.action_type === "cancel").data;
     assert.equal(cancellationContext.action_type, "cancel");
@@ -262,7 +307,7 @@ describe("assistant conversation persistence", () => {
     const firstDatabase = memoryDatabase();
     const firstService = createAssistantConversationService({ engine: { respond: async () => ({
       answer: "Available times are shown.", results: [{ tool: "get_available_slots", data: { slots: [{ start_time: "11:00:00" }] } }],
-      internalReferences: { version: 1, reference_timestamps: { appointments: "2026-11-15T00:00:00.000Z", slots: "2026-11-15T00:00:00.000Z", doctors: "2026-11-15T00:00:00.000Z" }, appointments: [{ id: appointmentId, appointment_id: appointmentId, date: "2027-01-07", start_time: "09:00:00", end_time: "09:30:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } }], slots: [{ id: availabilityId, availability_id: availabilityId, date: "2027-01-07", start_time: "11:00:00", end_time: "11:30:00" }], doctors: [{ id: doctorId, name: "Dr. Ada Morgan", specialty: "Cardiology" }], pending_action: "book", history_page: { query: { view: "past", scope: "all", from: "2026-11-02", to: "2026-11-08" }, next_offset: 1200, has_more: true, seen_appointment_ids: [appointmentId] } },
+      internalReferences: { version: 1, reference_timestamps: { appointments: "2026-11-15T00:00:00.000Z", slots: "2026-11-15T00:00:00.000Z", doctors: "2026-11-15T00:00:00.000Z" }, appointments: [{ id: appointmentId, appointment_id: appointmentId, date: "2027-01-07", start_time: "09:00:00", end_time: "09:30:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } }], slots: [{ id: availabilityId, availability_id: availabilityId, date: "2027-01-07", start_time: "11:00:00", end_time: "11:30:00" }], doctors: [{ id: doctorId, name: "Dr. Ada Morgan", specialty: "Cardiology" }], pending_action: "reschedule", pending_appointment_id: appointmentId, pending_target_date: "2027-01-09", history_page: { query: { view: "past", scope: "all", from: "2026-11-02", to: "2026-11-08" }, next_offset: 1200, has_more: true, seen_appointment_ids: [appointmentId] } },
     }) } });
     await firstService.send({ database: firstDatabase, user, conversationId, requestId, content: "Show available times" });
     const privateResult = firstDatabase.state.assistantMessage.tool_results.find(({ tool }) => tool === "__internal_action_context");
@@ -282,9 +327,42 @@ describe("assistant conversation persistence", () => {
     } } });
     await secondService.send({ database: secondDatabase, user, conversationId, requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", content: "11" });
     assert.equal(forwardedReferences.slots[0].availability_id, availabilityId);
+    assert.equal(forwardedReferences.pending_action, "reschedule");
+    assert.equal(forwardedReferences.pending_appointment_id, appointmentId);
+    assert.equal(forwardedReferences.pending_target_date, "2027-01-09");
     assert.equal(forwardedReferences.appointments[0].appointment_id, appointmentId);
     assert.equal(forwardedReferences.doctors[0].name, "Dr. Ada Morgan");
     assert.equal(forwardedReferences.history_page.next_offset, 1200);
+  });
+
+  it("retains private numbered cancellation choices across clarification turns after reference freshness expires", async () => {
+    const nowValue = Date.parse("2026-11-15T00:00:00.000Z");
+    const appointmentId = "77777777-7777-4777-8777-777777777777";
+    const doctorId = "66666666-6666-4666-8666-666666666666";
+    const database = memoryDatabase();
+    const firstService = createAssistantConversationService({ now: () => nowValue, engine: { respond: async () => ({
+      answer: "Choose an appointment to cancel.", results: [],
+      internalReferences: { version: 1, pending_action: "cancel", reference_timestamps: { appointments: new Date(nowValue - 10 * 60 * 1000).toISOString() }, cancellation_choices_at: new Date(nowValue - 10 * 60 * 1000).toISOString(), cancellation_choices: [{ id: appointmentId, appointment_id: appointmentId, date: "2027-01-20", start_time: "11:00:00", end_time: "11:30:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } }], appointments: [{ id: appointmentId, appointment_id: appointmentId, date: "2027-01-20", start_time: "11:00:00", end_time: "11:30:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } }], slots: [], doctors: [] },
+    }) } });
+    await firstService.send({ database, user, conversationId, requestId, content: "Cancel the second appointment" });
+    const privateResults = database.state.assistantMessage.tool_results.find(({ tool }) => tool === "__internal_action_context");
+    assert.equal(privateResults.data.references.pending_action, "cancel");
+    assert.equal(privateResults.data.references.appointments[0].appointment_id, appointmentId);
+    assert.equal(privateResults.data.references.cancellation_choices[0].appointment_id, appointmentId);
+    assert.equal(privateResults.data.references.cancellation_choices_at, new Date(nowValue - 10 * 60 * 1000).toISOString());
+    assert.equal(JSON.stringify(messageView(database.state.assistantMessage)).includes(appointmentId), false);
+
+    const nextDatabase = memoryDatabase();
+    nextDatabase.state.priorAssistantMessages = [{ role: "assistant", content: "Choose an appointment to cancel.", tool_results: database.state.assistantMessage.tool_results }];
+    let forwarded;
+    const nextService = createAssistantConversationService({ now: () => nowValue + 11 * 60 * 1000, engine: { respond: async ({ previousReferences }) => {
+      forwarded = previousReferences;
+      return { answer: "Please choose from a refreshed list.", results: [], internalReferences: previousReferences };
+    } } });
+    await nextService.send({ database: nextDatabase, user, conversationId, requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", content: "Thanks" });
+    assert.equal(forwarded.pending_action, "cancel");
+    assert.equal(forwarded.appointments[0].appointment_id, appointmentId);
+    assert.equal(forwarded.cancellation_choices[0].appointment_id, appointmentId);
   });
 
   it("supersedes cancellation context when a newer patient-owned appointment becomes the active reference", async () => {

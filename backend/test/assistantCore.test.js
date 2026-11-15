@@ -40,7 +40,7 @@ describe("patient assistant tools", () => {
       },
     });
     const response = await engine.respond({ actor: user, messages: [{ role: "user", content: "Book an appointment with Dr. Dee Doctor on 2027-02-06 at 11:00 AM" }] });
-    assert.equal(providerCalled, true);
+    assert.equal(providerCalled, false);
     assert.equal(calls.at(-1).name, "prepare_booking_action");
     assert.equal(calls.at(-1).args.availability_id, slotId);
     assert.match(response.answer, /booking proposal/i);
@@ -97,7 +97,7 @@ describe("patient assistant tools", () => {
   });
 
   it("registers role-specific assistant tools and validates bounded patient date ranges", () => {
-    assert.equal(getToolsForActor(user).length, 7);
+    assert.equal(getToolsForActor(user).length, 8);
     assert.match(getPolicyForActor(user), /Never guess or invent records/);
     assert.equal(getToolsForActor({ ...user, role: "doctor" }).length, 6);
     assert.match(getPolicyForActor({ ...user, role: "doctor" }), /Never book, cancel, reschedule/);
@@ -122,6 +122,399 @@ describe("patient assistant tools", () => {
     assert.deepEqual(calledWith, [user, appointmentId]);
     assert.deepEqual(output, { original_payment: { amount: "500.00", currency: "INR", status: "partially_refunded" }, processed_refund_amount: "100.00", pending_refund_amount: "50.00", estimated_additional_refund_amount: "100.00", currency: "INR", refund_expected: true, explanation: "Estimate" });
     assert.doesNotMatch(JSON.stringify(output), /secret|provider_response/i);
+  });
+
+  it("exposes patient payment and refund history without provider references or receipt URLs", async () => {
+    let calledWith;
+    const output = await executeTool({
+      name: "get_patient_payment_history", args: { limit: 5, offset: 10 }, actor: user, database: {},
+      paymentService: { async getPaymentHistory(...args) {
+        calledWith = args;
+        return { items: [{ id: "payment-secret", amount: "500.00", currency: "INR", status: "partially_refunded", date: "2027-01-01", receipt_url: "https://private.test", provider_payment_id: "secret", appointment: { id: "appointment-secret", status: "confirmed", date: "2027-01-02", start_time: "10:00", doctor: { id: "doctor-secret", first_name: "Dee", last_name: "Doctor", specialty: "Cardiology" } }, refunds: [{ id: "refund-secret", payment_id: "payment-secret", amount: "100.00", currency: "INR", status: "processed", reason: "appointment_cancelled", created_at: "2027-01-03", processed_at: "2027-01-04" }] }], has_more: false };
+      } },
+    });
+    assert.deepEqual(calledWith, [user, { limit: 5, offset: 10 }]);
+    assert.deepEqual(output.items[0], { amount: "500.00", currency: "INR", status: "partially_refunded", date: "2027-01-01", appointment: { status: "confirmed", date: "2027-01-02", start_time: "10:00", doctor: { name: "Dr. Dee Doctor", specialty: "Cardiology" } }, refunds: [{ amount: "100.00", currency: "INR", status: "processed", reason: "appointment_cancelled", created_at: "2027-01-03", processed_at: "2027-01-04" }] });
+    assert.doesNotMatch(JSON.stringify(output), /secret|receipt_url|provider_payment_id/);
+  });
+
+  it("routes payment-history questions to payment history without asking for an appointment", async () => {
+    const calls = [];
+    const engine = createConversationEngine({
+      provider: { generate: async () => { throw new Error("payment history is routed deterministically"); } },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        return { items: [{ amount: "500.00", currency: "INR", status: "captured", date: "2027-01-01", refunds: [] }], has_more: false };
+      },
+    });
+    const response = await engine.respond({ actor: user, messages: [{ role: "user", content: "Show my payment history" }] });
+    assert.deepEqual(calls, [{ name: "get_patient_payment_history", args: {} }]);
+    assert.deepEqual(response.results.map(({ tool }) => tool), ["get_patient_payment_history"]);
+    assert.match(response.answer, /payment and refund records/i);
+  });
+
+  it("shows date-specific booking slots and prepares the selected slot as a booking proposal", async () => {
+    const date = "2099-08-11";
+    const slotId = "88888888-8888-4888-8888-888888888888";
+    const doctor = { id: doctorId, name: "Dr. Ada Morgan", specialty: "Cardiology" };
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("date-only booking and its slot selection are deterministic"); } },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        if (name === "search_doctors") return { doctors: [doctor] };
+        if (name === "get_available_slots") return { slots: [{ id: slotId, availability_id: slotId, doctor_id: doctorId, date, start_time: "14:30:00", end_time: "15:00:00", doctor }] };
+        return { proposal: { action_type: "book", action_args: args }, requires_patient_confirmation: true };
+      },
+    });
+    const first = await engine.respond({ actor: user, messages: [{ role: "user", content: `Book an appointment with Dr. Ada Morgan on ${date}` }] });
+    assert.deepEqual(calls.map(({ name }) => name), ["search_doctors", "get_available_slots"]);
+    assert.equal(first.results[0].tool, "get_available_slots");
+    assert.equal(first.internalReferences.pending_action, "book");
+    const selected = await engine.respond({
+      actor: user, previousReferences: { ...first.internalReferences, pending_action: undefined },
+      messages: [{ role: "user", content: `Book an appointment with Dr. Ada Morgan on ${date}` }, { role: "assistant", content: first.answer }, { role: "user", content: "Book slot 1" }],
+    });
+    assert.deepEqual(calls.map(({ name }) => name), ["search_doctors", "get_available_slots", "get_patient_appointments", "prepare_booking_action"]);
+    assert.equal(calls[3].args.availability_id, slotId);
+    assert.equal(selected.results[0].tool, "prepare_booking_action");
+    assert.match(selected.answer, /booking proposal/i);
+  });
+
+  it("reports an existing confirmed appointment instead of preparing a duplicate booking", async () => {
+    const doctor = { id: doctorId, name: "Dr. Ada Morgan" };
+    const appointment = { appointment_id: "77777777-7777-4777-8777-777777777777", date: "2099-08-11", start_time: "14:30:00", status: "confirmed", doctor };
+    const calls = [];
+    const engine = createConversationEngine({
+      provider: { generate: async () => { throw new Error("duplicate booking should be caught before proposal creation"); } },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        if (name === "search_doctors") return { doctors: [doctor] };
+        if (name === "get_patient_appointments") return { appointments: [appointment], has_more: false };
+        throw new Error(`Unexpected tool: ${name}`);
+      },
+    });
+    const response = await engine.respond({ actor: user, messages: [{ role: "user", content: "Book an appointment with Dr. Ada Morgan on 2099-08-11 at 2:30 PM" }] });
+    assert.deepEqual(calls.map(({ name }) => name), ["search_doctors", "get_patient_appointments"]);
+    assert.match(response.answer, /already have a confirmed appointment.*2099-08-11 at 14:30/i);
+    assert.deepEqual(response.results, []);
+  });
+
+  it("prepares a selected rescheduling option with the original appointment instead of a booking proposal", async () => {
+    const appointmentId = "99999999-9999-4999-8999-999999999999";
+    const slotId = "88888888-8888-4888-8888-888888888888";
+    const appointment = { id: appointmentId, appointment_id: appointmentId, date: "2099-08-10", start_time: "09:00:00", end_time: "09:30:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } };
+    const slot = { id: slotId, availability_id: slotId, doctor_id: doctorId, date: "2099-08-12", start_time: "10:00:00", end_time: "10:30:00", doctor: appointment.doctor };
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("reschedule selection is deterministic"); } },
+      toolExecutor: async ({ name, args }) => { calls.push({ name, args }); return { proposal: { action_type: "reschedule", action_args: args }, requires_patient_confirmation: true }; },
+    });
+    const response = await engine.respond({
+      actor: user,
+      previousReferences: {
+        version: 1,
+        reference_timestamps: { appointments: "2026-11-15T00:00:00.000Z", slots: "2026-11-15T00:00:00.000Z" },
+        appointments: [appointment], slots: [slot], doctors: [], slot_query: { doctor_id: doctorId },
+        pending_action: "reschedule", pending_appointment_id: appointmentId,
+      },
+      messages: [{ role: "user", content: "Reschedule my appointment and show me options" }, { role: "assistant", content: "Here are rescheduling options." }, { role: "user", content: "Reschedule my appointment to slot 1" }],
+    });
+    assert.deepEqual(calls, [{ name: "prepare_reschedule_action", args: { appointment_id: appointmentId, availability_id: slotId } }]);
+    assert.equal(response.results[0].tool, "prepare_reschedule_action");
+    assert.match(response.answer, /rescheduling proposal/i);
+  });
+
+  it("finds the owned source appointment from its doctor and date, then offers target-date reschedule slots", async () => {
+    const appointmentId = "77777777-7777-4777-8777-777777777777";
+    const slotId = "88888888-8888-4888-8888-888888888888";
+    const sourceDate = "2099-08-10";
+    const targetDate = "2099-08-12";
+    const doctor = { id: doctorId, name: "Dr. Ada Morgan", specialty: "Cardiology" };
+    const appointment = { id: appointmentId, appointment_id: appointmentId, date: sourceDate, start_time: "09:00:00", end_time: "09:30:00", status: "confirmed", doctor };
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("reschedule targeting should be deterministic"); } },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        if (name === "get_patient_appointments") return { appointments: [appointment], has_more: false };
+        if (name === "get_available_slots") return { slots: [{ id: slotId, availability_id: slotId, doctor_id: doctorId, date: targetDate, start_time: "10:00:00", end_time: "10:30:00", doctor }] };
+        return { proposal: { action_type: "reschedule", action_args: args }, requires_patient_confirmation: true };
+      },
+    });
+    const first = await engine.respond({ actor: user, messages: [{ role: "user", content: `Reschedule my appointment with Dr. Ada Morgan on ${sourceDate} at 9:00 AM to ${targetDate}` }] });
+    assert.deepEqual(calls.map(({ name }) => name), ["get_patient_appointments", "get_available_slots"]);
+    assert.deepEqual(calls[0].args, { view: "upcoming", scope: "all", from: sourceDate, to: sourceDate });
+    assert.deepEqual(calls[1].args, { doctor_id: doctorId, from: targetDate, to: targetDate });
+    assert.equal(first.internalReferences.pending_action, "reschedule");
+    assert.equal(first.internalReferences.pending_appointment_id, appointmentId);
+    const selected = await engine.respond({
+      actor: user, previousReferences: first.internalReferences,
+      messages: [{ role: "user", content: `Reschedule my appointment with Dr. Ada Morgan on ${sourceDate} at 9:00 AM to ${targetDate}` }, { role: "assistant", content: first.answer }, { role: "user", content: "Reschedule my appointment to slot 1" }],
+    });
+    assert.deepEqual(calls.at(-1), { name: "prepare_reschedule_action", args: { appointment_id: appointmentId, availability_id: slotId } });
+    assert.equal(selected.results[0].tool, "prepare_reschedule_action");
+  });
+
+  it("cancels a unique doctor-and-date match without requiring a start time", async () => {
+    const appointmentId = "77777777-7777-4777-8777-777777777777";
+    const date = "2099-08-10";
+    const appointment = { id: appointmentId, appointment_id: appointmentId, date, start_time: "09:00:00", end_time: "09:30:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } };
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("doctor and date cancellation should be deterministic"); } },
+      toolExecutor: async ({ name, args }) => { calls.push({ name, args }); return name === "get_patient_appointments" ? { appointments: [appointment], has_more: false } : { proposal: { action_type: "cancel", action_args: args }, requires_patient_confirmation: true }; },
+    });
+    const response = await engine.respond({ actor: user, messages: [{ role: "user", content: `Cancel my appointment with Dr. Ada Morgan on ${date}` }] });
+    assert.deepEqual(calls.map(({ name }) => name), ["get_patient_appointments", "prepare_cancellation_action"]);
+    assert.deepEqual(calls[0].args, { view: "upcoming", scope: "all", from: date, to: date });
+    assert.deepEqual(calls[1].args, { appointment_id: appointmentId });
+    assert.equal(response.results[0].tool, "prepare_cancellation_action");
+  });
+
+  it("reports a no-match cancellation when the supplied doctor, date, and time do not identify an appointment", async () => {
+    const date = "2099-08-10";
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("fully specified cancellation lookup should be deterministic"); } },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        return name === "get_patient_appointments" ? { appointments: [
+          { id: "77777777-7777-4777-8777-777777777777", date, start_time: "10:00:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } },
+          { id: "88888888-8888-4888-8888-888888888888", date, start_time: "09:00:00", status: "confirmed", doctor: { id: "66666666-6666-4666-8666-666666666666", name: "Dr. Bea Stone" } },
+        ], has_more: false } : { proposal: { action_type: "cancel", action_args: args }, requires_patient_confirmation: true };
+      },
+    });
+    const result = await engine.respond({ actor: user, messages: [{ role: "user", content: `Cancel my appointment with Dr. Ada Morgan on ${date} at 9:00 AM` }] });
+    assert.deepEqual(calls.map(({ name }) => name), ["get_patient_appointments"]);
+    assert.match(result.answer, /couldn't find a confirmed appointment matching Dr\. Ada Morgan on 2099-08-10 at 09:00/i);
+    assert.deepEqual(result.results, []);
+  });
+
+  it("lists only confirmed appointments with the named doctor when rescheduling lacks source date and time", async () => {
+    const adaAppointment = { id: "77777777-7777-4777-8777-777777777777", date: "2099-08-10", start_time: "09:00:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } };
+    const calls = [];
+    const engine = createConversationEngine({
+      provider: { generate: async () => { throw new Error("doctor-scoped source appointments should be listed deterministically"); } },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        return { appointments: [adaAppointment,
+          { id: "88888888-8888-4888-8888-888888888888", date: "2099-08-11", start_time: "10:00:00", status: "confirmed", doctor: { id: "66666666-6666-4666-8666-666666666666", name: "Dr. Bea Stone" } },
+          { id: "99999999-9999-4999-8999-999999999999", date: "2099-08-12", start_time: "11:00:00", status: "cancelled", doctor: { id: doctorId, name: "Dr. Ada Morgan" } },
+        ], has_more: false };
+      },
+    });
+    const result = await engine.respond({ actor: user, messages: [{ role: "user", content: "Reschedule my appointment with Dr. Ada Morgan" }] });
+    assert.deepEqual(calls, [{ name: "get_patient_appointments", args: { view: "upcoming", scope: "all" } }]);
+    assert.match(result.answer, /1 confirmed upcoming appointment with Dr\. Ada Morgan/i);
+    assert.equal(result.results[0].data.appointments.length, 1);
+    assert.equal(result.results[0].data.appointments[0].date, adaAppointment.date);
+  });
+
+  it("returns only fresh doctor-matched rescheduling choices when a target date is supplied", async () => {
+    const james = { id: "77777777-7777-4777-8777-777777777777", date: "2027-01-10", start_time: "09:00:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. James Wilson" } };
+    const ali = { id: "88888888-8888-4888-8888-888888888888", date: "2027-01-12", start_time: "10:00:00", status: "confirmed", doctor: { id: "66666666-6666-4666-8666-666666666666", name: "Dr. Ali Ahmed" } };
+    const cancelledJames = { id: "99999999-9999-4999-8999-999999999999", date: "2027-01-13", start_time: "11:00:00", status: "cancelled", doctor: james.doctor };
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("doctor-scoped reschedule lookup should be deterministic"); } },
+      toolExecutor: async ({ name, args }) => { calls.push({ name, args }); return { appointments: [james, ali, cancelledJames], has_more: false }; },
+    });
+    const response = await engine.respond({
+      actor: user,
+      previousReferences: { version: 1, appointments: [ali], reference_timestamps: { appointments: "2026-11-15T00:00:00.000Z" } },
+      messages: [{ role: "user", content: "Reschedule my appointment with Dr. James Wilson to January 24, 2027." }],
+    });
+    assert.deepEqual(calls, [{ name: "get_patient_appointments", args: { view: "upcoming", scope: "all" } }]);
+    assert.match(response.answer, /confirmed upcoming appointment.*Dr\. James Wilson.*2027-01-24/i);
+    assert.equal(response.results[0].tool, "get_patient_appointments");
+    assert.deepEqual(response.results[0].data.appointments.map(({ date, status, doctor }) => ({ date, status, doctor: doctor.name })), [{ date: james.date, status: james.status, doctor: "Dr. James Wilson" }]);
+    assert.equal(response.results[0].ui_actions.length, 1);
+    assert.deepEqual(response.internalReferences.appointments.map(({ id }) => id), [james.id]);
+    assert.equal(response.internalReferences.pending_target_date, "2027-01-24");
+  });
+
+  it("resolves an abbreviated doctor name and checks exact booking availability before offering alternatives", async () => {
+    const doctor = { id: doctorId, name: "Dr. James Wilson", specialty: "Cardiology" };
+    const alternative = { id: "88888888-8888-4888-8888-888888888888", availability_id: "88888888-8888-4888-8888-888888888888", doctor_id: doctorId, date: "2099-08-10", start_time: "10:00:00", end_time: "10:30:00", doctor };
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("abbreviated named booking should be deterministic"); } },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        if (name === "search_doctors") return { doctors: [doctor] };
+        if (name === "get_available_slots") return args.exact_start_time ? { slots: [] } : { slots: [alternative] };
+        if (name === "get_patient_appointments") return { appointments: [], has_more: false };
+        throw new Error(`Unexpected tool: ${name}`);
+      },
+    });
+    const result = await engine.respond({ actor: user, messages: [{ role: "user", content: "Book an appointment with dr.james on 10 August 2099 at 9:00 AM" }] });
+    assert.deepEqual(calls.map(({ name }) => name), ["search_doctors", "get_patient_appointments", "get_available_slots", "get_available_slots"]);
+    assert.deepEqual(calls[0].args, { name: "james" });
+    assert.equal(calls[2].args.exact_start_time, "09:00");
+    assert.match(result.answer, /requested 9:00 AM time is not available.*other available times/i);
+    assert.equal(result.results[0].data.slots[0].start_time, alternative.start_time);
+  });
+
+  it("returns same-date alternatives only after explicitly reporting the requested exact time unavailable", async () => {
+    const date = "2027-01-15";
+    const doctor = { id: doctorId, name: "Dr. James Wilson" };
+    const alternative = { id: "88888888-8888-4888-8888-888888888888", availability_id: "88888888-8888-4888-8888-888888888888", doctor_id: doctorId, date, start_time: "11:30:00", end_time: "12:00:00", doctor };
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("exact named booking should be deterministic"); } },
+      toolExecutor: async ({ name, args }) => {
+        if (name === "search_doctors") return { doctors: [doctor] };
+        if (name === "get_patient_appointments") return { appointments: [], has_more: false };
+        if (name === "get_available_slots") return args.exact_start_time ? { slots: [] } : { slots: [alternative] };
+        throw new Error(`Unexpected tool: ${name}`);
+      },
+    });
+    const response = await engine.respond({ actor: user, messages: [{ role: "user", content: "Book an appointment with Dr. James Wilson on January 15, 2027 at 9:00 AM." }] });
+    assert.match(response.answer, /9:00 AM|09:00/);
+    assert.match(response.answer, /requested 9:00 AM time is not available/i);
+    assert.match(response.answer, /other available times on 2027-01-15/i);
+    assert.equal(response.results[0].tool, "get_available_slots");
+    assert.deepEqual(response.results[0].data.slots.map(({ start_time }) => start_time), ["11:30:00"]);
+  });
+
+  it("treats explicit cancellation rejection as dismissal without running tools", async () => {
+    for (const content of ["Don't cancel it", "I changed my mind", "Never mind, keep the appointment"]) {
+      const engine = createConversationEngine({
+        provider: { generate: async () => { throw new Error("a rejection must not call the model"); } },
+        toolExecutor: async () => { throw new Error("a rejection must not execute tools"); },
+      });
+      const result = await engine.respond({
+        actor: user,
+        previousProposal: { assistant_message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", action_type: "cancel" },
+        messages: [{ role: "user", content }],
+      });
+      assert.match(result.answer, /dismissed the cancellation proposal/i);
+      assert.deepEqual(result.dismissProposal, { assistant_message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", action_type: "cancel" });
+      assert.deepEqual(result.results, []);
+    }
+  });
+
+  it("returns matching cancellation appointments for selection and prepares only the selected one", async () => {
+    const date = "2099-08-10";
+    const appointments = ["77777777-7777-4777-8777-777777777777", "99999999-9999-4999-8999-999999999999"].map((id, index) => ({ id, appointment_id: id, date, start_time: `${String(9 + index).padStart(2, "0")}:00:00`, end_time: `${String(9 + index).padStart(2, "0")}:30:00`, status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } }));
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("ambiguous cancellation should stay in the action flow"); } },
+      toolExecutor: async ({ name, args }) => { calls.push({ name, args }); return name === "get_patient_appointments" ? { appointments, has_more: false } : { proposal: { action_type: "cancel", action_args: args }, requires_patient_confirmation: true }; },
+    });
+    const first = await engine.respond({ actor: user, messages: [{ role: "user", content: `Cancel my appointment with Dr. Ada Morgan on ${date}` }] });
+    assert.match(first.answer, /choose the appointment/i);
+    assert.equal(first.results[0].tool, "get_patient_appointments");
+    assert.equal(first.internalReferences.appointments.length, 2);
+    const selected = await engine.respond({ actor: user, previousReferences: first.internalReferences, previousActionContext: first.internalActionContext, messages: [{ role: "user", content: `Cancel my appointment with Dr. Ada Morgan on ${date}` }, { role: "assistant", content: first.answer }, { role: "user", content: "Cancel the second appointment" }] });
+    assert.deepEqual(calls.at(-1), { name: "prepare_cancellation_action", args: { appointment_id: appointments[1].id } });
+    assert.equal(selected.results[0].tool, "prepare_cancellation_action");
+  });
+
+  it("answers latest from the displayed cancellation list and keeps number 10 bound to that exact appointment", async () => {
+    const appointments = Array.from({ length: 10 }, (_, index) => {
+      const id = `77777777-7777-4777-8777-${String(index + 1).padStart(12, "0")}`;
+      const day = String(index + 1).padStart(2, "0");
+      return { id, appointment_id: id, date: `2099-08-${day}`, start_time: "09:00:00", end_time: "09:30:00", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } };
+    });
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => ({ text: "I can help with that.", toolCalls: [] }) },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        return name === "get_patient_appointments" ? { appointments, has_more: false }
+          : { proposal: { action_type: "cancel", action_args: args }, requires_patient_confirmation: true };
+      },
+    });
+    const first = await engine.respond({ actor: user, messages: [{ role: "user", content: "Show my upcoming appointments" }] });
+    assert.equal(first.results[0].tool, "get_patient_appointments");
+    assert.deepEqual(first.internalReferences.cancellation_choices.map(({ appointment_id }) => appointment_id), appointments.map(({ id }) => id));
+
+    const latest = await engine.respond({ actor: user, previousReferences: first.internalReferences, messages: [
+      { role: "user", content: "Show my upcoming appointments" },
+      { role: "assistant", content: first.answer },
+      { role: "user", content: "Which appointment is the latest?" },
+    ] });
+    assert.match(latest.answer, /number 10: Dr\. Ada Morgan on 2099-08-10/);
+    assert.equal(latest.results.length, 0);
+    assert.deepEqual(latest.internalReferences.cancellation_choices.map(({ appointment_id }) => appointment_id), appointments.map(({ id }) => id));
+
+    const unrelated = await engine.respond({ actor: user, previousReferences: latest.internalReferences, messages: [
+      { role: "user", content: "Which appointment is the latest?" },
+      { role: "assistant", content: latest.answer },
+      { role: "user", content: "Thanks" },
+    ] });
+    assert.deepEqual(unrelated.internalReferences.cancellation_choices.map(({ appointment_id }) => appointment_id), appointments.map(({ id }) => id));
+
+    const selected = await engine.respond({ actor: user, previousReferences: unrelated.internalReferences, messages: [
+      { role: "user", content: "Which appointment is the latest?" },
+      { role: "assistant", content: latest.answer },
+      { role: "user", content: "Thanks" },
+      { role: "assistant", content: unrelated.answer },
+      { role: "user", content: "Cancel appointment number 10" },
+    ] });
+    assert.deepEqual(calls.at(-1), { name: "prepare_cancellation_action", args: { appointment_id: appointments[9].id } });
+    assert.equal(selected.results[0].tool, "prepare_cancellation_action");
+  });
+
+  it("retains numbered cancellation choices across turns and refreshes expired choices before selection", async () => {
+    const date = "2099-08-10";
+    const appointments = ["77777777-7777-4777-8777-777777777777", "99999999-9999-4999-8999-999999999999"].map((id, index) => ({ id, appointment_id: id, date, start_time: `${String(9 + index).padStart(2, "0")}:00:00`, end_time: `${String(9 + index).padStart(2, "0")}:30:00`, status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } }));
+    const fixedNow = Date.parse("2026-11-15T00:00:00Z");
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => fixedNow,
+      provider: { generate: async () => ({ text: "No problem.", toolCalls: [] }) },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        return name === "get_patient_appointments" ? { appointments, has_more: false }
+          : { proposal: { action_type: "cancel", action_args: args }, requires_patient_confirmation: true };
+      },
+    });
+    const expiredReferences = {
+      version: 1, pending_action: "cancel", reference_timestamps: { appointments: "2026-11-14T23:50:00.000Z" },
+      appointments, slots: [], doctors: [],
+    };
+    const clarification = await engine.respond({ actor: user, previousReferences: expiredReferences, messages: [{ role: "user", content: "Thanks" }] });
+    assert.equal(clarification.internalReferences.pending_action, "cancel");
+    assert.deepEqual(clarification.internalReferences.appointments.map(({ appointment_id }) => appointment_id), appointments.map(({ id }) => id));
+    const expiredSelection = await engine.respond({ actor: user, previousReferences: clarification.internalReferences, messages: [{ role: "user", content: "2" }] });
+    assert.match(expiredSelection.answer, /choice expired.*refreshed/i);
+    assert.equal(expiredSelection.results[0].tool, "get_patient_appointments");
+    assert.equal(expiredSelection.internalReferences.pending_action, "cancel");
+    assert.deepEqual(calls.map(({ name }) => name), ["get_patient_appointments"]);
+    const selected = await engine.respond({ actor: user, previousReferences: expiredSelection.internalReferences, messages: [{ role: "user", content: "Cancel appointment number 2" }] });
+    assert.deepEqual(calls.at(-1), { name: "prepare_cancellation_action", args: { appointment_id: appointments[1].id } });
+    assert.equal(selected.results[0].tool, "prepare_cancellation_action");
+  });
+
+  it("refreshes and redisplays appointments when a numbered cancellation arrives without saved choices", async () => {
+    const appointments = ["77777777-7777-4777-8777-777777777777", "99999999-9999-4999-8999-999999999999"].map((id, index) => ({ id, appointment_id: id, date: "2099-08-10", start_time: `${String(9 + index).padStart(2, "0")}:00:00`, status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } }));
+    const calls = [];
+    const engine = createConversationEngine({
+      provider: { generate: async () => ({ text: "Choose an appointment.", toolCalls: [] }) },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        return name === "get_patient_appointments" ? { appointments, has_more: false }
+          : { proposal: { action_type: "cancel", action_args: args }, requires_patient_confirmation: true };
+      },
+    });
+    const refreshed = await engine.respond({ actor: user, messages: [{ role: "user", content: "Cancel appointment number 10" }] });
+    assert.match(refreshed.answer, /refreshed.*choose again/i);
+    assert.equal(refreshed.results[0].tool, "get_patient_appointments");
+    assert.equal(refreshed.internalReferences.pending_action, "cancel");
+    assert.deepEqual(refreshed.internalReferences.cancellation_choices.map(({ appointment_id }) => appointment_id), appointments.map(({ id }) => id));
+    assert.deepEqual(calls.map(({ name }) => name), ["get_patient_appointments"]);
   });
 
   it("uses the verified patient user for appointment lookup and projects minimal fields", async () => {
@@ -274,7 +667,7 @@ describe("patient assistant tools", () => {
     const slot = { id: "33333333-3333-4333-8333-333333333333", doctor_id: doctorId, doctor_first_name: "Dee", doctor_last_name: "Doctor", specialty: "General Practice", consultation_fee: 500, mode: "wave", capacity: 4, schedule_id: "44444444-4444-4444-8444-444444444444", date: "2099-08-10", start_time: "10:00:00", end_time: "10:30:00", remaining_capacity: 2, hold_status: "active", hold_expires_at: "internal", preserved_reservation_count: 8 };
     let slotsSql;
     let slotsValues;
-    const slots = await executeTool({ name: "get_available_slots", args: { doctor_id: doctorId, from: "2099-08-10", to: "2099-08-10" }, actor: user, applicationTimezone: "UTC", database: { query: async (sql, values) => { slotsSql = sql; slotsValues = values; return { rows: [slot] }; } } });
+    const slots = await executeTool({ name: "get_available_slots", args: { doctor_id: doctorId, from: "2099-08-10", to: "2099-08-10" }, actor: user, applicationTimezone: "UTC", database: { query: async (sql, values) => { if (sql.includes("ORDER BY date, start_time")) { slotsSql = sql; slotsValues = values; } return { rows: [slot] }; } } });
     assert.deepEqual(slots.slots[0], { id: slot.id, availability_id: slot.id, date: "2099-08-10", start_time: "10:00:00", end_time: "10:30:00", doctor_id: doctorId, doctor: { id: doctorId, name: "Dr. Dee Doctor" }, specialty: "General Practice", consultation_fee: 500, mode: "wave", capacity: 4, remaining_capacity: 2 });
     assert.match(slotsSql, /ORDER BY date, start_time\s+LIMIT \$10/);
     assert.equal(slotsValues.at(-1), 5);
@@ -286,8 +679,8 @@ describe("patient assistant tools", () => {
       args: { doctor_id: doctorId, from: "2099-08-10", to: "2099-08-10", exact_start_time: "10:00" },
       actor: user,
       applicationTimezone: "UTC",
-      database: { query: async (_sql, values) => {
-        exactValues = values;
+      database: { query: async (sql, values) => {
+        if (sql.includes("ORDER BY date, start_time")) exactValues = values;
         return { rows: [slot, { ...slot, id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }, { ...slot, id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", start_time: "10:30:00" }] };
       } },
     });
@@ -296,7 +689,7 @@ describe("patient assistant tools", () => {
 
     let globalAvailabilitySql;
     let globalAvailabilityValues;
-    const nextAvailable = await executeTool({ name: "get_available_slots", args: {}, actor: user, applicationTimezone: "UTC", database: { query: async (sql, values) => { globalAvailabilitySql = sql; globalAvailabilityValues = values; return { rows: [slot, { ...slot, date: "2099-08-11" }] }; } } });
+    const nextAvailable = await executeTool({ name: "get_available_slots", args: {}, actor: user, applicationTimezone: "UTC", database: { query: async (sql, values) => { if (sql.includes("ORDER BY date, start_time")) { globalAvailabilitySql = sql; globalAvailabilityValues = values; } return { rows: [slot, { ...slot, date: "2099-08-11" }] }; } } });
     assert.match(globalAvailabilitySql, /WHERE \$1::uuid IS NULL/);
     assert.match(globalAvailabilitySql, /active_user\.is_active = TRUE/);
     assert.match(globalAvailabilitySql, /availability\.booking_visibility = 'public'/);
@@ -306,7 +699,7 @@ describe("patient assistant tools", () => {
     let legacySql;
     const legacySlot = { ...slot, id: "55555555-5555-4555-8555-555555555555", date: "2099-08-09", mode: null, capacity: 1, remaining_capacity: 1 };
     const fullLegacySlot = { ...legacySlot, id: "66666666-6666-4666-8666-666666666666", date: "2099-08-08", remaining_capacity: 0 };
-    const withLegacy = await executeTool({ name: "get_available_slots", args: {}, actor: user, applicationTimezone: "UTC", database: { query: async (sql) => { legacySql = sql; return { rows: [fullLegacySlot, legacySlot, slot] }; } } });
+    const withLegacy = await executeTool({ name: "get_available_slots", args: {}, actor: user, applicationTimezone: "UTC", database: { query: async (sql) => { if (sql.includes("ORDER BY date, start_time")) legacySql = sql; return { rows: [fullLegacySlot, legacySlot, slot] }; } } });
     assert.match(legacySql, /availability\.mode IS NULL OR availability\.capacity > COALESCE\(occupancy\.occupied, 0\)/);
     assert.doesNotMatch(legacySql, /availability\.mode IN \('wave', 'stream'\)/);
     assert.deepEqual(withLegacy.slots.map(({ mode }) => mode), ["legacy", "wave"]);
@@ -316,24 +709,32 @@ describe("patient assistant tools", () => {
     ]);
     const manySlots = Array.from({ length: 6 }, (_, index) => ({ ...slot, date: `2099-08-${String(10 + index).padStart(2, "0")}` }));
     let orderedSql;
-    const capped = await executeTool({ name: "get_available_slots", args: {}, actor: user, applicationTimezone: "UTC", database: { query: async (sql) => { orderedSql = sql; return { rows: manySlots }; } } });
+    const capped = await executeTool({ name: "get_available_slots", args: {}, actor: user, applicationTimezone: "UTC", database: { query: async (sql) => { if (sql.includes("ORDER BY date, start_time")) orderedSql = sql; return { rows: manySlots }; } } });
     assert.match(orderedSql, /ORDER BY date, start_time/);
     assert.equal(capped.slots.length, 5);
     assert.deepEqual(capped.slots.map(({ date }) => date), manySlots.slice(0, 5).map(({ date }) => date));
 
     let doctorFilter;
-    const doctorSearch = await executeTool({ name: "get_available_slots", args: { doctor_id: doctorId }, actor: user, applicationTimezone: "UTC", database: { query: async (_sql, values) => { doctorFilter = values[0]; return { rows: [slot] }; } } });
+    const doctorSearch = await executeTool({ name: "get_available_slots", args: { doctor_id: doctorId }, actor: user, applicationTimezone: "UTC", database: { query: async (sql, values) => { if (sql.includes("ORDER BY date, start_time")) doctorFilter = values[0]; return { rows: [slot] }; } } });
     assert.equal(doctorFilter, doctorId);
     assert.equal(doctorSearch.slots.length, 1);
 
     let specialtySql;
     let specialtyValues;
     const stream = { ...slot, mode: "stream", date: "2099-08-09", capacity: 8, remaining_capacity: 3 };
-    const specialtySearch = await executeTool({ name: "get_available_slots", args: { specialty: "General Practice" }, actor: user, applicationTimezone: "UTC", database: { query: async (sql, values) => { specialtySql = sql; specialtyValues = values; return { rows: [stream, slot] }; } } });
+    const specialtySearch = await executeTool({ name: "get_available_slots", args: { specialty: "General Practice" }, actor: user, applicationTimezone: "UTC", database: { query: async (sql, values) => { if (sql.includes("ORDER BY date, start_time")) { specialtySql = sql; specialtyValues = values; } return { rows: [stream, slot] }; } } });
     assert.match(specialtySql, /specialty_doctor\.specialty ILIKE/);
     assert.equal(specialtyValues.at(-2), "General Practice");
     assert.equal(specialtyValues.at(-1), 5);
     assert.deepEqual(specialtySearch.slots.map(({ mode, remaining_capacity, capacity }) => ({ mode, remaining_capacity, capacity })), [{ mode: "stream", remaining_capacity: 3, capacity: 8 }, { mode: "wave", remaining_capacity: 2, capacity: 4 }]);
+  });
+
+  it("does not offer a same-patient confirmed appointment as an available slot", async () => {
+    const slot = { id: "33333333-3333-4333-8333-333333333333", doctor_id: doctorId, doctor_first_name: "Dee", doctor_last_name: "Doctor", specialty: "General Practice", consultation_fee: 500, mode: "wave", capacity: 4, date: "2099-08-10", start_time: "10:00:00", end_time: "10:30:00", remaining_capacity: 2 };
+    const existing = { id: "77777777-7777-4777-8777-777777777777", doctor_id: doctorId, date: slot.date, start_time: slot.start_time, status: "confirmed" };
+    const database = { query: async (sql) => ({ rows: sql.includes("ORDER BY date, start_time") ? [slot] : [existing] }) };
+    const result = await executeTool({ name: "get_available_slots", args: { doctor_id: doctorId, from: slot.date, to: slot.date }, actor: user, applicationTimezone: "UTC", database });
+    assert.deepEqual(result.slots, []);
   });
 
   it("normalizes a Dr-prefixed doctor search to the existing first/last-name query", async () => {
@@ -688,16 +1089,17 @@ describe("assistant conversation and Gemini adapter errors", () => {
       toolExecutor: async ({ name, args }) => {
         toolExecutions.push({ name, args });
         if (name === "search_doctors") return { doctors: [{ id: returnedDoctorId, name: "Dr. Ada Morgan" }] };
+        if (name === "get_patient_appointments") return { appointments: [], has_more: false };
         if (name === "get_available_slots") return { slots: [{ id: returnedSlotId, availability_id: returnedSlotId, doctor_id: returnedDoctorId, date: appointmentDate, start_time: "14:30:00", end_time: "15:00:00", consultation_fee: "640.00", doctor: { id: returnedDoctorId, name: "Dr. Ada Morgan" } }] };
         return { proposal: { action_type: "book", action_args: args }, requires_patient_confirmation: true };
       },
     });
     const response = await engine.respond({ actor: user, messages: [{ role: "user", content: `Book with Dr. Ada Morgan on ${appointmentDate} at 14:30 to 15:00` }] });
-    assert.deepEqual(toolExecutions.map(({ name }) => name), ["search_doctors", "get_available_slots", "prepare_booking_action"]);
-    assert.equal(providerCall, 1);
-    assert.equal(toolExecutions[1].args.doctor_id, returnedDoctorId);
-    assert.equal(toolExecutions[1].args.exact_start_time, "14:30");
-    assert.equal(toolExecutions[2].args.availability_id, returnedSlotId);
+    assert.deepEqual(toolExecutions.map(({ name }) => name), ["search_doctors", "get_patient_appointments", "get_available_slots", "prepare_booking_action"]);
+    assert.equal(providerCall, 0);
+    assert.equal(toolExecutions[2].args.doctor_id, returnedDoctorId);
+    assert.equal(toolExecutions[2].args.exact_start_time, "14:30");
+    assert.equal(toolExecutions[3].args.availability_id, returnedSlotId);
     assert.match(response.answer, new RegExp(`${appointmentDate} at 14:30`));
     assert.match(response.answer, /15:00/);
     assert.match(response.answer, /INR 640\.00/);
@@ -730,14 +1132,14 @@ describe("assistant conversation and Gemini adapter errors", () => {
       } },
       toolExecutor: async ({ name, args }) => {
         toolExecutions.push({ name, args });
-        if (name === "get_patient_appointments") return { appointments: [{ appointment_id: appointmentId, date: oldDate, start_time: "10:00:00", doctor: { id: returnedDoctorId, name: "Dr. Ada Morgan" } }] };
+        if (name === "get_patient_appointments") return { appointments: [{ appointment_id: appointmentId, date: oldDate, start_time: "10:00:00", status: "confirmed", doctor: { id: returnedDoctorId, name: "Dr. Ada Morgan" } }] };
         if (name === "get_available_slots") return { slots: [{ id: returnedSlotId, availability_id: returnedSlotId, doctor_id: returnedDoctorId, date: targetDate, start_time: "16:00:00" }] };
         return { proposal: { action_type: "reschedule", action_args: args }, requires_patient_confirmation: true };
       },
     });
     const response = await engine.respond({ actor: user, messages: [{ role: "user", content: `Move my appointment with Dr. Ada Morgan on ${oldDate} at 10:00 to ${targetDate} at 16:00` }] });
     assert.deepEqual(toolExecutions.map(({ name }) => name), ["get_patient_appointments", "get_available_slots", "prepare_reschedule_action"]);
-    assert.equal(providerCall, 1);
+    assert.equal(providerCall, 0);
     assert.equal(toolExecutions[1].args.doctor_id, returnedDoctorId);
     assert.equal(toolExecutions[2].args.appointment_id, appointmentId);
     assert.equal(toolExecutions[2].args.availability_id, returnedSlotId);
@@ -770,10 +1172,13 @@ describe("assistant conversation and Gemini adapter errors", () => {
     const calls = [];
     const secondEngine = createConversationEngine({
       provider: { generate: async () => { throw new Error("numeric slot choice must resolve before Gemini"); } },
-      toolExecutor: async ({ name, args }) => { calls.push({ name, args }); return { proposal: { action_type: "book", action_args: args }, requires_patient_confirmation: true }; },
+      toolExecutor: async ({ name, args }) => { calls.push({ name, args }); return name === "get_patient_appointments" ? { appointments: [], has_more: false } : { proposal: { action_type: "book", action_args: args }, requires_patient_confirmation: true }; },
     });
     const second = await secondEngine.respond({ actor: user, messages: [{ role: "user", content: "11" }], previousReferences: first.internalReferences });
-    assert.deepEqual(calls, [{ name: "prepare_booking_action", args: { availability_id: slotId } }]);
+    assert.deepEqual(calls, [
+      { name: "get_patient_appointments", args: { view: "upcoming", scope: "all", from: "2027-01-07", to: "2027-01-07" } },
+      { name: "prepare_booking_action", args: { availability_id: slotId } },
+    ]);
     assert.match(second.answer, /2027-01-07 at 11:00/);
     assert.equal(second.results[0].tool, "prepare_booking_action");
     assert.equal(JSON.stringify({ answer: second.answer, results: second.results }).includes(slotId), false);
@@ -889,7 +1294,7 @@ describe("assistant conversation and Gemini adapter errors", () => {
     const engine = createConversationEngine({
       provider: { generate: async () => ({ text: "Available times", toolCalls: [{ name: "get_patient_appointments", arguments: { view: "upcoming", scope: "all" }, id: "appointments" }] }) },
       toolExecutor: async ({ name, args }) => {
-        if (name === "get_patient_appointments") return { appointments: [{ appointment_id: appointmentId, date: "2026-12-20", start_time: "09:00:00", end_time: "09:30:00", doctor }] };
+        if (name === "get_patient_appointments") return { appointments: [{ appointment_id: appointmentId, date: "2026-12-20", start_time: "09:00:00", end_time: "09:30:00", status: "confirmed", doctor }] };
         if (name === "get_available_slots") return { slots: [{ availability_id: availabilityId, doctor_id: doctorId, date: targetDate, start_time: "11:30:00", end_time: "12:00:00", doctor }] };
         prepared += 1;
         return { proposal: { action_type: "reschedule", action_args: args }, requires_patient_confirmation: true };
@@ -1201,6 +1606,7 @@ describe("assistant conversation and Gemini adapter errors", () => {
         toolExecutor: async ({ name }) => {
           if (name === "search_doctors") return { doctors: [{ id: returnedDoctorId, name: "Dr. Ada Morgan" }] };
           if (name === "get_available_slots") return { slots };
+          if (name === "get_patient_appointments") return { appointments: [], has_more: false };
           prepared += 1;
           return { requires_patient_confirmation: true };
         },

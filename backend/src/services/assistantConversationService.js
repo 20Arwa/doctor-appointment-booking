@@ -71,6 +71,8 @@ function safeReferences(value) {
     ...(typeof value.captured_at === "string" && !Number.isNaN(Date.parse(value.captured_at)) ? { captured_at: value.captured_at } : {}),
     ...(value.reference_timestamps && typeof value.reference_timestamps === "object" ? { reference_timestamps: Object.fromEntries(["appointments", "slots", "doctors"].filter((kind) => typeof value.reference_timestamps[kind] === "string" && !Number.isNaN(Date.parse(value.reference_timestamps[kind]))).map((kind) => [kind, value.reference_timestamps[kind]])) } : {}),
     appointments: safeReferenceRows(value.appointments, "appointment"),
+    ...(Array.isArray(value.cancellation_choices) ? { cancellation_choices: safeReferenceRows(value.cancellation_choices, "appointment") } : {}),
+    ...(typeof value.cancellation_choices_at === "string" && !Number.isNaN(Date.parse(value.cancellation_choices_at)) ? { cancellation_choices_at: value.cancellation_choices_at } : {}),
     slots: safeReferenceRows(value.slots, "slot"),
     doctors: safeReferenceRows(value.doctors, "doctor"),
     ...(value.slot_query && typeof value.slot_query === "object" ? { slot_query: {
@@ -79,7 +81,9 @@ function safeReferences(value) {
       ...(typeof value.slot_query.to === "string" ? { to: value.slot_query.to.slice(0, 10) } : {}),
       ...(typeof value.slot_query.exact_start_time === "string" ? { exact_start_time: value.slot_query.exact_start_time.slice(0, 5) } : {}),
     } } : {}),
-    ...(value.pending_action === "book" || value.pending_action === "reschedule" ? { pending_action: value.pending_action } : {}),
+    ...(value.pending_action === "book" || value.pending_action === "reschedule" || value.pending_action === "cancel" ? { pending_action: value.pending_action } : {}),
+    ...(UUID_PATTERN.test(value.pending_appointment_id || "") ? { pending_appointment_id: value.pending_appointment_id } : {}),
+    ...(typeof value.pending_target_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.pending_target_date) ? { pending_target_date: value.pending_target_date } : {}),
     ...(historyPage ? { history_page: historyPage } : {}),
   };
 }
@@ -113,7 +117,7 @@ async function transaction(database, operation) {
   }
 }
 
-function createAssistantConversationService({ engine, now = Date.now }) {
+function createAssistantConversationService({ engine, actionService, now = Date.now }) {
   return {
     async create(database, user, conversationId) {
       await database.query(
@@ -231,7 +235,7 @@ function createAssistantConversationService({ engine, now = Date.now }) {
         }
         await client.query("UPDATE assistant_conversations SET updated_at = NOW() WHERE id = $1", [conversationId]);
         const prior = await client.query(
-          `SELECT role, content, tool_results FROM assistant_messages
+          `SELECT id, role, content, tool_results FROM assistant_messages
            WHERE conversation_id = $1 AND id <> $2
              AND (role = 'assistant' OR (role = 'user' AND request_status = 'complete'))
            ORDER BY created_at DESC, id DESC LIMIT $3`,
@@ -240,6 +244,7 @@ function createAssistantConversationService({ engine, now = Date.now }) {
         const priorMessages = [...prior.rows].reverse();
         let previousActionContext = null;
         let previousReferences = null;
+        let previousProposal = null;
         for (const message of priorMessages) {
           if (message.role !== "assistant" || !Array.isArray(message.tool_results)) continue;
           const contextResult = message.tool_results.find((result) => result?.tool === INTERNAL_ACTION_CONTEXT_TOOL);
@@ -250,8 +255,29 @@ function createAssistantConversationService({ engine, now = Date.now }) {
           if (context?.action_type === "cancel_pending") {
             const expiresAt = Date.parse(context.expires_at || "");
             if (Number.isFinite(expiresAt) && expiresAt > now() && expiresAt <= now() + 6 * 60 * 1000) {
-              previousActionContext = { action_type: "cancel_pending", expires_at: new Date(expiresAt).toISOString() };
+              previousActionContext = {
+                action_type: "cancel_pending",
+                expires_at: new Date(expiresAt).toISOString(),
+                ...(previousActionContext?.action_type === "cancel_pending" ? {
+                  ...(previousActionContext.date ? { date: previousActionContext.date } : {}),
+                  ...(previousActionContext.time ? { time: previousActionContext.time } : {}),
+                  ...(previousActionContext.doctor_name ? { doctor_name: previousActionContext.doctor_name } : {}),
+                } : {}),
+                ...(typeof context.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(context.date) ? { date: context.date } : {}),
+                ...(typeof context.time === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(context.time) ? { time: context.time } : {}),
+                ...(typeof context.doctor_name === "string" ? { doctor_name: context.doctor_name.slice(0, 120) } : {}),
+              };
             }
+          }
+          const proposalEvidence = message.tool_results.find((result) => result?.tool === INTERNAL_ACTION_CONTEXT_TOOL && result.data?.proposal_evidence)?.data?.proposal_evidence;
+          const dismissedTypes = message.tool_results.flatMap((result) => result?.tool === INTERNAL_ACTION_CONTEXT_TOOL ? Object.keys(result.data?.dismissed_proposals || {}) : []);
+          if (proposalEvidence?.proposal_succeeded === true && proposalEvidence.requires_patient_confirmation === true
+              && ["book", "reschedule", "cancel"].includes(proposalEvidence.action_type) && !dismissedTypes.includes(proposalEvidence.action_type)) {
+            previousProposal = { assistant_message_id: message.id, action_type: proposalEvidence.action_type };
+          }
+          if (dismissedTypes.includes("cancel")) {
+            if (previousActionContext?.action_type === "cancel") previousActionContext = null;
+            if (previousProposal?.assistant_message_id === message.id) previousProposal = null;
           }
           const references = safeReferences(context?.references);
           if (references && (references.version === 1 || references.appointments.length || references.slots.length || references.doctors.length)) {
@@ -259,7 +285,7 @@ function createAssistantConversationService({ engine, now = Date.now }) {
             if (references.appointments.length && context?.action_type !== "cancel" && context?.action_type !== "cancel_pending") previousActionContext = null;
           }
         }
-        return { userMessage, previousActionContext, previousReferences, context: priorMessages.map(({ role, content: priorContent }) => ({ role, content: priorContent })).concat({ role: "user", content }) };
+        return { userMessage, previousActionContext, previousProposal, previousReferences, context: priorMessages.map(({ role, content: priorContent }) => ({ role, content: priorContent })).concat({ role: "user", content }) };
       });
 
       if (claimed.inProgress) throw new AssistantConversationError("REQUEST_IN_PROGRESS", 409, "This message is still being processed. Retry shortly.");
@@ -276,10 +302,17 @@ function createAssistantConversationService({ engine, now = Date.now }) {
           applicationTimezone,
           paymentService,
           previousActionContext: claimed.previousActionContext,
+          previousProposal: claimed.previousProposal,
           previousReferences: claimed.previousReferences,
           requestId: diagnosticRequestId,
           logger,
         });
+        if (completion.dismissProposal) {
+          if (!actionService?.dismiss) throw new AssistantConversationError("ACTION_DISMISSAL_UNAVAILABLE", 503, "The cancellation proposal could not be dismissed right now. Please try again.");
+          await actionService.dismiss(user, conversationId, completion.dismissProposal.assistant_message_id, completion.dismissProposal.action_type);
+          completion = { ...completion };
+          delete completion.dismissProposal;
+        }
       } catch (error) {
         await database.query(
           `UPDATE assistant_messages SET request_status = 'failed', updated_at = NOW()
@@ -335,7 +368,13 @@ function createAssistantConversationService({ engine, now = Date.now }) {
             ...(exactCancellationContext
               ? completion.internalActionContext : {}),
             ...(pendingCancellationContext
-              ? { action_type: "cancel_pending", expires_at: new Date(pendingCancellationExpiry).toISOString() } : {}),
+              ? {
+                action_type: "cancel_pending",
+                expires_at: new Date(pendingCancellationExpiry).toISOString(),
+                ...(typeof completion.internalActionContext.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(completion.internalActionContext.date) ? { date: completion.internalActionContext.date } : {}),
+                ...(typeof completion.internalActionContext.time === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(completion.internalActionContext.time) ? { time: completion.internalActionContext.time } : {}),
+                ...(typeof completion.internalActionContext.doctor_name === "string" ? { doctor_name: completion.internalActionContext.doctor_name.slice(0, 120) } : {}),
+              } : {}),
             ...(completion.internalReferences ? { references: safeReferences(completion.internalReferences) } : {}),
           } });
         }

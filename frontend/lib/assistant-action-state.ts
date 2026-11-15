@@ -1,7 +1,7 @@
 import type { AssistantResult } from "@/lib/assistant-api";
 
 export type ProposalType = "book" | "cancel" | "reschedule";
-export type ProposalStatus = "loading" | "pending" | "confirming" | "dismissing" | "checkout_pending" | "refund_pending" | "completed" | "expired" | "failed" | "dismissed";
+export type ProposalStatus = "loading" | "pending" | "confirming" | "processing" | "dismissing" | "checkout_pending" | "refund_pending" | "completed" | "expired" | "failed" | "dismissed";
 
 const proposalTypes: Record<string, ProposalType> = {
   prepare_booking_action: "book",
@@ -36,7 +36,7 @@ export function proposalStatusFromBackend(status: string, expiresAt: string, now
   if (status === "refund_pending") return "refund_pending";
   if (status === "expired" || isProposalExpired(expiresAt, now)) return "expired";
   if (status === "pending") return "pending";
-  if (status === "executing") return "confirming";
+  if (status === "executing") return "processing";
   if (status === "dismissed") return "dismissed";
   return "failed";
 }
