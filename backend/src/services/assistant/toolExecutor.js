@@ -53,6 +53,52 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
   if (!parsed.success) throw Object.assign(new Error("Tool arguments are invalid"), { code: "INVALID_TOOL_ARGUMENTS" });
   const input = parsed.data;
 
+  if (name === "get_doctor_appointments" || name === "get_doctor_appointment_statistics") {
+    // The doctor ID is resolved from the verified local user, never from model arguments.
+    if (actor?.role !== "doctor") throw Object.assign(new Error("Tool is unavailable"), { code: "TOOL_UNAVAILABLE" });
+    const timeZone = "Asia/Kolkata";
+    const relativeOffset = input.day === "tomorrow" ? 1 : input.day === "yesterday" ? -1 : 0;
+    const requestedDate = input.date || (input.day ? addCalendarDays(dateInTimezone(now, timeZone), relativeOffset) : null);
+    const from = requestedDate || input.from;
+    const to = requestedDate || input.to;
+    const values = [actor.id, from, to];
+    const statusClause = input.status ? ` AND appointment.status = $${values.push(input.status)}` : "";
+    if (name === "get_doctor_appointment_statistics") {
+      const result = await database.query(
+        `SELECT appointment.status, COUNT(*)::int AS count
+         FROM appointments appointment
+         JOIN availability av ON av.id = appointment.availability_id
+         JOIN doctors doctor ON doctor.id = av.doctor_id
+         WHERE doctor.user_id = $1 AND appointment.scheduled_date BETWEEN $2::date AND $3::date${statusClause}
+         GROUP BY appointment.status ORDER BY appointment.status`, values,
+      );
+      const byStatus = { confirmed: 0, completed: 0, cancelled: 0 };
+      for (const row of result.rows) if (Object.hasOwn(byStatus, row.status)) byStatus[row.status] = Number(row.count);
+      return { from, to, total: Object.values(byStatus).reduce((sum, count) => sum + count, 0), by_status: byStatus };
+    }
+    const limit = input.limit;
+    const offset = input.offset;
+    values.push(limit + 1, offset);
+    const result = await database.query(
+      `SELECT appointment.scheduled_date::text AS date,
+              appointment.scheduled_start_time::text AS start_time,
+              appointment.scheduled_end_time::text AS end_time,
+              appointment.status, patient_user.first_name AS patient_first_name,
+              patient_user.last_name AS patient_last_name
+       FROM appointments appointment
+       JOIN availability av ON av.id = appointment.availability_id
+       JOIN doctors doctor ON doctor.id = av.doctor_id
+       JOIN patients patient ON patient.id = appointment.patient_id
+       JOIN users patient_user ON patient_user.id = patient.user_id
+       WHERE doctor.user_id = $1 AND appointment.scheduled_date BETWEEN $2::date AND $3::date${statusClause}
+       ORDER BY appointment.scheduled_date, appointment.scheduled_start_time, appointment.id LIMIT $${values.length - 1} OFFSET $${values.length}`,
+      values,
+    );
+    const hasMore = result.rows.length > limit;
+    const appointments = result.rows.slice(0, limit);
+    return { from, to, appointments, has_more: hasMore, next_offset: hasMore ? offset + appointments.length : null, limit, offset };
+  }
+
   if (name === "get_cancellation_refund_preview") {
     if (!paymentService?.previewCancellationRefund) throw Object.assign(new Error("Refund preview is unavailable"), { code: "TOOL_QUERY_FAILED" });
     const preview = await paymentService.previewCancellationRefund(actor, input.appointment_id);

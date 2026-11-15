@@ -22,26 +22,30 @@ function patientOnly(response) {
   return response.locals.user?.role === "patient";
 }
 
+function chatActor(response) {
+  return ["patient", "doctor"].includes(response.locals.user?.role);
+}
+
 async function create(request, response) {
-  if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can use the assistant" } });
+  if (!chatActor(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "This account cannot use the assistant" } });
   try { return response.status(201).json(await getService(response).create(response.locals.database, response.locals.user, response.locals.body.id)); }
   catch (error) { return errorResponse(response, error); }
 }
 
 async function list(request, response) {
-  if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can use the assistant" } });
+  if (!chatActor(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "This account cannot use the assistant" } });
   try { return response.json(await getService(response).list(response.locals.database, response.locals.user, response.locals.query)); }
   catch (error) { return errorResponse(response, error); }
 }
 
 async function open(request, response) {
-  if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can use the assistant" } });
+  if (!chatActor(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "This account cannot use the assistant" } });
   try { return response.json(await getService(response).get(response.locals.database, response.locals.user, response.locals.params.conversationId, response.locals.query)); }
   catch (error) { return errorResponse(response, error); }
 }
 
 async function remove(request, response) {
-  if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can use the assistant" } });
+  if (!chatActor(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "This account cannot use the assistant" } });
   try {
     const removed = await getService(response).remove(response.locals.database, response.locals.user, response.locals.params.conversationId);
     return removed ? response.status(204).end() : response.status(404).json({ error: { code: "CONVERSATION_NOT_FOUND", message: "Conversation not found" } });
@@ -49,7 +53,7 @@ async function remove(request, response) {
 }
 
 async function send(request, response) {
-  if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can use the assistant" } });
+  if (!chatActor(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "This account cannot use the assistant" } });
   const requestId = randomUUID();
   response.set("X-Request-Id", requestId);
   const started = Date.now();
