@@ -58,6 +58,13 @@ function publicToolResult(value) {
     .map(([key, nested]) => [key, publicToolResult(nested)]));
 }
 
+function patientUiActions(toolName, value) {
+  if (toolName === "get_patient_appointments") return (value.appointments || []).map((row) => ({ type: "appointment", appointment_id: row.appointment_id || row.id }));
+  if (toolName === "get_available_slots") return (value.slots || []).map((row) => ({ type: "slot", availability_id: row.availability_id || row.id, doctor_id: row.doctor_id || row.doctor?.id }));
+  if (toolName === "search_doctors") return (value.doctors || []).map((row) => ({ type: "doctor", doctor_id: row.id }));
+  return [];
+}
+
 function publicAssistantAnswer(value) {
   return value.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, "").replace(/\s{2,}/g, " ").trim();
 }
@@ -508,7 +515,9 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
             ? history.has_more || historyFailed ? `Here are the next ${referenceContext.appointments.length} ${category}. There are more records; ask me to continue for the next page.` : `Here are the next ${referenceContext.appointments.length} ${category}.`
             : history.has_more || historyFailed ? `Here are ${referenceContext.appointments.length} ${category}. There are more records; ask me to continue for the next page.` : `Here are your ${category}.`
           : `You have no matching ${category}.`;
-        return { answer, results: [{ tool: "get_patient_appointments", data: publicToolResult({ appointments: history.appointments, has_more: history.has_more }) }], ...internalState() };
+        const historyResult = { appointments: history.appointments, has_more: history.has_more };
+        const uiActions = patientUiActions("get_patient_appointments", historyResult);
+        return { answer, results: [{ tool: "get_patient_appointments", data: publicToolResult(historyResult), ...(uiActions.length ? { ui_actions: uiActions } : {}) }], ...internalState() };
       }
       const prepareForExactTarget = async (action, doctor, appointment) => {
         const targetCandidates = targetTime?.start?.candidates || [];
@@ -555,6 +564,33 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         if (!internalProposalEvidence) return { status: "prepare_failed" };
         return { status: "prepared" };
       };
+      const availabilityIntent = /\b(?:availability|available|open slots?|time slots?)\b/i.test(currentUserText);
+      const namedAvailabilityDoctor = currentUserText.match(/\bDr\.?\s+([\p{L}][\p{L}'-]*(?:\s+(?!on\b|for\b|at\b|availability\b|available\b|open\b|slots?\b|time\b|in\b)[\p{L}][\p{L}'-]*)?)/iu)?.[1]?.trim().replace(/\s+(?:availability|available|slots?)$/i, "");
+      const dateOnlyDoctorFollowup = !availabilityIntent && requestedDates.length > 0 && referenceContext.doctors.length === 1
+        && !/\b(?:appointment|cancel|reschedul|book|refund)\b/i.test(currentUserText);
+      if (!actionRequest && ((availabilityIntent && namedAvailabilityDoctor) || dateOnlyDoctorFollowup)) {
+        const search = dateOnlyDoctorFollowup ? { doctors: [referenceContext.doctors[0]] }
+          : await executeTool({ name: "search_doctors", args: { name: namedAvailabilityDoctor }, actor, database, applicationTimezone, paymentService });
+        const doctors = Array.isArray(search?.doctors) ? search.doctors : [];
+        referenceContext.doctors = doctors;
+        markReferenceFresh("doctors");
+        if (doctors.length !== 1) {
+          const answer = doctors.length ? `More than one doctor matches ${namedAvailabilityDoctor}. Please choose a doctor by name.` : `I could not find an active doctor matching ${namedAvailabilityDoctor}. Please check the doctor name.`;
+          const results = dateOnlyDoctorFollowup ? [] : [{ tool: "search_doctors", data: publicToolResult(search), ui_actions: patientUiActions("search_doctors", search) }];
+          return { answer, results, ...internalState() };
+        }
+        const doctor = doctors[0];
+        const args = { doctor_id: doctor.id, ...(requestedDateIso ? { from: requestedDateIso, to: requestedDateIso } : {}), ...(requestedTime ? { exact_start_time: requestedTime } : {}) };
+        const availability = await executeTool({ name: "get_available_slots", args, actor, database, applicationTimezone, paymentService });
+        referenceContext.slots = Array.isArray(availability?.slots) ? availability.slots : [];
+        referenceContext.slot_query = args;
+        markReferenceFresh("slots");
+        const results = [
+          ...(!dateOnlyDoctorFollowup ? [{ tool: "search_doctors", data: publicToolResult(search), ui_actions: patientUiActions("search_doctors", search) }] : []),
+          { tool: "get_available_slots", data: publicToolResult(availability), ui_actions: patientUiActions("get_available_slots", availability) },
+        ];
+        return { answer: availability.slots?.length ? `Here are the available appointment times with ${doctor.name}.` : `I could not find available appointment times with ${doctor.name} for that date.`, results, ...internalState() };
+      }
       if (cancellationRequest) {
         if (!requestedDateIso || !requestedTime) {
           return {
@@ -827,7 +863,7 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
               }
               const cachedKey = toolCacheKey(call.name, call.arguments);
               if (executedToolResults.has(cachedKey)) {
-                results.push({ name: call.name, id: call.id, result: executedToolResults.get(cachedKey) });
+                results.push({ name: call.name, id: call.id, result: publicToolResult(executedToolResults.get(cachedKey)) });
                 continue;
               }
               if (call.name === "get_available_slots" && call.arguments.doctor_id) {
@@ -1101,8 +1137,9 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
                 }
               }
               if (call.name === "get_cancellation_refund_preview" && result && !result.error) successfulRefundPreview = result;
-              publicResults.push({ tool: call.name, data: publicToolResult(result) });
-              results.push({ name: call.name, id: call.id, result });
+              const uiActions = patientUiActions(call.name, result);
+              publicResults.push({ tool: call.name, data: publicToolResult(result), ...(uiActions.length ? { ui_actions: uiActions } : {}) });
+              results.push({ name: call.name, id: call.id, result: publicToolResult(result) });
             } catch (error) {
               if (signal.aborted) throw error;
               results.push({ name: call.name, id: call.id, result: { error: error.code === "INVALID_TOOL_ARGUMENTS" ? "The lookup arguments were invalid. Ask the patient to clarify." : error.code === "TOOL_LIMIT_EXCEEDED" ? "The lookup budget was reached. Use the verified results already returned and ask the patient to narrow any remaining request." : "The requested data could not be loaded." } });
@@ -1182,4 +1219,4 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
   };
 }
 
-module.exports = { AssistantError, createConversationEngine, pairedTimeCandidates, selectedAppointmentTimes, timeRangeTarget, timeReferences };
+module.exports = { AssistantError, createConversationEngine, pairedTimeCandidates, patientUiActions, publicToolResult, selectedAppointmentTimes, timeRangeTarget, timeReferences };

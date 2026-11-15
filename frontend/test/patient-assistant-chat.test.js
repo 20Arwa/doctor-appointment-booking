@@ -14,10 +14,16 @@ function loadTs(relativePath) {
   return loadedModule.exports;
 }
 const { assistantMessageDateKey, assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, classifyAssistantError, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery, retryOperation } = loadTs("lib/assistant-chat-state.ts");
+const { dateNavigationTarget } = loadTs("lib/date-format.ts");
 const { AssistantApiError, confirmAssistantAction, dismissAssistantProposal, getAssistantActionStatus, getAssistantConversation, listAssistantConversations, prepareAssistantAction, sendAssistantMessage } = loadTs("lib/assistant-api.ts");
 const { confirmationStatus, isProposalExpired, preserveDismissalOnPrepare, proposalDescription, proposalStatusFromBackend, proposalTitle, proposalTypeForResult, reconcileActionStatus } = loadTs("lib/assistant-action-state.ts");
 
 describe("patient assistant chat", () => {
+  it("resolves deep-link month boundaries across years and rejects invalid dates", () => {
+    assert.deepEqual(dateNavigationTarget("2027-01-04", "2026-11-15"), { date: "2027-01-04", month: "2027-01-01" });
+    assert.deepEqual(dateNavigationTarget("2028-02-29", "2026-11-15"), { date: "2028-02-29", month: "2028-02-01" });
+    assert.deepEqual(dateNavigationTarget("2027-02-29", "2026-11-15"), { date: "2026-11-15", month: "2026-11-01" });
+  });
   it("formats message timestamps in Asia/Kolkata and separates only the first message of each day", () => {
     const messages = [
       { role: "user", content: "first", createdAt: "2026-04-10T19:00:00.000Z" },
@@ -362,7 +368,8 @@ describe("patient assistant chat", () => {
     assert.match(component, /remaining_capacity.*capacity/);
     assert.match(component, /in this window/);
     assert.match(component, /in this slot/);
-    assert.match(component, /Legacy availability · mode unknown/);
+    assert.match(component, /Legacy availability/);
+    assert.doesNotMatch(component, /Legacy availability · mode unknown/);
   });
 
   it("renders doctor schedule, exception, conflict, and nearest-slot result shapes", () => {
@@ -394,6 +401,61 @@ describe("patient assistant chat", () => {
     assert.match(launcher, /PatientAssistantChat compact/);
     assert.match(launcher, /pathname === "\/patient\/assistant" \|\| pathname\.startsWith\("\/patient\/assistant\/"\)/);
     assert.match(shell, /requiredRole === "patient" \? <PatientAssistantLauncher/);
+  });
+
+  it("keeps patient navigation identifiers in UI metadata and opens deep links in their requested month", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    const booking = fs.readFileSync(path.join(projectRoot, "components/doctor-booking-page.tsx"), "utf8");
+    const availability = fs.readFileSync(path.join(projectRoot, "components/doctor-availability-page.tsx"), "utf8");
+    const patientAppointments = fs.readFileSync(path.join(projectRoot, "components/patient-appointments-page.tsx"), "utf8");
+    assert.match(chat, /uiAction\.appointment_id/);
+    assert.match(chat, /action\.availability_id/);
+    assert.match(chat, /action\.doctor_id/);
+    assert.match(booking, /searchParams\.get\("date"\)/);
+    assert.match(booking, /calendarMonth, doctorId, getToken/);
+    assert.match(availability, /initialScheduleDate\.month/);
+    assert.match(availability, /searchParams\.get\("time"\)/);
+    assert.match(availability, /schedule-slot-\$\{selectedDate\}/);
+    assert.match(chat, /function AssistantResultsCta/);
+    assert.match(chat, /function resultRowHref/);
+    assert.match(chat, /result\.tool === "get_available_slots"[\s\S]*action\.type === "slot"[\s\S]*\?slot=\$\{encodeURIComponent\(action\.availability_id\)\}&date=\$\{encodeURIComponent\(item\.date\)\}/);
+    assert.match(chat, /Choose this time/);
+    assert.doesNotMatch(chat, /Choose an available time/);
+    assert.match(chat, /result\.tool === "get_patient_appointments"[\s\S]*action\.type === "appointment"[\s\S]*\/patient\/appointments\?appointment=\$\{encodeURIComponent\(action\.appointment_id\)\}/);
+    assert.match(chat, /const action = result\.ui_actions\?\.\[index\]/);
+    assert.match(chat, /actionAppointmentId \? `appointment-\$\{actionAppointmentId\}`/);
+    assert.match(chat, /result\.tool === "get_doctor_appointments"[\s\S]*\/doctor\/appointments\?appointment=/);
+    assert.match(chat, /result\.tool === "search_doctors"[\s\S]*\/patient\/doctors/);
+    assert.match(chat, /visible\[0\]\.data\.scope === "nearest"/);
+    assert.match(chat, /Your next confirmed appointment:/);
+    assert.match(chat, /needsSharedAvailabilityLink/);
+    assert.match(chat, /appointments && !getAssistantResultRows\(appointments\)\.some/);
+    assert.match(chat, /href="\/patient\/appointments">Open My Appointments/);
+    assert.match(chat, /appointments && !getAssistantResultRows\(appointments\)\.some/);
+    assert.match(patientAppointments, /searchParams\.get\("appointment"\)/);
+    assert.match(patientAppointments, /getAppointment\(token, appointmentFromNotification\)/);
+    assert.match(patientAppointments, /pendingNotificationScroll\.current = appointment\.id/);
+    assert.match(patientAppointments, /document\.getElementById\(`appointment-\$\{appointmentId\}`\)/);
+    assert.match(chat, /actionAppointmentId \? `appointment-\$\{actionAppointmentId\}`/);
+    assert.match(chat, /border-t border-border pt-3/);
+    assert.match(chat, /Open My Appointments/);
+    assert.match(chat, /View patient/);
+    assert.doesNotMatch(chat, /Book this time/);
+  });
+
+  it("keeps each patient appointment result paired with its own private navigation ID", () => {
+    const firstId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const secondId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const result = {
+      tool: "get_patient_appointments",
+      data: { appointments: [{ date: "2027-01-01" }, { date: "2027-01-01" }] },
+      ui_actions: [{ type: "appointment", appointment_id: firstId }, { type: "appointment", appointment_id: secondId }],
+    };
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.equal(getAssistantResultRows(result).length, 2);
+    assert.deepEqual(result.ui_actions.map(({ appointment_id }) => appointment_id), [firstId, secondId]);
+    assert.match(chat, /const uiAction = result\.ui_actions\?\.\[index\]/);
+    assert.match(chat, /action\.appointment_id\)\}/);
   });
 
   it("hides empty result cards and all cards attached to refusal responses", () => {
@@ -507,6 +569,45 @@ describe("patient assistant chat", () => {
       assert.equal(request.init.headers.Authorization, "Bearer session");
       assert.deepEqual(JSON.parse(request.init.body), { request_id: "same-request", content: "hello" });
       assert.equal(result.assistant_message.content, "Hi");
+    } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
+  });
+
+  it("parses the multi-appointment history response with a distinct UI action for each appointment", async () => {
+    const originalFetch = globalThis.fetch; const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
+    const firstId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const secondId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      user_message: { id: "u", role: "user", content: "Show my upcoming appointments" },
+      assistant_message: { id: "a", role: "assistant", content: "Here are your upcoming appointments.", results: [{
+        tool: "get_patient_appointments",
+        data: { appointments: [{ date: "2027-01-10", start_time: "09:00", status: "confirmed" }, { date: "2027-01-11", start_time: "10:00", status: "confirmed" }] },
+        ui_actions: [{ type: "appointment", appointment_id: firstId }, { type: "appointment", appointment_id: secondId }],
+      }] },
+      replayed: false,
+    }), { status: 200, headers: { "content-type": "application/json" } });
+    try {
+      const response = await sendAssistantMessage("session", "conversation", "request", "Show my upcoming appointments");
+      const result = response.assistant_message.results[0];
+      assert.deepEqual(result.ui_actions.map(({ appointment_id }) => appointment_id), [firstId, secondId]);
+      assert.equal(getAssistantResultRows(result).length, 2);
+      assert.equal(JSON.stringify(result.data).includes(firstId), false);
+      assert.equal(JSON.stringify(result.data).includes(secondId), false);
+    } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
+  });
+
+  it("parses replayed Doctor Assistant responses with multiple results and UI navigation metadata", async () => {
+    const originalFetch = globalThis.fetch; const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
+    const appointmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    const results = [0, 1, 2].map((index) => ({ tool: "get_doctor_appointments", data: { appointments: [{ date: `2027-01-0${index + 1}`, start_time: "09:00", end_time: "09:30", status: "confirmed" }] }, ui_actions: [{ type: "appointment", appointment_id: appointmentId }] }));
+    results.push({ tool: "get_doctor_appointment_statistics", data: { total: 3, by_status: { confirmed: 3, completed: 0, cancelled: 0 } } });
+    globalThis.fetch = async () => new Response(JSON.stringify({ user_message: { id: "u", role: "user", content: "Show my next appointment" }, assistant_message: { id: "a", role: "assistant", content: "Your next confirmed appointment is January 1.", results }, replayed: true }), { status: 200, headers: { "content-type": "application/json" } });
+    try {
+      const response = await sendAssistantMessage("session", "conversation", "retry", "Show my next appointment");
+      assert.equal(response.replayed, true);
+      assert.equal(response.assistant_message.results.length, 4);
+      assert.equal(response.assistant_message.results[0].ui_actions[0].appointment_id, appointmentId);
     } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
   });
 

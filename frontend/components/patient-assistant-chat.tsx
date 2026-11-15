@@ -4,6 +4,8 @@ import { useAuth } from "@clerk/nextjs";
 import { ArrowDown, ArrowUp, Bot, CalendarDays, Check, Clock3, LoaderCircle, MessageCircle, MessageSquarePlus, RefreshCw, Search, Send, Sparkles, Stethoscope, UserRound, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { getDoctorAppointmentPatientId } from "@/lib/profile-api";
 import { Button } from "@/components/ui/button";
 import { AssistantApiError, confirmAssistantAction, createAssistantConversation, dismissAssistantProposal, getAssistantActionStatus, getAssistantConversation, listAssistantConversations, prepareAssistantAction, sendAssistantMessage, type AssistantActionIntent, type AssistantActionType, type AssistantConversation, type AssistantResult } from "@/lib/assistant-api";
 import { assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, retryOperation, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery } from "@/lib/assistant-chat-state";
@@ -18,7 +20,54 @@ function dateLabel(value: unknown) {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return "";
   return new Intl.DateTimeFormat("en-IN", { dateStyle: "medium", timeZone: "Asia/Kolkata" }).format(new Date(`${value}T12:00:00+05:30`));
 }
-function ResultCards({ result }: { result: AssistantResult }) {
+function assistantContentForResults(content: string, results: AssistantResult[]) {
+  const visible = getVisibleAssistantResults(content, results);
+  if (visible.length === 1 && visible[0].tool === "get_doctor_appointments" && visible[0].data.scope === "nearest"
+    && getAssistantResultRows(visible[0]).length === 1) return "Your next confirmed appointment:";
+  return getAssistantDisplayContent(content, results);
+}
+
+function resultRowHref(result: AssistantResult, index: number, doctorMode: boolean) {
+  const item = getAssistantResultRows(result)[index] as Record<string, unknown> | undefined;
+  const action = result.ui_actions?.[index];
+  if (!item || !action) return null;
+  if (doctorMode) {
+    if (result.tool === "get_doctor_appointments" && action.type === "appointment" && typeof action.appointment_id === "string") {
+      return `/doctor/appointments?appointment=${encodeURIComponent(action.appointment_id)}`;
+    }
+    if (result.tool === "get_doctor_nearest_slots" && action.type === "schedule_slot"
+      && typeof action.availability_id === "string" && typeof item.date === "string" && typeof item.start_time === "string") {
+      return `/doctor/availability?date=${encodeURIComponent(item.date)}&time=${encodeURIComponent(item.start_time)}`;
+    }
+    if (result.tool === "get_doctor_schedule_conflicts" && typeof item.date === "string" && typeof item.start_time === "string") {
+      return `/doctor/availability?date=${encodeURIComponent(item.date)}&time=${encodeURIComponent(item.start_time)}`;
+    }
+    return null;
+  }
+  if (result.tool === "get_available_slots" && action.type === "slot"
+    && typeof action.doctor_id === "string" && typeof action.availability_id === "string" && typeof item.date === "string") {
+    return `/patient/doctors/${encodeURIComponent(action.doctor_id)}?slot=${encodeURIComponent(action.availability_id)}&date=${encodeURIComponent(item.date)}`;
+  }
+  if (result.tool === "search_doctors" && action.type === "doctor" && typeof action.doctor_id === "string") {
+    return `/patient/doctors/${encodeURIComponent(action.doctor_id)}`;
+  }
+  if (result.tool === "get_patient_appointments" && action.type === "appointment" && typeof action.appointment_id === "string") {
+    return `/patient/appointments?appointment=${encodeURIComponent(action.appointment_id)}`;
+  }
+  return null;
+}
+
+function resultRowActionLabel(result: AssistantResult, doctorMode: boolean) {
+  if (doctorMode && result.tool === "get_doctor_nearest_slots") return "View availability";
+  if (doctorMode && result.tool === "get_doctor_schedule_conflicts") return "View availability";
+  if (!doctorMode && result.tool === "get_available_slots") return "Choose this time";
+  if (!doctorMode && result.tool === "search_doctors") return "View doctor";
+  return "View appointment";
+}
+
+function ResultCards({ result, doctorMode }: { result: AssistantResult; doctorMode: boolean }) {
+  const { getToken } = useAuth();
+  const router = useRouter();
   const rows = getAssistantResultRows(result);
   const doctorTool = result.tool.startsWith("get_doctor_");
   if (!rows.length) return doctorTool ? <p className="mt-2 text-sm text-muted-foreground">No matching records were found for this range.{typeof result.data.notice === "string" ? ` ${result.data.notice}` : ""}</p> : null;
@@ -31,12 +80,17 @@ function ResultCards({ result }: { result: AssistantResult }) {
           : typeof doctor?.name === "string" ? doctor.name : typeof item.name === "string" ? item.name
             : ["get_available_slots", "get_doctor_nearest_slots"].includes(result.tool) ? "Available appointment" : "Appointment";
     const date = dateLabel(item.date);
-    return <li key={`${String(item.id || item.date || item.name)}-${index}`} className="rounded-xl border border-border bg-background p-3 text-sm">
+    const uiAction = result.ui_actions?.[index];
+    const appointmentId = doctorMode && result.tool === "get_doctor_appointments" && uiAction?.type === "appointment" && typeof uiAction.appointment_id === "string" ? uiAction.appointment_id : null;
+    const rowHref = resultRowHref(result, index, doctorMode);
+    const actionAppointmentId = uiAction?.type === "appointment" && typeof uiAction.appointment_id === "string" ? uiAction.appointment_id : null;
+    const rowKey = actionAppointmentId ? `appointment-${actionAppointmentId}` : `${String(item.id || item.date || item.name)}-${index}`;
+    return <li key={rowKey} className="rounded-xl border border-border bg-background p-3 text-sm">
       <p className="font-semibold text-foreground">{title}</p>
       {typeof item.specialty === "string" ? <p className="mt-1 text-muted-foreground">{item.specialty}</p> : null}
       {["get_available_slots", "get_doctor_nearest_slots"].includes(result.tool) && item.mode === "wave" ? <p className="mt-1 font-medium text-foreground">Available slot · Wave</p> : null}
       {["get_available_slots", "get_doctor_nearest_slots"].includes(result.tool) && item.mode === "stream" ? <p className="mt-1 font-medium text-foreground">Available window · Stream</p> : null}
-      {result.tool === "get_available_slots" && item.mode === "legacy" ? <p className="mt-1 font-medium text-foreground">Legacy availability · mode unknown</p> : null}
+      {result.tool === "get_available_slots" && item.mode === "legacy" ? <p className="mt-1 font-medium text-foreground">Legacy availability</p> : null}
       {date ? <p className="mt-1 flex items-center gap-1 text-muted-foreground"><Clock3 aria-hidden="true" className="size-3.5" />{date} · {displayTime(item.start_time)}–{displayTime(item.end_time)}</p> : null}
       {typeof item.consultation_fee === "number" ? <p className="mt-1 text-xs text-muted-foreground">Consultation fee: ₹{item.consultation_fee.toLocaleString("en-IN")}</p> : null}
       {typeof item.remaining_capacity === "number" && typeof item.capacity === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.remaining_capacity} of {item.capacity} places remaining{item.mode === "stream" ? " in this window" : " in this slot"}</p> : null}
@@ -48,8 +102,29 @@ function ResultCards({ result }: { result: AssistantResult }) {
       {result.tool === "get_doctor_schedule_exceptions" && Array.isArray(item.periods) ? <p className="mt-1 text-xs text-muted-foreground">{(item.periods as Record<string, unknown>[]).map((period) => `${displayTime(period.start_time)}–${displayTime(period.end_time)}`).join(", ") || "No hours"}</p> : null}
       {result.tool === "get_doctor_schedule_conflicts" && Array.isArray(item.conflicts) ? <p className="mt-1 text-xs text-muted-foreground">{(item.conflicts as unknown[]).map((conflict) => String(conflict).replaceAll("_", " ")).join(" · ")}</p> : null}
       {result.tool === "get_doctor_schedule_conflicts" && typeof item.occupied === "number" && typeof item.remaining_capacity === "number" && typeof item.capacity === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.occupied} occupied · {item.remaining_capacity} remaining of {item.capacity}</p> : null}
+      {rowHref || appointmentId ? <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border pt-3">
+        {rowHref ? <Link className="text-sm font-medium text-primary underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={rowHref}>{resultRowActionLabel(result, doctorMode)}</Link> : null}
+        {appointmentId ? <button type="button" className="text-sm font-medium text-primary underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" onClick={async () => { try { const token = await getToken(); if (!token) return; const patientId = await getDoctorAppointmentPatientId(token, appointmentId); router.push(`/doctor/patients/${encodeURIComponent(patientId)}`); } catch { router.push(`/doctor/appointments?appointment=${encodeURIComponent(appointmentId)}`); } }}>View patient</button> : null}
+      </div> : null}
     </li>;
   })}</ul>{doctorTool && typeof result.data.notice === "string" ? <p className="mt-3 text-xs text-muted-foreground">{result.data.notice}</p> : null}</div>;
+}
+
+function AssistantResultsCta({ results, doctorMode }: { results: AssistantResult[]; doctorMode: boolean }) {
+  if (doctorMode) {
+    const scheduleResults = results.filter(({ tool }) => ["get_doctor_schedules", "get_doctor_schedule_exceptions", "get_doctor_schedule_conflicts", "get_doctor_nearest_slots"].includes(tool));
+    const needsSharedAvailabilityLink = scheduleResults.some((result) => getAssistantResultRows(result).some((_row, index) => !resultRowHref(result, index, true)));
+    if (!needsSharedAvailabilityLink) return null;
+    const scheduleResult = scheduleResults.find((result) => getAssistantResultRows(result).some((_row, index) => !resultRowHref(result, index, true)))!;
+    const item = getAssistantResultRows(scheduleResult).find((_row, index) => !resultRowHref(scheduleResult, index, true)) as Record<string, unknown> | undefined;
+    const query = item?.date ? `?date=${encodeURIComponent(String(item.date))}${item.start_time ? `&time=${encodeURIComponent(String(item.start_time))}` : ""}` : "";
+    return <Link className="mt-3 inline-block text-sm font-medium text-primary underline" href={`/doctor/availability${query}`}>Open availability</Link>;
+  }
+  const appointments = results.find(({ tool }) => tool === "get_patient_appointments");
+  if (appointments && !getAssistantResultRows(appointments).some((_row, index) => resultRowHref(appointments, index, false))) {
+    return <Link className="mt-3 inline-block text-sm font-medium text-primary underline" href="/patient/appointments">Open My Appointments</Link>;
+  }
+  return null;
 }
 function ResultIcon({ result }: { result: AssistantResult }) { return result.tool === "search_doctors" ? <Stethoscope aria-hidden="true" className="size-4" /> : <CalendarDays aria-hidden="true" className="size-4" />; }
 
@@ -375,8 +450,8 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
           <div className={`flex max-w-[94%] items-end gap-2 sm:max-w-[82%] ${message.role === "user" ? "flex-row-reverse" : ""}`}>
           {message.role === "assistant" ? <span aria-label="AI assistant" className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><Bot aria-hidden="true" className="size-4" /></span> : <span aria-label={doctorMode ? "Doctor" : "Patient"} className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><UserRound aria-hidden="true" className="size-4" /></span>}
           <div className={`min-w-0 rounded-2xl p-3 ${message.role === "user" ? "rounded-br-md bg-primary text-primary-foreground" : "rounded-bl-md border border-border bg-background text-foreground"}`}>
-            {message.role === "assistant" ? <p className="mb-1 text-xs font-semibold opacity-75">Medrella Assistant</p> : null}<p className="whitespace-pre-wrap text-sm leading-6">{message.role === "assistant" ? getAssistantDisplayContent(message.content, message.results) : message.content}</p>
-            {message.role === "assistant" ? getVisibleAssistantResults(message.content, message.results).map((result, index) => <section key={`${result.tool}-${index}`} className="mt-3 rounded-xl border border-border bg-card p-3 text-card-foreground"><h3 className="flex items-center gap-2 text-xs font-semibold"><ResultIcon result={result} />{result.tool === "search_doctors" ? "Doctors" : result.tool === "get_available_slots" || result.tool === "get_doctor_nearest_slots" ? "Available times" : result.tool === "get_doctor_schedules" ? "Schedules" : result.tool === "get_doctor_schedule_exceptions" ? "Schedule exceptions" : result.tool === "get_doctor_schedule_conflicts" ? "Scheduling conflicts" : "Appointments"}</h3><ResultCards result={result} /></section>) : null}
+            {message.role === "assistant" ? <p className="mb-1 text-xs font-semibold opacity-75">Medrella Assistant</p> : null}<p className="whitespace-pre-wrap text-sm leading-6">{message.role === "assistant" ? assistantContentForResults(message.content, message.results || []) : message.content}</p>
+            {message.role === "assistant" ? <>{getVisibleAssistantResults(message.content, message.results).map((result, index) => <section key={`${result.tool}-${index}`} className="mt-3 rounded-xl border border-border bg-card p-3 text-card-foreground"><h3 className="flex items-center gap-2 text-xs font-semibold"><ResultIcon result={result} />{result.tool === "search_doctors" ? "Doctors" : result.tool === "get_available_slots" || result.tool === "get_doctor_nearest_slots" ? "Available times" : result.tool === "get_doctor_schedules" ? "Schedules" : result.tool === "get_doctor_schedule_exceptions" ? "Schedule exceptions" : result.tool === "get_doctor_schedule_conflicts" ? "Scheduling conflicts" : "Appointments"}</h3><ResultCards result={result} doctorMode={doctorMode} /></section>)}<AssistantResultsCta results={getVisibleAssistantResults(message.content, message.results)} doctorMode={doctorMode} /></> : null}
           </div>
           </div>
           <time className={`mt-1 px-10 text-xs text-muted-foreground ${message.role === "user" ? "text-right" : "text-left"}`} dateTime={message.createdAt}>{assistantMessageTimeLabel(message.createdAt)}</time>

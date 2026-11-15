@@ -2,6 +2,7 @@
 
 import { useAuth } from "@clerk/nextjs";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { CalendarPlus, RefreshCw, Trash2, CalendarRange, Sparkles, ChevronLeft, ChevronRight, Pencil, X, Eye, Save } from "lucide-react";
 import { useDashboardProfile } from "@/components/role-application-shell";
 import { useEffect, useRef, useState } from "react";
@@ -18,7 +19,7 @@ import {
 import { deleteDoctorSlot, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DoctorSchedule, type ElasticSchedulePreview, type ElasticScheduleInput, createDoctorSchedule, createScheduleException, generateDoctorAvailability, getDoctorSchedules, previewDoctorScheduleUpdate, updateDoctorSchedule, updateDoctorProfile } from "@/lib/profile-api";
 import { notifySuccess } from "@/lib/notifications";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { formatDateOnly } from "@/lib/date-format";
+import { dateNavigationTarget, formatDateOnly } from "@/lib/date-format";
 import { DateInput } from "@/components/ui/date-input";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
@@ -93,6 +94,7 @@ export function DoctorAvailabilityPage() {
   const profile = useDashboardProfile();
   const doctorId = profile.profile.id;
   const { getToken } = useAuth();
+  const searchParams = useSearchParams();
   const [slots, setSlots] = useState<AvailabilitySlot[]>([]);
   const [schedules, setSchedules] = useState<DoctorSchedule[]>([]);
   const [scheduleLoading, setScheduleLoading] = useState(true);
@@ -130,8 +132,11 @@ export function DoctorAvailabilityPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [scheduleRefreshKey, setScheduleRefreshKey] = useState(0);
-  const [calendarMonth, setCalendarMonth] = useState(() => `${todayInApplicationZone().slice(0, 7)}-01`);
-  const [selectedDate, setSelectedDate] = useState(todayInApplicationZone());
+  const linkedDate = searchParams.get("date");
+  const linkedTime = searchParams.get("time")?.slice(0, 5) || "";
+  const initialScheduleDate = dateNavigationTarget(linkedDate, todayInApplicationZone());
+  const [calendarMonth, setCalendarMonth] = useState(() => initialScheduleDate.month);
+  const [selectedDate, setSelectedDate] = useState(initialScheduleDate.date);
   const [activeSlotId, setActiveSlotId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<AvailabilitySlot | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -423,6 +428,10 @@ export function DoctorAvailabilityPage() {
     return counts;
   }, {});
   const selectedDateSlots = slots.filter((slot) => slot.date === selectedDate);
+  useEffect(() => {
+    if (!linkedTime || !selectedDateSlots.length) return;
+    document.getElementById(`schedule-slot-${selectedDate}-${linkedTime.replace(":", "-")}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [linkedTime, selectedDate, selectedDateSlots.length]);
   const calendarDates = calendarCells(calendarMonth);
   const currentMonth = `${todayInApplicationZone().slice(0, 7)}-01`;
 
@@ -535,7 +544,7 @@ export function DoctorAvailabilityPage() {
           <div className="flex items-center justify-between gap-3"><button type="button" aria-label="Previous month" disabled={calendarMonth <= currentMonth} onClick={() => { const next = shiftMonth(calendarMonth, -1); setCalendarMonth(next); setLoading(true); setSlots([]); setLoadError(null); }} className="inline-flex size-10 items-center justify-center rounded-lg border border-border hover:bg-muted disabled:opacity-40"><ChevronLeft aria-hidden="true" className="size-4" /></button><h3 className="font-semibold text-foreground" aria-live="polite">{formatMonth(calendarMonth)}</h3><button type="button" aria-label="Next month" onClick={() => { const next = shiftMonth(calendarMonth, 1); setCalendarMonth(next); setLoading(true); setSlots([]); setLoadError(null); }} className="inline-flex size-10 items-center justify-center rounded-lg border border-border hover:bg-muted"><ChevronRight aria-hidden="true" className="size-4" /></button></div>
           <div className="mt-4 grid grid-cols-7 gap-1 text-center text-xs font-medium text-muted-foreground">{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => <span key={day} className="py-2">{day}</span>)}</div>
           <div className="grid grid-cols-7 justify-items-center gap-1">{calendarDates.map((day, index) => { if (!day) return <span key={"blank-" + index} aria-hidden="true" className="size-10" />; const count = availabilityCounts[day] ?? 0; const reservations = reservationCounts[day] ?? 0; const selected = day === selectedDate; const today = day === todayInApplicationZone(); const label = `${formatDate(day)}, ${count ? `${count} bookable availability option${count === 1 ? "" : "s"}` : "no bookable availability"}${reservations ? `, ${reservations} reservation-only row${reservations === 1 ? "" : "s"}` : ""}`; return <button key={day} type="button" aria-label={label} aria-pressed={selected} onClick={() => setSelectedDate(day)} className={`flex size-10 flex-col items-center justify-center rounded-lg text-xs transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring ${today ? "ring-2 ring-inset ring-ring" : ""} ${selected ? "bg-primary font-semibold text-primary-foreground" : count ? "bg-secondary/60 font-medium text-secondary-foreground hover:bg-secondary" : "text-muted-foreground hover:bg-muted"}`}><span>{Number(day.slice(-2))}</span><span className="flex min-h-2 items-center gap-0.5 text-[9px] leading-none" aria-hidden="true">{count ? count : ""}{reservations ? <span className="rounded-sm bg-muted px-0.5 text-[8px]">R{reservations > 1 ? reservations : ""}</span> : null}</span></button>; })}</div>
-          <div className="mt-5 border-t border-border pt-4"><h3 className="font-semibold text-card-foreground">{formatDate(selectedDate)}</h3>{selectedDateSlots.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">No availability or reservations on this date.</p> : <ul className="mt-3 divide-y divide-border">{selectedDateSlots.map((slot) => <li key={slot.id} className="flex items-center justify-between gap-4 py-3"><div><span className="inline-flex rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">{slot.reservation_only ? "Reservation" : slot.mode === "wave" ? "Wave" : "Stream"}</span><p className="mt-1 text-sm text-muted-foreground">{slot.mode === "stream" ? "Continuous window · " : ""}{formatTime(slot.start_time)}–{formatTime(slot.end_time)} IST</p>{slot.reservation_only ? <p className="mt-1 text-xs text-muted-foreground">{slot.preserved_reservation_count ?? 1} existing booking{(slot.preserved_reservation_count ?? 1) === 1 ? "" : "s"} preserved. Not available for new bookings.</p> : slot.capacity != null && slot.remaining_capacity != null ? <p className="mt-1 text-xs text-muted-foreground">{slot.remaining_capacity} / {slot.capacity} places available</p> : null}</div>{!slot.reservation_only ? <button type="button" aria-label={`Remove availability on ${formatDate(slot.date)} at ${formatTime(slot.start_time)}`} onClick={() => { setDeleteError(null); setDeleteTarget(slot); }} disabled={activeSlotId !== null} className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50">{activeSlotId === slot.id ? <RefreshCw aria-hidden="true" className="size-4 animate-spin" /> : <Trash2 aria-hidden="true" className="size-4" />}</button> : null}</li>)}</ul>}</div>
+          <div className="mt-5 border-t border-border pt-4"><h3 className="font-semibold text-card-foreground">{formatDate(selectedDate)}</h3>{selectedDateSlots.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">No availability or reservations on this date.</p> : <ul className="mt-3 divide-y divide-border">{selectedDateSlots.map((slot) => <li id={`schedule-slot-${slot.date}-${slot.start_time.slice(0, 5).replace(":", "-")}`} key={slot.id} className={`flex items-center justify-between gap-4 py-3 ${linkedTime && slot.start_time.slice(0, 5) === linkedTime ? "rounded-lg bg-secondary/40 px-3 ring-2 ring-ring" : ""}`}><div><span className="inline-flex rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">{slot.reservation_only ? "Reservation" : slot.mode === "wave" ? "Wave" : "Stream"}</span><p className="mt-1 text-sm text-muted-foreground">{slot.mode === "stream" ? "Continuous window · " : ""}{formatTime(slot.start_time)}–{formatTime(slot.end_time)} IST</p>{slot.reservation_only ? <p className="mt-1 text-xs text-muted-foreground">{slot.preserved_reservation_count ?? 1} existing booking{(slot.preserved_reservation_count ?? 1) === 1 ? "" : "s"} preserved. Not available for new bookings.</p> : slot.capacity != null && slot.remaining_capacity != null ? <p className="mt-1 text-xs text-muted-foreground">{slot.remaining_capacity} / {slot.capacity} places available</p> : null}</div>{!slot.reservation_only ? <button type="button" aria-label={`Remove availability on ${formatDate(slot.date)} at ${formatTime(slot.start_time)}`} onClick={() => { setDeleteError(null); setDeleteTarget(slot); }} disabled={activeSlotId !== null} className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50">{activeSlotId === slot.id ? <RefreshCw aria-hidden="true" className="size-4 animate-spin" /> : <Trash2 aria-hidden="true" className="size-4" />}</button> : null}</li>)}</ul>}</div>
         </div> : null}
       </section>      <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => {
         if (!open && activeSlotId === null) {

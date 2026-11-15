@@ -350,6 +350,13 @@ export async function getDoctorPatient(token: string, patientId: string): Promis
   return parsed.data;
 }
 
+export async function getDoctorAppointmentPatientId(token: string, appointmentId: string): Promise<string> {
+  const payload = await request<unknown>(token, `/appointments/${encodeURIComponent(appointmentId)}/patient-profile`);
+  const parsed = z.object({ patient_id: z.string().uuid() }).safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete patient profile link.");
+  return parsed.data.patient_id;
+}
+
 export async function getDoctorPatientAppointmentsPage(token: string, patientId: string, view: "scheduled" | "past" | "cancelled", offset: number, limit = 5): Promise<AppointmentPage> {
   const query = new URLSearchParams({ view, limit: String(limit), offset: String(offset) });
   const payload = await request<unknown>(token, `/doctors/patients/${encodeURIComponent(patientId)}/appointments?${query.toString()}`);

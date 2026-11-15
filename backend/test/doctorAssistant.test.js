@@ -11,6 +11,30 @@ const otherDoctor = { id: "99999999-9999-4999-8999-999999999999", role: "doctor"
 const conversationId = "22222222-2222-4222-8222-222222222222";
 
 describe("doctor assistant appointment insights", () => {
+  it("normalizes next appointment lookups to nearest confirmed scope and keeps actions aligned", async () => {
+    let turn = 0;
+    let receivedArgs;
+    const engine = createDoctorConversationEngine({
+      provider: { generate: async () => turn++ === 0 ? { toolCalls: [{ id: "next", name: "get_doctor_appointments", arguments: { scope: "nearest", status: "cancelled" } }] } : { text: "Your next confirmed appointment is January 2." } },
+      toolExecutor: async ({ args }) => { receivedArgs = args; return { appointments: [{ date: "2027-01-02", start_time: "09:00", status: "confirmed" }], ui_actions: [{ type: "appointment", appointment_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }] }; },
+    });
+    const result = await engine.respond({ actor: doctor, messages: [{ role: "user", content: "Show my next appointment." }], tools: [], systemInstruction: "" });
+    assert.deepEqual(receivedArgs, { scope: "nearest", status: "confirmed" });
+    assert.deepEqual(result.results[0].ui_actions, [{ type: "appointment", appointment_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }]);
+    assert.equal("appointment_id" in result.results[0].data.appointments[0], false);
+  });
+  it("keeps navigation identifiers in UI metadata and out of model tool results", async () => {
+    const providerCalls = [];
+    let round = 0;
+    const engine = createDoctorConversationEngine({
+      provider: { generate: async (input) => { providerCalls.push(input); return round++ === 0 ? { toolCalls: [{ id: "call", name: "get_doctor_appointments", arguments: {} }] } : { text: "One appointment." }; } },
+      toolExecutor: async () => ({ appointments: [{ date: "2027-01-01", start_time: "09:00", status: "confirmed" }], ui_actions: [{ type: "appointment", appointment_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }] }),
+    });
+    const result = await engine.respond({ actor: doctor, messages: [], database: {}, tools: [], systemInstruction: "" });
+    assert.equal(result.results[0].ui_actions[0].appointment_id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    assert.equal("ui_actions" in providerCalls[1].messages.at(-1).toolResults[0].result, false);
+    assert.equal("appointment_id" in providerCalls[1].messages.at(-1).toolResults[0].result.appointments[0], false);
+  });
   it("exposes only read-only doctor tools and denies other roles", () => {
     const names = getToolsForActor(doctor).map(({ name }) => name);
     assert.deepEqual(names, ["get_doctor_schedules", "get_doctor_schedule_exceptions", "get_doctor_schedule_conflicts", "get_doctor_nearest_slots", "get_doctor_appointments", "get_doctor_appointment_statistics"]);
@@ -25,6 +49,10 @@ describe("doctor assistant appointment insights", () => {
     assert.equal(list.schema.safeParse({ date: "2027-02-01", to: "2027-02-01" }).success, false);
     assert.equal(list.schema.safeParse({ day: "today", offset: 10, limit: 50 }).success, true);
     assert.equal(list.schema.safeParse({ day: "today", limit: 51 }).success, false);
+    assert.equal(list.schema.safeParse({ scope: "nearest", status: "confirmed" }).success, true);
+    assert.equal(list.schema.safeParse({ scope: "nearest", from: "2027-02-01", to: "2027-02-02" }).success, false);
+    assert.equal(list.schema.safeParse({ scope: "upcoming", from: "2027-02-01", to: "2027-02-28", status: "confirmed" }).success, true);
+    assert.equal(list.schema.safeParse({ scope: "upcoming", from: "2027-02-01" }).success, false);
     const scheduleTool = getToolsForActor(doctor).find(({ name }) => name === "get_doctor_schedules");
     assert.equal(scheduleTool.schema.safeParse({ from: "2027-02-01", to: "2027-03-04" }).success, false);
     assert.equal(scheduleTool.schema.safeParse({ from: "2027-02-01", to: "2027-02-02", doctor_id: otherDoctor.id }).success, false);
@@ -49,7 +77,8 @@ describe("doctor assistant appointment insights", () => {
     assert.match(call.sql, /doctor\.user_id = \$1/);
     assert.doesNotMatch(call.sql, /JOIN patients|patient_user|patient_id|first_name|last_name|email|phone|date_of_birth|gender|reason|payment/i);
     assert.deepEqual(result.appointments[0], { date: "2027-02-01", start_time: "09:00:00", end_time: "09:30:00", status: "confirmed", mode: "wave" });
-    assert.doesNotMatch(JSON.stringify(result), /patient-id|appointment-id|payment-id|patient@example\.com|555-0100|private reason|"A"|"B"/);
+    assert.deepEqual(result.ui_actions, [{ type: "appointment", appointment_id: "appointment-id" }]);
+    assert.doesNotMatch(JSON.stringify(result.appointments), /patient-id|appointment-id|payment-id|patient@example\.com|555-0100|private reason|"A"|"B"/);
     assert.match(getToolsForActor(doctor).find(({ name }) => name === "get_doctor_appointments").description, /never request or disclose patient names, IDs, or other patient details/i);
     assert.equal("doctor_id" in result, false);
   });
@@ -82,6 +111,76 @@ describe("doctor assistant appointment insights", () => {
     assert.equal(page.appointments.length, 2);
     assert.equal(page.has_more, true);
     assert.equal(page.next_offset, 12);
+  });
+
+  it("executes nearest doctor appointments as one upcoming confirmed appointment with its navigation action", async () => {
+    let call;
+    const database = { async query(sql, values) {
+      call = { sql, values };
+      return { rows: [{ id: "next-id", status: "confirmed", date: "2027-02-03", start_time: "09:00:00", end_time: "09:30:00", mode: "wave", patient_first_name: "Private", patient_id: "private-id" }] };
+    } };
+    const result = await executeTool({ name: "get_doctor_appointments", actor: doctor, database, args: { scope: "nearest", status: "confirmed" } });
+    assert.match(call.sql, /a\.status = 'confirmed'/);
+    assert.match(call.sql, /scheduled_date \+ a\.scheduled_start_time/);
+    assert.deepEqual(result.appointments, [{ date: "2027-02-03", start_time: "09:00:00", end_time: "09:30:00", status: "confirmed", mode: "wave" }]);
+    assert.deepEqual(result.ui_actions, [{ type: "appointment", appointment_id: "next-id" }]);
+    assert.equal(result.has_more, false);
+    assert.doesNotMatch(JSON.stringify(result), /Private|private-id/);
+  });
+
+  it("lists only future confirmed appointments in range, caps at 15, and keeps same-time appointments distinct", async () => {
+    let call;
+    const rows = Array.from({ length: 16 }, (_, index) => ({
+      id: `appointment-${index + 1}`, status: "confirmed",
+      date: index < 2 ? "2026-11-20" : `2026-11-${String(20 + Math.floor(index / 2)).padStart(2, "0")}`,
+      start_time: index < 2 ? "09:00:00" : `${String(10 + index).padStart(2, "0")}:00:00`,
+      end_time: index < 2 ? "09:30:00" : `${String(10 + index).padStart(2, "0")}:30:00`,
+      mode: "wave", patient_id: "private-patient", patient_first_name: "Private",
+    }));
+    const database = { async query(sql, values) { call = { sql, values }; return { rows }; } };
+    const result = await executeTool({ name: "get_doctor_appointments", actor: doctor, database, args: { scope: "upcoming", from: "2026-11-01", to: "2026-11-30" } });
+    assert.match(call.sql, /a\.status = 'confirmed'/);
+    assert.match(call.sql, /\(\(a\.scheduled_date \+ a\.scheduled_start_time\) AT TIME ZONE \$2\) > NOW\(\)/);
+    assert.match(call.sql, /a\.scheduled_date >= \$4::date/);
+    assert.match(call.sql, /a\.scheduled_date <= \$5::date/);
+    assert.match(call.sql, /ORDER BY a\.scheduled_date, a\.scheduled_start_time, a\.id/);
+    assert.deepEqual(call.values, [doctor.id, "Asia/Kolkata", "confirmed", "2026-11-01", "2026-11-30", 16, 0]);
+    assert.equal(result.appointments.length, 15);
+    assert.deepEqual(result.appointments.slice(0, 2).map(({ date, start_time }) => ({ date, start_time })), [
+      { date: "2026-11-20", start_time: "09:00:00" }, { date: "2026-11-20", start_time: "09:00:00" },
+    ]);
+    assert.deepEqual(result.ui_actions.slice(0, 2), [
+      { type: "appointment", appointment_id: "appointment-1" }, { type: "appointment", appointment_id: "appointment-2" },
+    ]);
+    assert.equal(result.has_more, true);
+    assert.doesNotMatch(JSON.stringify(result.appointments), /appointment-1|appointment-2|Private|private-patient/);
+  });
+
+  it("limits default upcoming list requests but leaves explicit cancelled history queries unchanged", async () => {
+    const received = [];
+    let turn = 0;
+    const engine = createDoctorConversationEngine({
+      provider: { generate: async () => turn++ === 0
+        ? { toolCalls: [{ id: "list", name: "get_doctor_appointments", arguments: { from: "2026-11-01", to: "2026-11-30", status: "cancelled" } }] }
+        : { text: "Here are your appointments." } },
+      now: () => new Date("2026-11-15T08:00:00.000Z"),
+      maxToolCalls: 1,
+      toolExecutor: async ({ args }) => { received.push(args); return { appointments: [], has_more: false }; },
+    });
+    await engine.respond({ actor: doctor, messages: [{ role: "user", content: "Show my appointments for November 2026." }], tools: [], systemInstruction: "" });
+    assert.deepEqual(received[0], { from: "2026-11-01", to: "2026-11-30", status: "confirmed", scope: "upcoming" });
+
+    received.length = 0;
+    turn = 0;
+    const historyEngine = createDoctorConversationEngine({
+      provider: { generate: async () => turn++ === 0
+        ? { toolCalls: [{ id: "history", name: "get_doctor_appointments", arguments: { from: "2026-11-01", to: "2026-11-30", status: "cancelled" } }] }
+        : { text: "Here are the cancelled appointments." } },
+      now: () => new Date("2026-11-15T08:00:00.000Z"), maxToolCalls: 1,
+      toolExecutor: async ({ args }) => { received.push(args); return { appointments: [] }; },
+    });
+    await historyEngine.respond({ actor: doctor, messages: [{ role: "user", content: "Show my cancelled appointments for November 2026." }], tools: [], systemInstruction: "" });
+    assert.deepEqual(received[0], { from: "2026-11-01", to: "2026-11-30", status: "cancelled" });
   });
 
   it("doctor conversation engine never exposes patient action tools and keeps tools read-only", async () => {

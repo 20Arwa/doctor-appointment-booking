@@ -110,10 +110,16 @@ const doctorTools = [
   },
   {
     name: "get_doctor_appointments",
-    description: "List the authenticated doctor's appointments for an exact date, today/tomorrow/yesterday, or inclusive date range. Return only date, time, status, and scheduling mode; never request or disclose patient names, IDs, or other patient details. Dates use Asia/Kolkata.",
-    parameters: { type: "OBJECT", properties: { date: { type: "STRING" }, day: { type: "STRING", enum: ["today", "tomorrow", "yesterday"] }, from: { type: "STRING" }, to: { type: "STRING" }, status: { type: "STRING", enum: ["confirmed", "completed", "cancelled"] }, offset: { type: "INTEGER", minimum: 0, maximum: 100000 }, limit: { type: "INTEGER", minimum: 1, maximum: 50 } }, required: [] },
-    schema: z.object({ date: z.iso.date().optional(), day: z.enum(["today", "tomorrow", "yesterday"]).optional(), from: z.iso.date().optional(), to: z.iso.date().optional(), status: z.enum(["confirmed", "completed", "cancelled"]).optional(), offset: z.number().int().min(0).max(100000).default(0), limit: z.number().int().min(1).max(50).default(20) }).strict()
-      .refine(({ date, day, from, to }) => Number(Boolean(date)) + Number(Boolean(day)) + Number(Boolean(from && to)) === 1 && Boolean(from) === Boolean(to), "Provide one date/day or both range endpoints")
+    description: "Find the next upcoming confirmed appointment with scope nearest. For an upcoming list, use scope upcoming, optionally with one exact date, today/tomorrow/yesterday, or both inclusive range endpoints. Otherwise list the authenticated doctor's appointments for an exact date, today/tomorrow/yesterday, or inclusive date range. Return only date, time, status, and scheduling mode; never request or disclose patient names, IDs, or other patient details. Dates use Asia/Kolkata.",
+    parameters: { type: "OBJECT", properties: { scope: { type: "STRING", enum: ["nearest", "upcoming"] }, date: { type: "STRING" }, day: { type: "STRING", enum: ["today", "tomorrow", "yesterday"] }, from: { type: "STRING" }, to: { type: "STRING" }, status: { type: "STRING", enum: ["confirmed", "completed", "cancelled"] }, offset: { type: "INTEGER", minimum: 0, maximum: 100000 }, limit: { type: "INTEGER", minimum: 1, maximum: 50 } }, required: [] },
+    schema: z.object({ scope: z.enum(["nearest", "upcoming"]).optional(), date: z.iso.date().optional(), day: z.enum(["today", "tomorrow", "yesterday"]).optional(), from: z.iso.date().optional(), to: z.iso.date().optional(), status: z.enum(["confirmed", "completed", "cancelled"]).optional(), offset: z.number().int().min(0).max(100000).default(0), limit: z.number().int().min(1).max(50).default(20) }).strict()
+      .refine(({ scope, date, day, from, to }) => {
+        const hasOneSelector = Number(Boolean(date)) + Number(Boolean(day)) + Number(Boolean(from && to)) === 1;
+        const hasNoSelector = !date && !day && !from && !to;
+        if (scope === "nearest") return hasNoSelector;
+        if (scope === "upcoming") return hasNoSelector || hasOneSelector && Boolean(from) === Boolean(to);
+        return hasOneSelector && Boolean(from) === Boolean(to);
+      }, "Provide nearest scope or one date/day or both range endpoints")
       .refine(({ from, to }) => !from || to >= from && Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`) <= 366 * 86400000, "Date range must be ordered and no longer than 367 days"),
   },
   {
