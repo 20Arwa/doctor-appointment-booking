@@ -13,10 +13,61 @@ function loadTs(relativePath) {
   loadedModule._compile(ts.transpileModule(fs.readFileSync(filename, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, baseUrl: projectRoot, paths: { "@/*": ["./*"] } } }).outputText, filename);
   return loadedModule.exports;
 }
-const { chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend } = loadTs("lib/assistant-chat-state.ts");
-const { getAssistantConversation, sendAssistantMessage } = loadTs("lib/assistant-api.ts");
+const { canSendAssistantMessage, chatReducer, classifyAssistantError, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, shouldShowHistoryRecovery, retryOperation } = loadTs("lib/assistant-chat-state.ts");
+const { getAssistantConversation, listAssistantConversations, sendAssistantMessage } = loadTs("lib/assistant-api.ts");
 
 describe("patient assistant chat", () => {
+  it("shows saved-history recovery controls only for conversation/history failures", () => {
+    for (const code of ["CONVERSATION_NOT_FOUND", "HISTORY_LOAD_FAILED", "CONVERSATION_HISTORY_UNAVAILABLE"]) assert.equal(shouldShowHistoryRecovery(code), true);
+    for (const code of ["ASSISTANT_UNAVAILABLE", "TOOL_LIMIT_EXCEEDED", "TOOL_QUERY_FAILED", "ASSISTANT_RESPONSE_INVALID", "UNAUTHORIZED", "RATE_LIMITED"]) assert.equal(shouldShowHistoryRecovery(code), false);
+    assert.equal(shouldShowHistoryRecovery(null), false);
+    assert.equal(classifyAssistantError("ASSISTANT_UNAVAILABLE"), "provider");
+    assert.equal(classifyAssistantError("TOOL_QUERY_FAILED"), "tool");
+    assert.equal(classifyAssistantError("TOOL_LIMIT_EXCEEDED"), "budget");
+    assert.equal(classifyAssistantError("PROVIDER_INVALID_RESPONSE"), "response");
+    assert.equal(classifyAssistantError("UNAUTHORIZED"), "authentication");
+    assert.equal(classifyAssistantError("ASSISTANT_PROVIDER_RATE_LIMITED"), "rate_limit");
+  });
+
+  it("clears a history failure after a successful send and retries the later send rather than history", () => {
+    const historyFailure = chatReducer(initialChatState, { type: "failure", requestId: "history", message: "History unavailable", code: "HISTORY_LOAD_FAILED", source: "history" });
+    assert.equal(retryOperation(historyFailure.errorSource), "history");
+    const submitted = chatReducer(historyFailure, { type: "submit", message: { requestId: "send-1", role: "user", content: "Ask assistant" } });
+    const recovered = chatReducer(submitted, { type: "success", requestId: "send-1", user: { requestId: "send-1", role: "user", content: "Ask assistant" }, assistant: { role: "assistant", content: "Recovered" } });
+    assert.equal(recovered.errorSource, null);
+    const failedSend = chatReducer(recovered, { type: "submit", message: { requestId: "send-2", role: "user", content: "Another question" } });
+    const sendFailure = chatReducer(failedSend, { type: "failure", requestId: "send-2", message: "Provider unavailable", code: "ASSISTANT_UNAVAILABLE", source: "send" });
+    assert.equal(retryOperation(sendFailure.errorSource), "send");
+    assert.equal(shouldShowHistoryRecovery(sendFailure.errorCode), false);
+    assert.equal(sendFailure.messages.filter((message) => message.role === "user").length, 2);
+  });
+  it("accepts all supported preparation-only action result names from the assistant API", async () => {
+    const previousFetch = global.fetch;
+    const previousUrl = process.env.NEXT_PUBLIC_API_URL;
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    try {
+      for (const tool of ["prepare_booking_action", "prepare_reschedule_action", "prepare_cancellation_action"]) {
+        global.fetch = async () => ({
+          status: 200,
+          ok: true,
+          async json() {
+            return {
+              user_message: { id: "user-message", role: "user", content: "Do this", request_id: "request", request_status: "complete" },
+              assistant_message: { id: "assistant-message", role: "assistant", content: "Prepared", results: [{ tool, data: { requires_patient_confirmation: true } }] },
+              replayed: false,
+            };
+          },
+        });
+        const result = await sendAssistantMessage("token", "conversation", "request", "Do this");
+        assert.equal(result.assistant_message.results[0].tool, tool);
+      }
+    } finally {
+      global.fetch = previousFetch;
+      if (previousUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL;
+      else process.env.NEXT_PUBLIC_API_URL = previousUrl;
+    }
+  });
+
   it("shows the user turn while loading and appends one response", () => {
     const submitted = chatReducer(initialChatState, { type: "submit", message: { requestId: "r1", role: "user", content: "hello" } });
     assert.equal(submitted.loading, true);
@@ -24,6 +75,43 @@ describe("patient assistant chat", () => {
     assert.equal(completed.loading, false);
     assert.equal(completed.messages.length, 2);
     assert.equal(completed.messages[1].content, "Hi");
+  });
+
+  it("clears the composer immediately after appending and restores a failed submission draft", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    const submitStart = chat.indexOf("function submit(event:");
+    const appendUser = chat.indexOf('dispatch({ type: "submit", message:', submitStart);
+    const clearDraft = chat.indexOf('setDraft((current) => current.trim() === content ? "" : current)', submitStart);
+    const deliverRequest = chat.indexOf("void deliver(requestId, content)", submitStart);
+    assert.ok(submitStart >= 0 && appendUser < clearDraft && clearDraft < deliverRequest);
+    assert.equal(restoreDraftAfterFailedSubmission("", "Submitted message"), "Submitted message");
+    assert.equal(restoreDraftAfterFailedSubmission("A newer draft", "Submitted message"), "A newer draft");
+    assert.match(chat, /setDraft\(\(current\) => restoreDraftAfterFailedSubmission\(current, content\)\)/);
+  });
+
+  it("accepts complete doctor-search and availability tool results from the assistant API", async () => {
+    const previousFetch = global.fetch;
+    const previousUrl = process.env.NEXT_PUBLIC_API_URL;
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    global.fetch = async () => ({
+      status: 200, ok: true,
+      async json() { return {
+        user_message: { id: "u", role: "user", content: "Show availability for him", request_id: "r", request_status: "complete" },
+        assistant_message: { id: "a", role: "assistant", content: "Here are available times.", results: [
+          { tool: "search_doctors", data: { doctors: [{ name: "Dr. Ali Ahmed", specialty: "Cardiology" }] } },
+          { tool: "get_available_slots", data: { slots: [{ date: "2027-01-06", start_time: "10:00:00", end_time: "10:30:00", doctor: { name: "Dr. Ali Ahmed" } }] } },
+        ] },
+        replayed: false,
+      }; },
+    });
+    try {
+      const response = await sendAssistantMessage("token", "conversation", "r", "Show availability for him");
+      assert.deepEqual(response.assistant_message.results.map(({ tool }) => tool), ["search_doctors", "get_available_slots"]);
+    } finally {
+      global.fetch = previousFetch;
+      if (previousUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL;
+      else process.env.NEXT_PUBLIC_API_URL = previousUrl;
+    }
   });
 
   it("keeps one failed user message so retry does not duplicate it", () => {
@@ -34,6 +122,28 @@ describe("patient assistant chat", () => {
     assert.equal(failed.messages[0].failed, true);
     assert.equal(retried.messages.filter((item) => item.role === "user").length, 1);
     assert.equal(retried.messages[0].failed, false);
+  });
+
+  it("preserves the visible transcript when a conversation send fails", () => {
+    const history = chatReducer(initialChatState, { type: "restore", messages: [
+      { id: "saved-user", role: "user", content: "Earlier question" },
+      { id: "saved-assistant", role: "assistant", content: "Earlier answer" },
+    ] });
+    const submitted = chatReducer(history, { type: "submit", message: { requestId: "request-2", role: "user", content: "New question" } });
+    const failed = chatReducer(submitted, { type: "failure", requestId: "request-2", message: "Conversation not found" });
+    assert.deepEqual(failed.messages.map(({ content }) => content), ["Earlier question", "Earlier answer", "New question"]);
+    assert.equal(failed.messages[2].failed, true);
+    assert.equal(failed.error, "Conversation not found");
+    const settled = chatReducer(failed, { type: "loading", value: false });
+    assert.equal(settled.error, "Conversation not found");
+    assert.deepEqual(settled.messages, failed.messages);
+  });
+
+  it("enables sending after history failure only when the existing conversation ID is retained", () => {
+    assert.equal(canSendAssistantMessage({ ready: false, loading: false, draft: "hello", historyLoadFailed: true, hasConversation: true }), false);
+    assert.equal(canSendAssistantMessage({ ready: true, loading: false, draft: "hello", historyLoadFailed: true, hasConversation: true }), true);
+    assert.equal(canSendAssistantMessage({ ready: true, loading: false, draft: "hello", historyLoadFailed: true, hasConversation: false }), false);
+    assert.equal(canSendAssistantMessage({ ready: true, loading: true, draft: "hello", historyLoadFailed: false, hasConversation: true }), false);
   });
 
   it("renders only the filtered appointment rows returned by the backend", () => {
@@ -75,6 +185,12 @@ describe("patient assistant chat", () => {
     assert.deepEqual(getVisibleAssistantResults("Here is your appointment.", [empty]), []);
     assert.deepEqual(getVisibleAssistantResults("I can’t book, reschedule, or cancel appointments for you.", [populated]), []);
     assert.deepEqual(getVisibleAssistantResults("Here is the appointment you asked about.", [populated]), [populated]);
+  });
+
+  it("does not render appointment cards for a refund-only assistant result", () => {
+    const refund = { tool: "get_cancellation_refund_preview", data: { original_payment: { amount: "500.00", currency: "INR", status: "partially_refunded" }, processed_refund_amount: "100.00", pending_refund_amount: "25.00", estimated_additional_refund_amount: "125.00" } };
+    assert.deepEqual(getAssistantResultRows(refund), []);
+    assert.deepEqual(getVisibleAssistantResults("Here is the verified refund preview.", [refund]), []);
   });
 
   it("replaces verbose result narration with one contextual sentence and suppresses duplicate doctor cards", () => {
@@ -125,6 +241,41 @@ describe("patient assistant chat", () => {
     } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
   });
 
+  it("opens the exact listed conversation and accepts persisted refund-preview tool results", async () => {
+    const originalFetch = globalThis.fetch; const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
+    const conversationId = "22222222-2222-4222-8222-222222222222";
+    const calls = [];
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      if (calls.length === 1) return new Response(JSON.stringify({ items: [{ id: conversationId, created_at: "2027-01-20T00:00:00.000Z", updated_at: "2027-01-20T00:01:00.000Z", preview: "What refund applies?" }], limit: 50, offset: 0 }), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({
+        conversation: { id: conversationId, created_at: "2027-01-20T00:00:00.000Z", updated_at: "2027-01-20T00:01:00.000Z" },
+        messages: [{ id: "assistant-message", role: "assistant", content: "The estimate is INR 50.", created_at: "2027-01-20T00:01:00.000Z", results: [{ tool: "get_cancellation_refund_preview", data: { estimated_additional_refund_amount: "50.00" } }] }],
+        has_more: false,
+        next_before: null,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      const listed = await listAssistantConversations("session");
+      const selected = listed.items[0].id;
+      const detail = await getAssistantConversation("session", selected);
+      assert.equal(selected, conversationId);
+      assert.match(calls[1], new RegExp(`/conversations/${conversationId}\\?limit=20$`));
+      assert.equal(detail.conversation.id, conversationId);
+      assert.equal(detail.messages[0].results[0].tool, "get_cancellation_refund_preview");
+    } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
+  });
+
+  it("returns a specific, non-destructive error when saved history cannot be parsed", async () => {
+    const originalFetch = globalThis.fetch; const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    globalThis.fetch = async () => new Response(JSON.stringify({ conversation: {}, messages: [], has_more: false, next_before: null }), { status: 200, headers: { "content-type": "application/json" } });
+    try {
+      await assert.rejects(getAssistantConversation("session", "22222222-2222-4222-8222-222222222222"), (error) => error.code === "ASSISTANT_RESPONSE_INVALID" && /selected conversation was kept/.test(error.message));
+    } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
+  });
+
   it("sends an idempotency key and conversation ID to the persistent message route", async () => {
     const originalFetch = globalThis.fetch; const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
     let request; process.env.NEXT_PUBLIC_API_URL = "https://api.example.test/";
@@ -150,6 +301,48 @@ describe("patient assistant chat", () => {
     } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
   });
 
+  it("explains conversation-not-found without suggesting replacement or clearing visible history", async () => {
+    const originalFetch = globalThis.fetch; const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: { code: "CONVERSATION_NOT_FOUND", message: "Conversation not found" } }), { status: 404, headers: { "content-type": "application/json" } });
+    try {
+      await assert.rejects(sendAssistantMessage("session", "missing-conversation", "request", "hello"), (error) => error.code === "CONVERSATION_NOT_FOUND" && /visible messages are still here/.test(error.message) && /No replacement conversation was created/.test(error.message));
+    } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
+  });
+
+  it("retains the requested conversation, restores send readiness, and offers explicit new-chat recovery", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    const state = fs.readFileSync(path.join(projectRoot, "lib/assistant-chat-state.ts"), "utf8");
+    const retainedReference = chat.indexOf("conversationId.current = id;");
+    const historyLookup = chat.indexOf("await getAssistantConversation(token, id");
+    const createConversation = chat.indexOf("await createAssistantConversation(token, id)");
+    const assignAfterCreate = chat.indexOf("conversationId.current = id;", createConversation);
+    assert.ok(retainedReference >= 0 && retainedReference < historyLookup);
+    assert.ok(createConversation >= 0 && assignAfterCreate > createConversation);
+    assert.match(chat, /finally \{ setReady\(true\)/);
+    assert.match(chat, /retryOperation\(state\.errorSource\)/);
+    const submitHandler = chat.slice(chat.indexOf("function submit("), chat.indexOf("const retry ="));
+    assert.ok(submitHandler.indexOf('dispatch({ type: "submit"') < submitHandler.indexOf('setDraft((current) => current.trim() === content ? "" : current)'));
+    assert.ok(submitHandler.indexOf('setDraft((current) => current.trim() === content ? "" : current)') < submitHandler.indexOf("void deliver(requestId, content)"));
+    assert.match(chat, /restoreDraftAfterFailedSubmission\(current, content\)/);
+    assert.match(state, /historyLoadFailed && !hasConversation/);
+    assert.match(chat, /Start new conversation/);
+    assert.match(chat, /Find saved conversations/);
+  });
+
+  it("offers saved-history recovery without switching IDs until the selected history loads", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    const recoveryStart = chat.indexOf("const openSavedConversation = useCallback");
+    const fetchSelectedHistory = chat.indexOf("await getAssistantConversation(token, id", recoveryStart);
+    const switchReference = chat.indexOf("conversationId.current = stored.conversation.id", recoveryStart);
+    assert.ok(recoveryStart >= 0 && fetchSelectedHistory > recoveryStart);
+    assert.ok(switchReference > fetchSelectedHistory);
+    assert.match(chat, /recoveryTargetId\.current = id;/);
+    assert.match(chat, /operation === "history" && recoveryTargetId\.current/);
+    assert.match(chat, /const saved = await listAssistantConversations\(token\)/);
+    assert.match(chat, /setRecoveryConversations\(saved.items\)/);
+  });
+
   it("reuses the same chat implementation in the full page and floating panel", () => {
     const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
     const launcher = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-launcher.tsx"), "utf8");
@@ -163,7 +356,7 @@ describe("patient assistant chat", () => {
     const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
     assert.match(chat, /UserRound/);
     assert.doesNotMatch(chat, /message\.role === "user" \? "You"/);
-    assert.match(chat, /mx-auto flex w-full max-w-3xl items-end/);
+    assert.match(chat, /mx-auto flex w-full items-end/);
     assert.match(chat, /import \{[^}]*RefreshCw[^}]*\} from "lucide-react"/);
     assert.match(chat, /aria-label="Retry this message"/);
     assert.match(chat, /role="tooltip"[^>]*>Retry this message<\/span>/);
