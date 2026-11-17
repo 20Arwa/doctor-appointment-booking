@@ -670,12 +670,16 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
           if (!history.payments.length) return { answer: `I found your appointment with ${history.appointment.doctor.name} on ${history.appointment.date} at ${displayableTime(history.appointment.start_time)}, but no payment record is associated with it.`, results: [{ tool: "get_patient_refund_history", data: publicToolResult(history) }], ...internalState() };
           const paymentStates = history.payments.filter((payment) => ["captured", "partially_refunded", "refunded"].includes(payment.status));
           const statusPayments = paymentStates.length ? paymentStates : history.payments;
-          const paymentStatus = [...new Set(statusPayments.map((payment) => `${payment.status} · ${payment.currency} ${payment.amount}`))].join("; ");
+          const paymentStatus = [...new Set(statusPayments.map((payment) => `payment status is ${payment.status} · ${payment.currency} ${payment.amount} (original payment)`))].join("; ");
           const refunds = history.payments.flatMap((payment) => (payment.refunds || []).map((refund) => ({ ...refund, currency: refund.currency || payment.currency })));
           const statusText = refunds.length
-            ? refunds.map((refund) => `${refund.currency} ${refund.amount} is ${String(refund.status).replaceAll("_", " ")}`).join("; ")
+            ? refunds.map((refund) => `${refund.currency} ${refund.amount} is ${String(refund.status).replaceAll("_", " ")} (refund)${refund.processed_at ? ` (processed ${refund.processed_at})` : refund.created_at ? ` (recorded ${refund.created_at})` : ""}`).join("; ")
             : "No refund record is associated with that payment";
-          return { answer: `For your appointment with ${history.appointment.doctor.name} on ${history.appointment.date} at ${displayableTime(history.appointment.start_time)}, payment status is ${paymentStatus}. ${statusText}.`, results: [{ tool: "get_patient_refund_history", data: publicToolResult(history) }], ...internalState() };
+          const processedRefundTotal = refunds.filter((refund) => refund.status === "processed").reduce((total, refund) => total + Math.round(Number(refund.amount) * 100), 0);
+          const processedText = processedRefundTotal
+            ? `Processed refunds total ${refunds[0]?.currency || statusPayments[0]?.currency || ""} ${(processedRefundTotal / 100).toFixed(2)}.`
+            : "No refund amount is confirmed as processed.";
+          return { answer: `For your appointment with ${history.appointment.doctor.name} on ${history.appointment.date} at ${displayableTime(history.appointment.start_time)}, ${paymentStatus}. ${processedText} ${statusText}.`, results: [{ tool: "get_patient_refund_history", data: publicToolResult(history) }], ...internalState() };
         } catch {
           return { answer: "I couldn't check the recorded refund status just now. Please try again.", results: [], ...internalState() };
         }

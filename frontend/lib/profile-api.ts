@@ -42,6 +42,7 @@ const doctorPatientSchema = z.object({
 const appointmentSchema = z.object({
   id: z.string().uuid(),
   status: z.enum(["confirmed", "cancelled", "completed"]),
+  cancelled_at: z.string().nullable().optional(),
   availability_id: z.string().uuid(),
   mode: z.enum(["wave", "stream"]).nullable().optional(),
   appointment_duration_minutes: z.number().int().positive().nullable().optional(),

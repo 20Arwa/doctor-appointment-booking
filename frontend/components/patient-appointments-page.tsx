@@ -284,7 +284,10 @@ export function PatientAppointmentsPage() {
     const endInstant = appointmentEndInstant(appointment);
     return appointment.status === "completed" || endInstant !== null && endInstant.getTime() <= now;
   })());
-  const cancelled = ordered.filter((appointment) => appointment.status === "cancelled");
+  const cancelled = ordered.filter((appointment) => appointment.status === "cancelled").sort((first, second) =>
+    (second.cancelled_at ? new Date(second.cancelled_at).getTime() : 0) - (first.cancelled_at ? new Date(first.cancelled_at).getTime() : 0)
+    || (second.date + second.start_time).localeCompare(first.date + first.start_time)
+    || second.id.localeCompare(first.id));
 
   function retryList() {
     clearNotificationFocus();

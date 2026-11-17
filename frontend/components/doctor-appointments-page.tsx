@@ -162,9 +162,14 @@ export function DoctorAppointmentsPage() {
   const past = appointments.filter((appointment) => appointment.status !== "cancelled" && (() => {
     const instant = appointmentInstant(appointment);
     return appointment.status === "completed" || instant !== null && instant.getTime() <= now;
-  })()).sort((first, second) => (appointmentInstant(second)?.getTime() ?? 0) - (appointmentInstant(first)?.getTime() ?? 0));
+  })()).sort((first, second) =>
+    `${second.date}T${second.start_time}`.localeCompare(`${first.date}T${first.start_time}`)
+    || second.id.localeCompare(first.id));
   const cancelled = appointments.filter((appointment) => appointment.status === "cancelled")
-    .sort((first, second) => (appointmentInstant(second)?.getTime() ?? 0) - (appointmentInstant(first)?.getTime() ?? 0));
+    .sort((first, second) =>
+      (second.cancelled_at ? new Date(second.cancelled_at).getTime() : 0) - (first.cancelled_at ? new Date(first.cancelled_at).getTime() : 0)
+      || `${second.date}T${second.start_time}`.localeCompare(`${first.date}T${first.start_time}`)
+      || second.id.localeCompare(first.id));
 
   function refreshAppointments() {
     clearNotificationFocus();
