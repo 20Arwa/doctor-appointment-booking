@@ -1,6 +1,6 @@
 import type { AssistantResult } from "@/lib/assistant-api";
 
-export type ChatMessage = { id?: string; requestId?: string; role: "user" | "assistant"; content: string; results?: AssistantResult[]; failed?: boolean };
+export type ChatMessage = { id?: string; requestId?: string; role: "user" | "assistant"; content: string; createdAt?: string; results?: AssistantResult[]; failed?: boolean };
 export type ChatState = { messages: ChatMessage[]; loading: boolean; error: string | null; errorCode: string | null; errorSource: "history" | "send" | "saved_conversations" | "new_conversation" | null };
 export type ChatAction =
   | { type: "restore"; messages: ChatMessage[] }
@@ -77,6 +77,25 @@ export function getAssistantDisplayContent(content: string, results: AssistantRe
 
 export function preserveScrollAfterPrepend(scrollHeight: number, previousHeight: number, previousTop: number): number {
   return previousTop + scrollHeight - previousHeight;
+}
+
+const ASSISTANT_TIME_ZONE = "Asia/Kolkata";
+export function assistantMessageDateKey(value?: string): string | null {
+  if (!value || Number.isNaN(Date.parse(value))) return null;
+  return new Intl.DateTimeFormat("en-CA", { year: "numeric", month: "2-digit", day: "2-digit", timeZone: ASSISTANT_TIME_ZONE }).format(new Date(value));
+}
+export function assistantMessageDateLabel(value?: string): string {
+  if (!value || Number.isNaN(Date.parse(value))) return "";
+  return new Intl.DateTimeFormat("en-IN", { dateStyle: "medium", timeZone: ASSISTANT_TIME_ZONE }).format(new Date(value));
+}
+export function assistantMessageTimeLabel(value?: string): string {
+  if (!value || Number.isNaN(Date.parse(value))) return "";
+  return new Intl.DateTimeFormat("en-IN", { hour: "numeric", minute: "2-digit", timeZone: ASSISTANT_TIME_ZONE }).format(new Date(value));
+}
+export function shouldShowAssistantDateSeparator(messages: ChatMessage[], index: number): boolean {
+  const currentDate = assistantMessageDateKey(messages[index]?.createdAt);
+  if (!currentDate) return false;
+  return index === 0 || assistantMessageDateKey(messages[index - 1]?.createdAt) !== currentDate;
 }
 
 function messageIdentity(message: ChatMessage): string {

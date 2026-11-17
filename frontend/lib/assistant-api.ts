@@ -1,11 +1,15 @@
 import { z } from "zod";
 
 const resultSchema = z.object({ tool: z.enum(["get_patient_appointments", "search_doctors", "get_available_slots", "prepare_booking_action", "prepare_reschedule_action", "prepare_cancellation_action", "get_cancellation_refund_preview"]), data: z.record(z.string(), z.unknown()) });
-const messageSchema = z.object({ id: z.string(), role: z.enum(["user", "assistant"]), content: z.string(), request_id: z.string().optional(), request_status: z.string().optional(), results: z.array(resultSchema).optional() });
+const messageSchema = z.object({ id: z.string(), role: z.enum(["user", "assistant"]), content: z.string(), created_at: z.string().optional(), request_id: z.string().optional(), request_status: z.string().optional(), results: z.array(resultSchema).optional() });
 const conversationSchema = z.object({ id: z.string(), created_at: z.string(), updated_at: z.string(), preview: z.string().nullable().optional() });
 const listSchema = z.object({ items: z.array(conversationSchema) });
 const detailSchema = z.object({ conversation: conversationSchema, messages: z.array(messageSchema), has_more: z.boolean(), next_before: z.string().nullable() });
 const sentSchema = z.object({ user_message: messageSchema, assistant_message: messageSchema, replayed: z.boolean() });
+const actionTypeSchema = z.enum(["book", "reschedule", "cancel"]);
+const actionIntentSchema = z.object({ id: z.string().uuid(), status: z.enum(["pending", "executing", "checkout_pending", "refund_pending", "completed", "failed", "expired"]), expires_at: z.string(), action_type: actionTypeSchema, summary: z.record(z.string(), z.unknown()).optional() });
+const dismissedProposalSchema = z.object({ status: z.literal("dismissed") });
+const actionConfirmationSchema = z.object({ status: z.enum(["pending", "executing", "checkout_pending", "refund_pending", "completed", "failed", "expired"]), checkout_url: z.string().url().optional(), expires_at: z.string().optional(), appointment: z.record(z.string(), z.unknown()).optional(), cancellation_status: z.string().optional(), refund_status: z.string().optional(), amount: z.string().optional(), currency: z.string().optional(), payment_status: z.string().optional(), replayed: z.boolean().optional() });
 
 export type AssistantResult = z.infer<typeof resultSchema>;
 export type StoredAssistantMessage = z.infer<typeof messageSchema>;
@@ -34,6 +38,15 @@ async function request<T>(token: string, path: string, init: RequestInit, schema
       ASSISTANT_DAILY_QUOTA_EXCEEDED: "The AI assistant has reached its current usage limit. Please try again later.",
       ASSISTANT_PROVIDER_RATE_LIMITED: "The AI assistant is receiving too many requests. Please wait a moment and try again.",
       ASSISTANT_PROVIDER_UNAVAILABLE: "The AI assistant is temporarily unavailable. Please try again shortly.",
+      ACTION_EXPIRED: "This proposal expired. Ask the assistant to prepare it again.",
+      ACTION_ALREADY_HANDLED: "This proposal has already been handled. Refresh the conversation to see its latest status.",
+      ACTION_IN_PROGRESS: "This action is still processing. Check its status in a moment.",
+      PROPOSAL_NOT_VERIFIED: "This proposal could not be verified. Ask the assistant to prepare it again.",
+      INVALID_ACTION: "The proposal details are no longer valid. Ask the assistant to prepare it again.",
+      SLOT_UNAVAILABLE: "That appointment time is no longer available. Ask the assistant to find another time.",
+      SLOT_CAPACITY_REACHED: "That appointment time has just filled. Ask the assistant to find another time.",
+      APPOINTMENT_STATE_CONFLICT: "This appointment has changed and can no longer be updated from this proposal.",
+      BOOKING_CONFIRMATION_STALE: "The booking details changed. Ask the assistant to prepare the booking again.",
     };
     throw new AssistantApiError(response.status, (code && safeMessages[code]) || "The assistant couldn't respond. Please try again.", code);
   }
@@ -51,3 +64,11 @@ export const getAssistantConversation = (token: string, id: string, { limit = 20
 };
 export const deleteAssistantConversation = (token: string, id: string) => request(token, `/conversations/${encodeURIComponent(id)}`, { method: "DELETE" }, z.undefined());
 export const sendAssistantMessage = (token: string, conversationId: string, requestId: string, content: string) => request(token, `/conversations/${encodeURIComponent(conversationId)}/messages`, { method: "POST", body: JSON.stringify({ request_id: requestId, content }) }, sentSchema);
+export type AssistantActionType = z.infer<typeof actionTypeSchema>;
+export type AssistantActionIntent = z.infer<typeof actionIntentSchema>;
+export type AssistantActionPrepareResponse = AssistantActionIntent | z.infer<typeof dismissedProposalSchema>;
+export type AssistantActionConfirmation = z.infer<typeof actionConfirmationSchema>;
+export const prepareAssistantAction = (token: string, conversationId: string, assistantMessageId: string, actionType: AssistantActionType) => request(token, `/conversations/${encodeURIComponent(conversationId)}/actions`, { method: "POST", body: JSON.stringify({ assistant_message_id: assistantMessageId, action_type: actionType }) }, z.union([actionIntentSchema, dismissedProposalSchema]), "The proposal details could not be verified. Please ask the assistant to prepare it again.");
+export const dismissAssistantProposal = (token: string, conversationId: string, assistantMessageId: string, actionType: AssistantActionType) => request(token, `/conversations/${encodeURIComponent(conversationId)}/actions/dismiss`, { method: "POST", body: JSON.stringify({ assistant_message_id: assistantMessageId, action_type: actionType }) }, dismissedProposalSchema);
+export const getAssistantActionStatus = (token: string, conversationId: string, intentId: string) => request(token, `/conversations/${encodeURIComponent(conversationId)}/actions/${encodeURIComponent(intentId)}`, { method: "GET" }, z.object({ id: z.string().uuid(), action_type: actionTypeSchema, status: actionIntentSchema.shape.status, expires_at: z.string(), summary: z.record(z.string(), z.unknown()).optional() }));
+export const confirmAssistantAction = (token: string, conversationId: string, intentId: string) => request(token, `/conversations/${encodeURIComponent(conversationId)}/actions/${encodeURIComponent(intentId)}/confirm`, { method: "POST" }, actionConfirmationSchema);

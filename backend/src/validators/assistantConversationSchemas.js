@@ -18,8 +18,9 @@ const actionIntentParamsSchema = z.object({ conversationId: z.uuid(), intentId: 
 const prepareActionSchema = z.object({
   assistant_message_id: z.uuid(),
   action_type: z.enum(["book", "reschedule", "cancel"]),
-  action_args: z.record(z.string(), z.unknown()),
+  action_args: z.record(z.string(), z.unknown()).optional(),
 }).strict();
+const dismissActionSchema = z.object({ assistant_message_id: z.uuid(), action_type: z.enum(["book", "reschedule", "cancel"]) }).strict();
 
 module.exports = {
   conversationIdParamsSchema,
@@ -29,4 +30,5 @@ module.exports = {
   sendConversationMessageSchema,
   actionIntentParamsSchema,
   prepareActionSchema,
+  dismissActionSchema,
 };

@@ -9,7 +9,7 @@ const intentId = "44444444-4444-4444-8444-444444444444";
 const availabilityId = "55555555-5555-4555-8555-555555555555";
 
 function mockDatabase({ expiry = new Date(Date.now() + 60_000) } = {}) {
-  const state = { intent: null, lease: Promise.resolve(), calls: [], slotAvailable: false, toolResults: [] };
+  const state = { intent: null, otherIntents: [], lease: Promise.resolve(), calls: [], slotAvailable: false, toolResults: [] };
   const execute = async (sql, values = []) => {
     state.calls.push({ sql, values });
     if (sql === "BEGIN") {
@@ -22,11 +22,22 @@ function mockDatabase({ expiry = new Date(Date.now() + 60_000) } = {}) {
     if (sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] };
     if (sql.includes("SELECT av.id, av.doctor_id")) return { rows: state.slotAvailable ? [{ id: availabilityId, doctor_id: "66666666-6666-4666-8666-666666666666", date: "2099-01-01", start_time: "09:00:00", end_time: "09:30:00", mode: "wave", capacity: 2, booking_visibility: "public", deleted_at: null, consultation_fee: "500.005", doctor_first_name: "Dee", doctor_last_name: "Doctor", specialty: "General Practice" }] : [] };
     if (sql.includes("COUNT(DISTINCT reservation.patient_id)")) return { rows: [{ occupied: 0 }] };
-    if (sql.includes("UPDATE assistant_action_intents SET status = 'expired'")) {
+    if (sql.includes("UPDATE assistant_action_intents SET status = 'expired'") && sql.includes("expires_at <= NOW()")) {
       if (state.intent?.id === values[0] && new Date(state.intent.expires_at).getTime() <= Date.now()) state.intent.status = "expired";
       return { rows: [], rowCount: state.intent?.status === "expired" ? 1 : 0 };
     }
+    if (sql.includes("UPDATE assistant_messages") && sql.includes("tool_results = tool_results ||")) {
+      state.toolResults.push(...JSON.parse(values[1]));
+      return { rows: [], rowCount: 1 };
+    }
     if (sql.includes("SELECT m.id, c.user_id, m.tool_results FROM assistant_conversations c")) return { rows: values[1] === user.id && values[0] === conversationId && values[2] === messageId ? [{ id: messageId, user_id: user.id, tool_results: state.toolResults }] : [] };
+    if (sql.includes("SELECT id, status FROM assistant_action_intents") && sql.includes("FOR UPDATE")) {
+      return { rows: [state.intent, ...state.otherIntents].filter((intent) => intent && intent.user_id === values[0] && intent.conversation_id === values[1] && intent.assistant_message_id === values[2] && intent.action_type === values[3]).map(({ id, status }) => ({ id, status })) };
+    }
+    if (sql.startsWith("SELECT") && sql.includes("assistant_message_id = $3 AND action_type = $4")) {
+      const matches = state.intent && state.intent.user_id === values[0] && state.intent.conversation_id === values[1] && state.intent.assistant_message_id === values[2] && state.intent.action_type === values[3] ? [state.intent] : [];
+      return { rows: matches };
+    }
     if (sql.startsWith("INSERT INTO assistant_action_intents")) {
       state.intent = { id: intentId, user_id: user.id, conversation_id: conversationId, assistant_message_id: messageId, action_type: values[3], action_args: JSON.parse(values[4]), status: "pending", expires_at: expiry, execution_lease_until: null, execution_lease_token: null };
       return { rows: [{ id: intentId, status: "pending", expires_at: expiry }] };
@@ -56,6 +67,11 @@ function mockDatabase({ expiry = new Date(Date.now() + 60_000) } = {}) {
       if (state.intent.execution_lease_token !== values[1]) return { rows: [], rowCount: 0 };
       Object.assign(state.intent, { status: values[2], execution_lease_until: null, execution_lease_token: null });
       return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("SET status = 'expired', execution_lease_until = NULL")) {
+      const candidates = [state.intent, ...state.otherIntents].filter((intent) => intent && intent.user_id === values[0] && intent.conversation_id === values[1] && intent.assistant_message_id === values[2] && intent.action_type === values[3] && intent.status === "pending");
+      candidates.forEach((intent) => { intent.status = "expired"; });
+      return { rows: [], rowCount: candidates.length };
     }
     if (sql.includes("WHERE id = $1 AND user_id = $2 AND conversation_id = $3")) {
       return { rows: state.intent && state.intent.id === values[0] && state.intent.user_id === values[1] && state.intent.conversation_id === values[2] ? [{ id: intentId, action_type: state.intent.action_type, status: state.intent.status, expires_at: state.intent.expires_at, action_args: state.intent.action_args }] : [] };
@@ -123,11 +139,79 @@ describe("patient assistant action intents", () => {
         async countOccupiedPlaces() { return 0; },
       };
       const service = createAssistantActionService({ database, appointments, paymentService: { async previewCancellationRefund() { return { estimated_refund_amount: "0.00" }; } } });
-      const intent = await service.prepare(user, conversationId, messageId, actionType, args);
+      const intent = await service.prepare(user, conversationId, messageId, actionType);
       assert.equal(intent.action_type, actionType);
       assert.equal(state.intent.action_args.availability_id, args.availability_id);
       assert.equal(state.intent.action_args.appointment_id, args.appointment_id);
     }
+  });
+
+  it("reuses a prepared intent when the same conversation is reopened", async () => {
+    const { database, state } = mockDatabase();
+    const args = { availability_id: availabilityId };
+    state.slotAvailable = true;
+    state.toolResults = [proposalEvidence("book", args)];
+    const service = createAssistantActionService({ database, paymentService: {} });
+    const first = await service.prepare(user, conversationId, messageId, "book");
+    state.slotAvailable = false;
+    const reopened = await service.prepare(user, conversationId, messageId, "book");
+    assert.equal(reopened.id, first.id);
+    assert.deepEqual(reopened.summary, first.summary);
+    assert.equal(state.calls.filter(({ sql }) => sql.startsWith("INSERT INTO assistant_action_intents")).length, 1);
+  });
+
+  it("returns the completed checkout intent and its saved summary when the conversation is reopened", async () => {
+    const { database, state } = mockDatabase();
+    state.slotAvailable = true;
+    state.toolResults = [proposalEvidence("book", { availability_id: availabilityId })];
+    const service = createAssistantActionService({ database, paymentService: {} });
+    const prepared = await service.prepare(user, conversationId, messageId, "book");
+    state.intent.status = "completed";
+    state.slotAvailable = false;
+    const reopened = await service.prepare(user, conversationId, messageId, "book");
+    const status = await service.intentView(user, conversationId, prepared.id);
+    assert.equal(reopened.id, prepared.id);
+    assert.equal(reopened.status, "completed");
+    assert.deepEqual(status.summary, prepared.summary);
+    assert.equal(state.calls.filter(({ sql }) => sql.startsWith("INSERT INTO assistant_action_intents")).length, 1);
+  });
+
+  it("persists dismissal and prevents preparing or confirming that proposal again", async () => {
+    const { database, state } = mockDatabase();
+    const args = { availability_id: availabilityId };
+    state.slotAvailable = true;
+    state.toolResults = [proposalEvidence("book", args)];
+    const service = createAssistantActionService({ database, paymentService: {} });
+    const intent = await service.prepare(user, conversationId, messageId, "book");
+    state.otherIntents.push({ id: "77777777-7777-4777-8777-777777777777", user_id: user.id, conversation_id: conversationId, assistant_message_id: messageId, action_type: "book", status: "pending" });
+    assert.deepEqual(await service.dismiss(user, conversationId, messageId, "book"), { status: "dismissed" });
+    assert.equal(state.intent.status, "expired");
+    assert.equal(state.otherIntents[0].status, "expired");
+    assert.deepEqual(await service.prepare(user, conversationId, messageId, "book"), { status: "dismissed" });
+    await assert.rejects(service.confirm(user, conversationId, intent.id), { code: "ACTION_EXPIRED" });
+    assert.equal(state.calls.filter(({ sql }) => sql.startsWith("INSERT INTO assistant_action_intents")).length, 1);
+  });
+
+  it("does not let an in-flight prepare recreate a proposal dismissed before intent insertion", async () => {
+    const { database, state } = mockDatabase();
+    const args = { availability_id: availabilityId };
+    state.slotAvailable = true;
+    state.toolResults = [proposalEvidence("book", args)];
+    let signalValidationStarted;
+    const validationStarted = new Promise((resolve) => { signalValidationStarted = resolve; });
+    let releaseValidation;
+    const validationGate = new Promise((resolve) => { releaseValidation = resolve; });
+    const appointments = {
+      async countOccupiedPlaces() { signalValidationStarted(); await validationGate; return 0; },
+    };
+    const service = createAssistantActionService({ database, paymentService: {}, appointments });
+    const preparing = service.prepare(user, conversationId, messageId, "book");
+    await validationStarted;
+    await service.dismiss(user, conversationId, messageId, "book");
+    releaseValidation();
+    assert.deepEqual(await preparing, { status: "dismissed" });
+    assert.equal(state.intent, null);
+    assert.equal(state.calls.filter(({ sql }) => sql.startsWith("INSERT INTO assistant_action_intents")).length, 0);
   });
 
   it("rejects missing, unrelated, failed, or argument-mismatched proposal evidence", async () => {
@@ -294,9 +378,11 @@ describe("patient assistant action intents", () => {
     const service = createAssistantActionService({ database, paymentService: {} });
     const prepared = await service.prepare(user, conversationId, messageId, "book", { availability_id: availabilityId });
     assert.equal(prepared.summary.consultation_fee, "500.01");
-    assert.deepEqual(JSON.parse(state.calls.find(({ sql }) => sql.startsWith("INSERT INTO assistant_action_intents")).values[4]), {
-      availability_id: availabilityId,
-      prepared_fee_minor: 50001,
-    });
+    const storedArgs = JSON.parse(state.calls.find(({ sql }) => sql.startsWith("INSERT INTO assistant_action_intents")).values[4]);
+    assert.equal(storedArgs.availability_id, availabilityId);
+    assert.equal(storedArgs.prepared_fee_minor, 50001);
+    assert.deepEqual(storedArgs.__assistant_summary, prepared.summary);
+    const status = await service.intentView(user, conversationId, intentId);
+    assert.deepEqual(status.summary, prepared.summary);
   });
 });

@@ -39,6 +39,11 @@ function hasVerifiedProposalEvidence(toolResults, userId, conversationId, assist
   });
 }
 
+function isProposalDismissed(toolResults, actionType) {
+  return Array.isArray(toolResults) && toolResults.some((result) => result?.tool === "__internal_action_context"
+    && result.data?.dismissed_proposals?.[actionType] === true);
+}
+
 async function transaction(database, operation) {
   const client = await database.connect();
   try {
@@ -72,23 +77,57 @@ function createAssistantActionService({ database, paymentService, appointments =
     return { ...slot, remaining_capacity: Number(slot.capacity || 1) - occupied };
   }
 
-  async function prepare(user, conversationId, assistantMessageId, actionType, rawArgs) {
-    if (user.role !== "patient") fail("FORBIDDEN", 403, "Only patients can prepare appointment actions");
+  async function verifiedMessage(user, conversationId, assistantMessageId, actionType, rawArgs, client = database) {
     const schema = actionSchemas[actionType];
-    const parsed = schema?.safeParse(rawArgs);
-    if (!parsed?.success) fail("INVALID_ACTION", 400, "Action details are invalid");
-    const args = parsed.data;
-    const conversation = await database.query(
+    const supplied = rawArgs === undefined ? null : schema?.safeParse(rawArgs);
+    if (rawArgs !== undefined && !supplied?.success) fail("INVALID_ACTION", 400, "Action details are invalid");
+    const conversation = await client.query(
       `SELECT m.id, c.user_id, m.tool_results FROM assistant_conversations c
        JOIN assistant_messages m ON m.conversation_id = c.id
-       WHERE c.id = $1 AND c.user_id = $2 AND m.id = $3 AND m.role = 'assistant'`,
+       WHERE c.id = $1 AND c.user_id = $2 AND m.id = $3 AND m.role = 'assistant'${client !== database ? " FOR UPDATE OF m" : ""}`,
       [conversationId, user.id, assistantMessageId],
     );
     if (!conversation.rows[0]) fail("CONVERSATION_NOT_FOUND", 404, "Assistant message not found");
-    if (conversation.rows[0].user_id !== user.id
-        || !hasVerifiedProposalEvidence(conversation.rows[0].tool_results, user.id, conversationId, assistantMessageId, actionType, args)) {
+    const evidence = (conversation.rows[0].tool_results || []).find((result) => {
+      const proposal = result?.tool === "__internal_action_context" ? result.data?.proposal_evidence : null;
+      return proposal?.version === 1 && proposal.proposal_succeeded === true
+        && proposal.requires_patient_confirmation === true && proposal.action_type === actionType
+        && proposal.user_id === user.id && proposal.conversation_id === conversationId
+        && proposal.assistant_message_id === assistantMessageId;
+    })?.data?.proposal_evidence;
+    if (!evidence || (supplied && !sameArguments(supplied.data, evidence.action_args))
+        || conversation.rows[0].user_id !== user.id
+        || !hasVerifiedProposalEvidence(conversation.rows[0].tool_results, user.id, conversationId, assistantMessageId, actionType, evidence.action_args)) {
       fail("PROPOSAL_NOT_VERIFIED", 409, "This assistant message does not contain a matching verified proposal");
     }
+    const parsed = schema?.safeParse(evidence.action_args);
+    if (!parsed?.success) fail("INVALID_ACTION", 400, "Action details are invalid");
+    return { row: conversation.rows[0], evidence, args: parsed.data };
+  }
+
+  async function existingIntent(user, conversationId, assistantMessageId, actionType, client = database) {
+    const result = await client.query(
+      `SELECT id, action_type, status, expires_at, action_args
+       FROM assistant_action_intents
+       WHERE user_id = $1 AND conversation_id = $2 AND assistant_message_id = $3 AND action_type = $4
+       ORDER BY created_at DESC LIMIT 1${client !== database ? " FOR UPDATE" : ""}`,
+      [user.id, conversationId, assistantMessageId, actionType],
+    );
+    return result.rows[0] || null;
+  }
+
+  function intentProposalView(intent) {
+    const args = intent.action_args || {};
+    const { __assistant_summary: summary, ..._privateArgs } = args;
+    return { id: intent.id, action_type: intent.action_type, status: intent.status, expires_at: intent.expires_at, ...(summary && typeof summary === "object" ? { summary } : {}) };
+  }
+
+  async function prepare(user, conversationId, assistantMessageId, actionType, rawArgs) {
+    if (user.role !== "patient") fail("FORBIDDEN", 403, "Only patients can prepare appointment actions");
+    const { row, args } = await verifiedMessage(user, conversationId, assistantMessageId, actionType, rawArgs);
+    if (isProposalDismissed(row.tool_results, actionType)) return { status: "dismissed" };
+    const previous = await existingIntent(user, conversationId, assistantMessageId, actionType);
+    if (previous) return intentProposalView(previous);
     let summary;
     let storedArgs = args;
     if (actionType === "book") {
@@ -100,20 +139,67 @@ function createAssistantActionService({ database, paymentService, appointments =
       const appointment = await appointments.getAppointment(database, user, args.appointment_id);
       if (appointment.status !== "confirmed") fail("APPOINTMENT_STATE_CONFLICT", 409, "Only confirmed appointments can be rescheduled");
       const slot = await validateSlot(database, args.availability_id);
-      summary = { appointment_id: appointment.id, previous_date: appointment.date, previous_start_time: appointment.start_time, date: slot.date, start_time: slot.start_time, end_time: slot.end_time, doctor: `Dr. ${slot.doctor_first_name} ${slot.doctor_last_name}`.trim(), specialty: slot.specialty, mode: slot.mode || "legacy", capacity: Number(slot.capacity || 1), remaining_capacity: slot.remaining_capacity };
+      summary = { previous_date: appointment.date, previous_start_time: appointment.start_time, date: slot.date, start_time: slot.start_time, end_time: slot.end_time, doctor: `Dr. ${slot.doctor_first_name} ${slot.doctor_last_name}`.trim(), specialty: slot.specialty, consultation_fee: slot.consultation_fee, currency: "INR", mode: slot.mode || "legacy", capacity: Number(slot.capacity || 1), remaining_capacity: slot.remaining_capacity };
     } else {
       const appointment = await appointments.getAppointment(database, user, args.appointment_id);
       if (appointment.status !== "confirmed") fail("APPOINTMENT_STATE_CONFLICT", 409, "Only confirmed appointments can be cancelled");
-      summary = await paymentService.previewCancellationRefund(user, args.appointment_id);
+      const refund = await paymentService.previewCancellationRefund(user, args.appointment_id);
+      summary = {
+        ...refund,
+        date: appointment.date,
+        start_time: appointment.start_time,
+        end_time: appointment.end_time,
+        ...(appointment.doctor_first_name || appointment.doctor_last_name ? { doctor: `Dr. ${appointment.doctor_first_name || ""} ${appointment.doctor_last_name || ""}`.trim() } : {}),
+        specialty: appointment.specialty,
+        consultation_fee: appointment.consultation_fee,
+        currency: appointment.consultation_currency || "INR",
+      };
     }
-    const inserted = await database.query(
-      `INSERT INTO assistant_action_intents
-         (user_id, conversation_id, assistant_message_id, action_type, action_args, expires_at)
-       VALUES ($1, $2, $3, $4, $5::jsonb, NOW() + INTERVAL '5 minutes')
-       RETURNING id, status, expires_at`,
-      [user.id, conversationId, assistantMessageId, actionType, JSON.stringify(storedArgs)],
-    );
-    return { ...inserted.rows[0], action_type: actionType, summary };
+    return transaction(database, async (client) => {
+      const locked = await verifiedMessage(user, conversationId, assistantMessageId, actionType, rawArgs, client);
+      if (isProposalDismissed(locked.row.tool_results, actionType)) return { status: "dismissed" };
+      const alreadyPrepared = await existingIntent(user, conversationId, assistantMessageId, actionType, client);
+      if (alreadyPrepared) return intentProposalView(alreadyPrepared);
+      const inserted = await client.query(
+        `INSERT INTO assistant_action_intents
+           (user_id, conversation_id, assistant_message_id, action_type, action_args, expires_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, NOW() + INTERVAL '5 minutes')
+         RETURNING id, status, expires_at`,
+        [user.id, conversationId, assistantMessageId, actionType, JSON.stringify({ ...storedArgs, __assistant_summary: summary })],
+      );
+      return { ...inserted.rows[0], action_type: actionType, summary };
+    });
+  }
+
+  async function dismiss(user, conversationId, assistantMessageId, actionType) {
+    if (user.role !== "patient") fail("FORBIDDEN", 403, "Only patients can dismiss appointment proposals");
+    return transaction(database, async (client) => {
+      const verified = await verifiedMessage(user, conversationId, assistantMessageId, actionType, undefined, client);
+      if (isProposalDismissed(verified.row.tool_results, actionType)) return { status: "dismissed" };
+      const intents = await client.query(
+        `SELECT id, status FROM assistant_action_intents
+         WHERE user_id = $1 AND conversation_id = $2 AND assistant_message_id = $3 AND action_type = $4
+         FOR UPDATE`,
+        [user.id, conversationId, assistantMessageId, actionType],
+      );
+      if (intents.rows.some((intent) => !["pending", "expired", "failed"].includes(intent.status))) {
+        fail("ACTION_ALREADY_HANDLED", 409, "This action has already been handled");
+      }
+      if (intents.rows.some((intent) => intent.status === "pending")) {
+        await client.query(
+          `UPDATE assistant_action_intents SET status = 'expired', execution_lease_until = NULL, execution_lease_token = NULL
+           WHERE user_id = $1 AND conversation_id = $2 AND assistant_message_id = $3 AND action_type = $4 AND status = 'pending'`,
+          [user.id, conversationId, assistantMessageId, actionType],
+        );
+      }
+      await client.query(
+        `UPDATE assistant_messages
+         SET tool_results = tool_results || $2::jsonb
+         WHERE id = $1 AND conversation_id = $3 AND role = 'assistant'`,
+        [assistantMessageId, JSON.stringify([{ tool: "__internal_action_context", data: { dismissed_proposals: { [actionType]: true } } }]), conversationId],
+      );
+      return { status: "dismissed" };
+    });
   }
 
   async function intentView(user, conversationId, intentId) {
@@ -129,7 +215,9 @@ function createAssistantActionService({ database, paymentService, appointments =
       [intentId, user.id, conversationId],
     );
     if (!result.rows[0]) fail("ACTION_NOT_FOUND", 404, "Action confirmation not found");
-    const { action_args: _args, ...view } = result.rows[0];
+    const { action_args: storedArgs, ...view } = result.rows[0];
+    const { __assistant_summary: summary, ..._args } = storedArgs || {};
+    if (summary && typeof summary === "object") view.summary = summary;
     if (view.action_type === "cancel") {
       const outcome = await database.query(
         `SELECT appointment.status AS cancellation_status,
@@ -311,7 +399,7 @@ function createAssistantActionService({ database, paymentService, appointments =
     return result.rowCount;
   }
 
-  return { confirm, intentView, prepare, reconcileCheckout, reconcileRefund };
+  return { confirm, dismiss, intentView, prepare, reconcileCheckout, reconcileRefund };
 }
 
 module.exports = { AssistantActionError, createAssistantActionService };

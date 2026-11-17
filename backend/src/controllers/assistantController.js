@@ -88,6 +88,14 @@ async function prepareAction(request, response) {
   } catch (error) { return errorResponse(response, error); }
 }
 
+async function dismissAction(_request, response) {
+  if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can dismiss appointment proposals" } });
+  try {
+    const { assistant_message_id, action_type } = response.locals.body;
+    return response.json(await getActionService(response).dismiss(response.locals.user, response.locals.params.conversationId, assistant_message_id, action_type));
+  } catch (error) { return errorResponse(response, error); }
+}
+
 async function confirmAction(_request, response) {
   if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can confirm appointment actions" } });
   try {
@@ -104,4 +112,4 @@ async function getActionStatus(_request, response) {
   } catch (error) { return errorResponse(response, error); }
 }
 
-module.exports = { create, list, open, remove, send, prepareAction, confirmAction, getActionStatus };
+module.exports = { create, list, open, remove, send, prepareAction, dismissAction, confirmAction, getActionStatus };
