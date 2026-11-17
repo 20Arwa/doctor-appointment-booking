@@ -358,6 +358,14 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
       const requestedDate = requestedDates.at(-1);
       const requestedDateIso = resolveDateReference(requestedDate, applicationTimezone, now());
       const canonicalIntent = recognizeCanonicalIntent(currentUserText, applicationTimezone, now());
+      if (/\b(?:i said|i meant|no,?\s*i said|correction)\b/i.test(currentUserText)) {
+        const correctedDate = dateReferences(currentUserText).map((reference) => resolveDateReference(reference, applicationTimezone, now())).find(Boolean);
+        if (correctedDate && referenceContext.history_page?.query) {
+          canonicalIntent.category = "appointment_history";
+          canonicalIntent.historyQuery = { view: "date", scope: "all", from: correctedDate, to: correctedDate };
+          canonicalIntent.historyScope = "all_upcoming";
+        }
+      }
       const actionRequest = ({ booking: "book", rescheduling: "reschedule" })[canonicalIntent.category] || null;
       let targetTime = timeRangeTarget(currentUserText, requestedTimes);
       if (actionRequest === "reschedule" && requestedTimes.length >= 2) {
@@ -625,7 +633,8 @@ function createConversationEngine({ provider, toolExecutor, logger = console, no
         const category = effectiveHistoryQuery.scope === "nearest" ? "next upcoming appointment"
           : effectiveHistoryQuery.scope === "last" ? "most recent past appointment"
             : effectiveHistoryQuery.scope === "last_completed" ? "most recently completed appointment"
-              : effectiveHistoryQuery.view === "cancelled" ? "cancelled appointments"
+              : effectiveHistoryQuery.view === "date" ? `appointments on ${effectiveHistoryQuery.from}`
+            : effectiveHistoryQuery.view === "cancelled" ? "cancelled appointments"
                 : effectiveHistoryQuery.view === "past" ? "past appointments" : "upcoming appointments";
         const answer = historyContinuation && !referenceContext.appointments.length && !historyFailed
           ? "There are no more appointment pages in that list."

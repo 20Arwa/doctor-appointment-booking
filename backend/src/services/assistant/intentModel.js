@@ -1,10 +1,11 @@
 const { z } = require("zod");
+const { dateReferences, resolveDateReference } = require("./temporalInterpretation");
 
 const canonicalIntentSchema = z.object({
   category: z.enum(["doctor_search", "availability", "booking", "rescheduling", "cancellation", "payment_history", "refund_preview", "appointment_history", "unknown"]),
   historyScope: z.enum(["next_upcoming", "all_upcoming", "past", "last", "last_completed", "cancelled"]).nullable(),
   historyQuery: z.object({
-    view: z.enum(["upcoming", "past", "cancelled"]),
+    view: z.enum(["upcoming", "past", "cancelled", "date"]),
     scope: z.enum(["all", "nearest", "next_days", "last", "last_completed"]),
     from: z.string().optional(),
     to: z.string().optional(),
@@ -19,6 +20,11 @@ const canonicalIntentSchema = z.object({
 function recognizeAppointmentHistory(text, timeZone = "Asia/Kolkata", nowValue = Date.now()) {
   const value = String(text || "").toLowerCase();
   if (!/\b(?:appointment|visit|booking)s?\b/.test(value)) return null;
+  const dateRefs = dateReferences(value);
+  if (dateRefs.length) {
+    const date = resolveDateReference(dateRefs.at(-1), timeZone, nowValue);
+    return date ? { view: "date", scope: "all", from: date, to: date } : null;
+  }
   if (/\b(?:cancelled|canceled)\b/.test(value)) return { view: "cancelled", scope: "all" };
   if (/\b(?:last|most recent)\b/.test(value) && /\bcompleted\b/.test(value)) return { view: "past", scope: "last_completed" };
   if (/\blast week\b/.test(value)) {

@@ -63,4 +63,19 @@ describe("canonical patient assistant intent model", () => {
     const [tomorrow] = dateReferences("tomorrow");
     assert.equal(resolveDateReference(tomorrow, "Asia/Kolkata", now), "2026-11-17");
   });
+
+  it("routes date specific appointment wording consistently and resolves yearless dates to the next occurrence", () => {
+    const now = Date.parse("2026-11-17T04:00:00.000Z");
+    for (const text of ["Show me all my appointments for today", "List every appointment on today", "What appointments do I have today?"]) {
+      assert.deepEqual(recognizeCanonicalIntent(text, "Asia/Kolkata", now).historyQuery, {
+        view: "date", scope: "all", from: "2026-11-17", to: "2026-11-17",
+      });
+    }
+    assert.deepEqual(recognizeCanonicalIntent("Show all appointments for 15th December", "Asia/Kolkata", now).historyQuery, {
+      view: "date", scope: "all", from: "2026-12-15", to: "2026-12-15",
+    });
+    assert.deepEqual(recognizeCanonicalIntent("Show appointments for December 15, 2024", "Asia/Kolkata", now).historyQuery, {
+      view: "date", scope: "all", from: "2024-12-15", to: "2024-12-15",
+    });
+  });
 });

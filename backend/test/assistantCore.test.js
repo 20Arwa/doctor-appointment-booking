@@ -1981,3 +1981,31 @@ describe("assistant conversation and Gemini adapter errors", () => {
     await assert.rejects(provider.generate({ messages: [], tools: [], systemInstruction: "", signal: AbortSignal.timeout(1000) }), (error) => error.status === 504 && error.category === "provider_http_504" && error.name !== "AbortError");
   });
 });
+
+
+describe("patient assistant date-query reliability regressions", () => {
+  it("uses a date scoped lookup for today and keeps an empty date result empty", async () => {
+    const calls = [];
+    const engine = createConversationEngine({ now: () => Date.parse("2026-11-17T04:00:00.000Z"), provider: { generate: async () => { throw new Error("date history is deterministic"); } }, toolExecutor: async ({ name, args }) => { calls.push({ name, args }); return { appointments: [], has_more: false }; } });
+    const response = await engine.respond({ actor: user, messages: [{ role: "user", content: "Show me all my appointments for today" }] });
+    assert.deepEqual(calls, [{ name: "get_patient_appointments", args: { view: "date", scope: "all", from: "2026-11-17", to: "2026-11-17", offset: 0 } }]);
+    assert.match(response.answer, /no matching appointments/i);
+    assert.equal(response.internalReferences.history_page.query.view, "date");
+  });
+  it("re-resolves a corrected date instead of continuing the previous appointment query", async () => {
+    const calls = [];
+    const engine = createConversationEngine({ now: () => Date.parse("2026-11-17T04:00:00.000Z"), provider: { generate: async () => { throw new Error("date corrections are deterministic"); } }, toolExecutor: async ({ name, args }) => { calls.push({ name, args }); return { appointments: [], has_more: false }; } });
+    const first = await engine.respond({ actor: user, messages: [{ role: "user", content: "Show appointments for tomorrow" }] });
+    const corrected = await engine.respond({ actor: user, previousReferences: first.internalReferences, messages: [{ role: "user", content: "Show appointments for tomorrow" }, { role: "assistant", content: first.answer }, { role: "user", content: "I said today" }] });
+    assert.equal(calls[0].args.from, "2026-11-18");
+    assert.equal(calls[1].args.from, "2026-11-17");
+    assert.equal(corrected.internalReferences.history_page.query.to, "2026-11-17");
+  });
+  it("applies date filters in the owned appointment query and returns every matching row", async () => {
+    let sql; let values;
+    const rows = Array.from({ length: 27 }, (_, index) => ({ id: `id-${index}`, date: "2026-12-15", start_time: "09:00", end_time: "09:30", status: "confirmed", mode: "Wave" }));
+    const output = await executeTool({ name: "get_patient_appointments", args: { view: "date", scope: "all", from: "2026-12-15", to: "2026-12-15" }, actor: user, database: { async query(query, params) { sql = query; values = params; return { rows }; } }, applicationTimezone: "Asia/Kolkata" });
+    assert.match(sql, /p\.user_id = \$1/); assert.match(sql, /a\.scheduled_date >= \$\d+::date/); assert.match(sql, /a\.scheduled_date <= \$\d+::date/); assert.doesNotMatch(sql, /LIMIT/);
+    assert.deepEqual(values.slice(0, 3), [userId, "2026-12-15", "2026-12-15"]); assert.equal(output.appointments.length, 27); assert.equal(output.has_more, false);
+  });
+});

@@ -7,7 +7,7 @@ const tools = [
     parameters: {
       type: "OBJECT",
       properties: {
-        view: { type: "STRING", enum: ["upcoming", "past", "cancelled"] },
+        view: { type: "STRING", enum: ["upcoming", "past", "cancelled", "date"] },
         scope: { type: "STRING", enum: ["all", "nearest", "next_days", "last", "last_completed"] },
         days_ahead: { type: "INTEGER", minimum: 1, maximum: 31 },
         offset: { type: "INTEGER", minimum: 0, maximum: 100000 },
@@ -17,7 +17,7 @@ const tools = [
       required: ["view", "scope"],
     },
     schema: z.object({
-      view: z.enum(["upcoming", "past", "cancelled"]),
+      view: z.enum(["upcoming", "past", "cancelled", "date"]),
       scope: z.enum(["all", "nearest", "next_days", "last", "last_completed"]),
       days_ahead: z.number().int().min(1).max(31).optional(),
       offset: z.number().int().min(0).max(100000).optional(),
