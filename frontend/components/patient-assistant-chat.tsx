@@ -5,8 +5,8 @@ import { ArrowDown, ArrowUp, CalendarDays, Clock3, LoaderCircle, MessageCircle, 
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
-import { AssistantApiError, createAssistantConversation, getAssistantConversation, listAssistantConversations, sendAssistantMessage, type AssistantResult } from "@/lib/assistant-api";
-import { chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend } from "@/lib/assistant-chat-state";
+import { AssistantApiError, createAssistantConversation, getAssistantConversation, listAssistantConversations, sendAssistantMessage, type AssistantConversation, type AssistantResult } from "@/lib/assistant-api";
+import { canSendAssistantMessage, chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, retryOperation, shouldShowHistoryRecovery } from "@/lib/assistant-chat-state";
 
 function displayTime(value: unknown) {
   if (typeof value !== "string") return "";
@@ -44,10 +44,13 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
   const [state, dispatch] = useReducer(chatReducer, initialChatState);
   const [draft, setDraft] = useState("");
   const [ready, setReady] = useState(false);
+  const [historyLoadFailed, setHistoryLoadFailed] = useState(false);
+  const [recoveryConversations, setRecoveryConversations] = useState<AssistantConversation[]>([]);
   const [history, setHistory] = useState({ hasMore: false, nextBefore: null as string | null, loadingOlder: false, olderError: null as string | null, reachedStart: false });
   const [nearTop, setNearTop] = useState(false);
   const [nearLatest, setNearLatest] = useState(true);
   const conversationId = useRef<string | null>(null);
+  const recoveryTargetId = useRef<string | null>(null);
   const requestInFlight = useRef(false);
   const olderLoadInFlight = useRef(false);
   const messageList = useRef<HTMLDivElement>(null);
@@ -74,12 +77,19 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       const requested = new URLSearchParams(window.location.search).get("conversation");
       const id = requested || (await listAssistantConversations(token)).items[0]?.id;
       if (id) {
+        // Keep the selected ID even when history loading fails. Sending must not
+        // silently create a different conversation for a stale/unavailable URL.
+        conversationId.current = id;
         const stored = await getAssistantConversation(token, id, { limit: 20 });
         conversationId.current = stored.conversation.id;
         dispatch({ type: "restore", messages: stored.messages.map((message) => ({ id: message.id, requestId: message.request_id, role: message.role, content: message.content, results: message.results, failed: message.request_status === "failed" })) });
         setHistory({ hasMore: stored.has_more, nextBefore: stored.next_before, loadingOlder: false, olderError: null, reachedStart: false });
       }
-    } catch (error) { dispatch({ type: "failure", requestId: "load", message: error instanceof Error ? error.message : "We couldn't load this conversation." }); }
+      setHistoryLoadFailed(false);
+    } catch (error) {
+      setHistoryLoadFailed(true);
+      dispatch({ type: "failure", requestId: "load", message: error instanceof Error ? error.message : "We couldn't load this conversation.", code: error instanceof AssistantApiError ? error.code || "HISTORY_LOAD_FAILED" : "HISTORY_LOAD_FAILED", source: "history" });
+    }
     finally { setReady(true); dispatch({ type: "loading", value: false }); }
   }, [getToken]);
   useEffect(() => { const timer = window.setTimeout(() => { void loadConversation(); }, 0); return () => window.clearTimeout(timer); }, [loadConversation]);
@@ -112,20 +122,97 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       const token = await getToken();
       if (!token) throw new AssistantApiError(401, "Your secure sign-in session is not ready. Please sign in again.");
       if (!conversationId.current) {
-        const id = crypto.randomUUID(); conversationId.current = id; await createAssistantConversation(token, id);
+        const id = crypto.randomUUID(); await createAssistantConversation(token, id); conversationId.current = id;
         if (!compact) window.history.replaceState(null, "", `/patient/assistant?conversation=${id}`);
       }
       const reply = await sendAssistantMessage(token, conversationId.current, requestId, content);
+      setHistoryLoadFailed(false);
       dispatch({ type: "success", requestId, user: { id: reply.user_message.id, requestId, role: "user", content }, assistant: { id: reply.assistant_message.id, role: "assistant", content: reply.assistant_message.content, results: reply.assistant_message.results || [] } });
-    } catch (error) { dispatch({ type: "failure", requestId, message: error instanceof Error ? error.message : "We couldn't get a reply. Please try again." }); }
+    } catch (error) { setDraft((current) => restoreDraftAfterFailedSubmission(current, content)); dispatch({ type: "failure", requestId, message: error instanceof Error ? error.message : "We couldn't get a reply. Please try again.", code: error instanceof AssistantApiError ? error.code : undefined, source: "send" }); }
     finally { requestInFlight.current = false; }
+  }, [compact, getToken, historyLoadFailed]);
+
+  const startNewConversation = useCallback(async () => {
+    if (requestInFlight.current) return;
+    requestInFlight.current = true;
+    dispatch({ type: "loading", value: true });
+    try {
+      const token = await getToken();
+      if (!token) throw new AssistantApiError(401, "Your secure sign-in session is not ready. Please sign in again.");
+      const id = crypto.randomUUID();
+      await createAssistantConversation(token, id);
+      conversationId.current = id;
+      recoveryTargetId.current = null;
+      setHistoryLoadFailed(false);
+      setHistory({ hasMore: false, nextBefore: null, loadingOlder: false, olderError: null, reachedStart: false });
+      setRecoveryConversations([]);
+      dispatch({ type: "clear" });
+      if (!compact) window.history.replaceState(null, "", `/patient/assistant?conversation=${id}`);
+    } catch (error) {
+      dispatch({ type: "failure", requestId: "start-new", message: error instanceof Error ? error.message : "A new conversation couldn't be started.", code: error instanceof AssistantApiError ? error.code : undefined, source: "new_conversation" });
+    } finally {
+      requestInFlight.current = false;
+      dispatch({ type: "loading", value: false });
+    }
+  }, [compact, getToken]);
+
+  const findSavedConversations = useCallback(async () => {
+    if (requestInFlight.current) return;
+    requestInFlight.current = true;
+    dispatch({ type: "loading", value: true });
+    try {
+      const token = await getToken();
+      if (!token) throw new AssistantApiError(401, "Your secure sign-in session is not ready. Please sign in again.");
+      const saved = await listAssistantConversations(token);
+      setRecoveryConversations(saved.items);
+      if (!saved.items.length) dispatch({ type: "failure", requestId: "recover", message: "No saved conversations were returned for this account. You can retry loading or explicitly start a new conversation.", source: "saved_conversations" });
+    } catch (error) {
+      dispatch({ type: "failure", requestId: "recover", message: error instanceof Error ? error.message : "Saved conversations couldn't be loaded.", code: error instanceof AssistantApiError ? error.code : undefined, source: "saved_conversations" });
+    } finally {
+      requestInFlight.current = false;
+      dispatch({ type: "loading", value: false });
+    }
+  }, [getToken]);
+
+  const openSavedConversation = useCallback(async (id: string) => {
+    if (requestInFlight.current) return;
+    recoveryTargetId.current = id;
+    requestInFlight.current = true;
+    dispatch({ type: "loading", value: true });
+    try {
+      const token = await getToken();
+      if (!token) throw new AssistantApiError(401, "Your secure sign-in session is not ready. Please sign in again.");
+      const stored = await getAssistantConversation(token, id, { limit: 20 });
+      conversationId.current = stored.conversation.id;
+      recoveryTargetId.current = null;
+      dispatch({ type: "restore", messages: stored.messages.map((message) => ({ id: message.id, requestId: message.request_id, role: message.role, content: message.content, results: message.results, failed: message.request_status === "failed" })) });
+      setHistory({ hasMore: stored.has_more, nextBefore: stored.next_before, loadingOlder: false, olderError: null, reachedStart: false });
+      setHistoryLoadFailed(false);
+      setRecoveryConversations([]);
+      if (!compact) window.history.replaceState(null, "", `/patient/assistant?conversation=${stored.conversation.id}`);
+    } catch (error) {
+      dispatch({ type: "failure", requestId: "recover", message: error instanceof Error ? error.message : "The saved conversation couldn't be opened.", code: error instanceof AssistantApiError ? error.code || "HISTORY_LOAD_FAILED" : "HISTORY_LOAD_FAILED", source: "history" });
+    } finally {
+      requestInFlight.current = false;
+      dispatch({ type: "loading", value: false });
+    }
   }, [compact, getToken]);
 
   function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); const content = draft.trim(); if (!content || state.loading || requestInFlight.current || !ready) return;
-    const requestId = crypto.randomUUID(); dispatch({ type: "submit", message: { requestId, role: "user", content } }); setDraft(""); void deliver(requestId, content);
+    event.preventDefault(); const content = draft.trim(); if (!canSendAssistantMessage({ ready, loading: state.loading || requestInFlight.current, draft: content, historyLoadFailed, hasConversation: Boolean(conversationId.current) })) return;
+    const failed = [...state.messages].reverse().find((item) => item.role === "user" && item.failed && item.content === content && item.requestId);
+    if (failed?.requestId) { setDraft(""); void deliver(failed.requestId, content); return; }
+    const requestId = crypto.randomUUID(); dispatch({ type: "submit", message: { requestId, role: "user", content } }); setDraft((current) => current.trim() === content ? "" : current); void deliver(requestId, content);
   }
-  const retry = () => { const failed = [...state.messages].reverse().find((item) => item.failed && item.requestId); if (failed) void deliver(failed.requestId!, failed.content); else void loadConversation(); };
+  const retry = () => {
+    const operation = retryOperation(state.errorSource);
+    if (operation === "history" && recoveryTargetId.current) { void openSavedConversation(recoveryTargetId.current); return; }
+    if (operation === "history") { void loadConversation(); return; }
+    if (operation === "saved_conversations") { void findSavedConversations(); return; }
+    if (operation === "new_conversation") { void startNewConversation(); return; }
+    const failed = [...state.messages].reverse().find((item) => item.failed && item.requestId);
+    if (failed) { setDraft((current) => current === failed.content ? "" : current); void deliver(failed.requestId!, failed.content); } else void loadConversation();
+  };
   const content = <>
     <header className={`flex items-center gap-3 ${compact ? "px-4 py-3" : "mb-5"}`}>
       <span className="flex size-10 items-center justify-center rounded-2xl bg-secondary text-secondary-foreground"><MessageCircle aria-hidden="true" className="size-5" /></span>
@@ -162,13 +249,14 @@ export function PatientAssistantChat({ compact = false, onClose }: { compact?: b
       </div>
       {!nearLatest && state.messages.length ? <Button type="button" variant="outline" size="icon" className="absolute bottom-4 right-4 z-20 rounded-full border border-border bg-background text-foreground shadow-lg hover:bg-muted" aria-label="Scroll to latest messages" onClick={() => { const element = messageList.current; if (element) element.scrollTo({ top: element.scrollHeight, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }); }}><ArrowDown aria-hidden="true" className="size-4" /></Button> : null}
       </div>
-      {state.error ? <div role="alert" className="mx-3 mb-2 flex items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-foreground"><span>{state.error}</span><Button type="button" variant="default" size="sm" disabled={state.loading} onClick={retry}>Retry</Button></div> : null}
+      {state.error ? <div role="alert" className="mx-3 mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-foreground"><span className="min-w-0 flex-1">{state.error}</span><div className="flex shrink-0 gap-2"><Button type="button" variant="default" size="sm" disabled={state.loading} onClick={retry}>Retry</Button>{shouldShowHistoryRecovery(state.errorCode) ? <><Button type="button" variant="outline" size="sm" disabled={state.loading} onClick={() => void findSavedConversations()}>Find saved conversations</Button><Button type="button" variant="outline" size="sm" disabled={state.loading} onClick={() => void startNewConversation()}>Start new conversation</Button></> : null}</div></div> : null}
+      {recoveryConversations.length ? <ul aria-label="Saved conversations" className="mx-3 mb-2 flex max-h-40 flex-col gap-1 overflow-y-auto rounded-lg border border-border bg-background p-2">{recoveryConversations.map((conversation) => <li key={conversation.id}><Button type="button" variant="ghost" size="sm" className="h-auto w-full justify-start whitespace-normal text-left" disabled={state.loading} onClick={() => void openSavedConversation(conversation.id)}>{conversation.preview || "Conversation without messages"}</Button></li>)}</ul> : null}
       {state.loading && !state.messages.length ? <div className="flex items-center gap-2 px-4 pb-2 text-xs text-muted-foreground" role="status"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Loading your conversation…</div> : null}
       <form onSubmit={submit} className="sticky bottom-0 z-10 shrink-0 border-t border-border bg-card p-3">
         <label htmlFor={compact ? "assistant-panel-message" : "assistant-message"} className="sr-only">Message Medrella Assistant</label>
         <div className="mx-auto flex w-full items-end gap-2 rounded-2xl border border-input bg-background p-2 focus-within:ring-2 focus-within:ring-ring">
           <textarea id={compact ? "assistant-panel-message" : "assistant-message"} value={draft} onChange={(event) => setDraft(event.target.value.slice(0, 1000))} maxLength={1000} rows={1} placeholder="Ask about appointments, doctors, or available times…" className="max-h-28 min-h-10 flex-1 resize-y bg-transparent px-2 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
-          <Button type="submit" size="icon" aria-label="Send message" disabled={!ready || state.loading || !draft.trim()}><Send aria-hidden="true" /></Button>
+          <Button type="submit" size="icon" aria-label="Send message" disabled={!canSendAssistantMessage({ ready, loading: state.loading, draft, historyLoadFailed, hasConversation: Boolean(conversationId.current) })}><Send aria-hidden="true" /></Button>
         </div>
       </form>
     </section>

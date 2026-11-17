@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-const resultSchema = z.object({ tool: z.enum(["get_patient_appointments", "search_doctors", "get_available_slots"]), data: z.record(z.string(), z.unknown()) });
+const resultSchema = z.object({ tool: z.enum(["get_patient_appointments", "search_doctors", "get_available_slots", "prepare_booking_action", "prepare_reschedule_action", "prepare_cancellation_action", "get_cancellation_refund_preview"]), data: z.record(z.string(), z.unknown()) });
 const messageSchema = z.object({ id: z.string(), role: z.enum(["user", "assistant"]), content: z.string(), request_id: z.string().optional(), request_status: z.string().optional(), results: z.array(resultSchema).optional() });
 const conversationSchema = z.object({ id: z.string(), created_at: z.string(), updated_at: z.string(), preview: z.string().nullable().optional() });
 const listSchema = z.object({ items: z.array(conversationSchema) });
@@ -15,7 +15,7 @@ export class AssistantApiError extends Error {
   constructor(public readonly status: number, message: string, public readonly code?: string) { super(message); this.name = "AssistantApiError"; }
 }
 
-async function request<T>(token: string, path: string, init: RequestInit, schema: z.ZodType<T>): Promise<T> {
+async function request<T>(token: string, path: string, init: RequestInit, schema: z.ZodType<T>, invalidResponseMessage?: string): Promise<T> {
   const base = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/\/+$/, "");
   if (!base) throw new AssistantApiError(0, "The backend API URL is not configured.");
   let response: Response;
@@ -30,6 +30,7 @@ async function request<T>(token: string, path: string, init: RequestInit, schema
     const code = parsed.success ? parsed.data.error?.code : undefined;
     const safeMessages: Record<string, string> = {
       RATE_LIMITED: "You're sending messages too quickly. Please wait a moment before trying again.",
+      CONVERSATION_NOT_FOUND: "This saved conversation couldn't be found. Your visible messages are still here; retry loading the conversation before continuing. No replacement conversation was created.",
       ASSISTANT_DAILY_QUOTA_EXCEEDED: "The AI assistant has reached its current usage limit. Please try again later.",
       ASSISTANT_PROVIDER_RATE_LIMITED: "The AI assistant is receiving too many requests. Please wait a moment and try again.",
       ASSISTANT_PROVIDER_UNAVAILABLE: "The AI assistant is temporarily unavailable. Please try again shortly.",
@@ -37,7 +38,7 @@ async function request<T>(token: string, path: string, init: RequestInit, schema
     throw new AssistantApiError(response.status, (code && safeMessages[code]) || "The assistant couldn't respond. Please try again.", code);
   }
   const parsed = schema.safeParse(payload);
-  if (!parsed.success) throw new AssistantApiError(502, "The assistant returned an incomplete response. Please try again.");
+  if (!parsed.success) throw new AssistantApiError(502, invalidResponseMessage || "The assistant returned an incomplete response. Please try again.", "ASSISTANT_RESPONSE_INVALID");
   return parsed.data;
 }
 
@@ -46,7 +47,7 @@ export const listAssistantConversations = (token: string) => request(token, "/co
 export const getAssistantConversation = (token: string, id: string, { limit = 20, before }: { limit?: number; before?: string } = {}) => {
   const query = new URLSearchParams({ limit: String(limit) });
   if (before) query.set("before", before);
-  return request(token, `/conversations/${encodeURIComponent(id)}?${query.toString()}`, { method: "GET" }, detailSchema);
+  return request(token, `/conversations/${encodeURIComponent(id)}?${query.toString()}`, { method: "GET" }, detailSchema, "Saved conversation history could not be read because its response format was not recognized. The selected conversation was kept; retry or choose another saved conversation.");
 };
 export const deleteAssistantConversation = (token: string, id: string) => request(token, `/conversations/${encodeURIComponent(id)}`, { method: "DELETE" }, z.undefined());
 export const sendAssistantMessage = (token: string, conversationId: string, requestId: string, content: string) => request(token, `/conversations/${encodeURIComponent(conversationId)}/messages`, { method: "POST", body: JSON.stringify({ request_id: requestId, content }) }, sentSchema);

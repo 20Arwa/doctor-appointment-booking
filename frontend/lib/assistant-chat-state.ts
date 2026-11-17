@@ -1,16 +1,44 @@
 import type { AssistantResult } from "@/lib/assistant-api";
 
 export type ChatMessage = { id?: string; requestId?: string; role: "user" | "assistant"; content: string; results?: AssistantResult[]; failed?: boolean };
-export type ChatState = { messages: ChatMessage[]; loading: boolean; error: string | null };
+export type ChatState = { messages: ChatMessage[]; loading: boolean; error: string | null; errorCode: string | null; errorSource: "history" | "send" | "saved_conversations" | "new_conversation" | null };
 export type ChatAction =
   | { type: "restore"; messages: ChatMessage[] }
   | { type: "prepend"; messages: ChatMessage[] }
   | { type: "submit"; message: ChatMessage }
   | { type: "success"; requestId: string; user: ChatMessage; assistant: ChatMessage }
-  | { type: "failure"; requestId: string; message: string }
+  | { type: "failure"; requestId: string; message: string; code?: string; source?: ChatState["errorSource"] }
   | { type: "loading"; value: boolean }
   | { type: "clear" };
-export const initialChatState: ChatState = { messages: [], loading: false, error: null };
+export const initialChatState: ChatState = { messages: [], loading: false, error: null, errorCode: null, errorSource: null };
+
+export function retryOperation(source: ChatState["errorSource"]): "history" | "send" | "saved_conversations" | "new_conversation" {
+  return source || "history";
+}
+
+export function canSendAssistantMessage({ ready, loading, draft, historyLoadFailed, hasConversation }: { ready: boolean; loading: boolean; draft: string; historyLoadFailed: boolean; hasConversation: boolean }): boolean {
+  return ready && !loading && Boolean(draft.trim()) && !(historyLoadFailed && !hasConversation);
+}
+
+export function restoreDraftAfterFailedSubmission(currentDraft: string, submittedContent: string): string {
+  return currentDraft.trim() ? currentDraft : submittedContent;
+}
+
+export function classifyAssistantError(errorCode: string | null | undefined): "history" | "provider" | "tool" | "budget" | "response" | "authentication" | "rate_limit" | "other" {
+  const code = errorCode || "";
+  if (["CONVERSATION_NOT_FOUND", "HISTORY_LOAD_FAILED", "CONVERSATION_HISTORY_UNAVAILABLE"].includes(code)) return "history";
+  if (code === "TOOL_LIMIT_EXCEEDED") return "budget";
+  if (/^TOOL_|^INVALID_TOOL/.test(code)) return "tool";
+  if (/^(?:PROVIDER_INVALID_RESPONSE|ASSISTANT_RESPONSE)/.test(code)) return "response";
+  if (/^(?:UNAUTHORIZED|FORBIDDEN|AUTHENTICATION_REQUIRED)/.test(code) || code === "401") return "authentication";
+  if (/RATE_LIMIT|QUOTA/.test(code)) return "rate_limit";
+  if (/^(?:ASSISTANT_|PROVIDER_)/.test(code)) return "provider";
+  return "other";
+}
+
+export function shouldShowHistoryRecovery(errorCode: string | null | undefined): boolean {
+  return classifyAssistantError(errorCode) === "history";
+}
 
 export function getAssistantResultRows(result: AssistantResult): unknown[] {
   const rows = result.data.appointments || result.data.doctors || result.data.slots;
@@ -56,7 +84,7 @@ function messageIdentity(message: ChatMessage): string {
 }
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
-  if (action.type === "restore") return { messages: action.messages, loading: false, error: null };
+  if (action.type === "restore") return { messages: action.messages, loading: false, error: null, errorCode: null, errorSource: null };
   if (action.type === "prepend") {
     const existing = new Set(state.messages.map(messageIdentity));
     const older = action.messages.filter((message) => {
@@ -67,13 +95,15 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     });
     return { ...state, messages: [...older, ...state.messages] };
   }
-  if (action.type === "submit") return { messages: [...state.messages, action.message], loading: true, error: null };
+  if (action.type === "submit") return { ...state, messages: [...state.messages, action.message], loading: true, error: null, errorCode: null, errorSource: null };
   if (action.type === "success") {
     const user = { ...action.user, failed: false };
     const messages = state.messages.map((message) => message.requestId === action.requestId ? user : message);
-    return { messages: [...messages, action.assistant], loading: false, error: null };
+    return { messages: [...messages, action.assistant], loading: false, error: null, errorCode: null, errorSource: null };
   }
-  if (action.type === "failure") return { messages: state.messages.map((message) => message.requestId === action.requestId ? { ...message, failed: true } : message), loading: false, error: action.message };
-  if (action.type === "loading") return { ...state, loading: action.value, error: null };
+  if (action.type === "failure") return { messages: state.messages.map((message) => message.requestId === action.requestId ? { ...message, failed: true } : message), loading: false, error: action.message, errorCode: action.code || null, errorSource: action.source || null };
+  if (action.type === "loading") return action.value
+    ? { ...state, loading: true, error: null, errorCode: null }
+    : { ...state, loading: false };
   return initialChatState;
 }
