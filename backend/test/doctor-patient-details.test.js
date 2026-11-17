@@ -4,9 +4,34 @@ const appointmentService = require("../src/services/appointmentService");
 const { doctorPatientAppointmentsQuerySchema, doctorPatientParamsSchema } = require("../src/validators/doctorPatientSchemas");
 
 const doctorUser = { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", role: "doctor" };
+const patientUser = { id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", role: "patient" };
 const patientId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const appointmentId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 describe("doctor patient details", () => {
+  it("resolves patient appointment deep links only for the authenticated appointment owner", async () => {
+    let query;
+    const database = { async query(sql, values) {
+      query = { sql, values };
+      return values[1] === patientUser.id ? { rows: [{ id: appointmentId, status: "confirmed" }] } : { rows: [] };
+    } };
+    assert.deepEqual(await appointmentService.getAppointment(database, patientUser, appointmentId), { id: appointmentId, status: "confirmed" });
+    assert.deepEqual(query.values, [appointmentId, patientUser.id]);
+    assert.match(query.sql, /a\.id = \$1 AND p\.user_id = \$2/);
+    await assert.rejects(appointmentService.getAppointment(database, { ...patientUser, id: "ffffffff-ffff-4fff-8fff-ffffffffffff" }, appointmentId), (error) => error.status === 404 && error.code === "APPOINTMENT_NOT_FOUND");
+  });
+
+  it("resolves a patient profile link only for the doctor who owns the appointment", async () => {
+    let query;
+    const database = { query: async (sql, values) => { query = { sql, values }; return { rows: [{ patient_id: patientId }] }; } };
+    const result = await appointmentService.getDoctorAppointmentPatientId(database, doctorUser, appointmentId);
+    assert.deepEqual(result, { patient_id: patientId });
+    assert.deepEqual(query.values, [appointmentId, doctorUser.id]);
+    assert.match(query.sql, /a\.id = \$1 AND d\.user_id = \$2/);
+    await assert.rejects(appointmentService.getDoctorAppointmentPatientId(database, { ...doctorUser, role: "patient" }, appointmentId), (error) => error.status === 403);
+    const missing = { query: async () => ({ rows: [] }) };
+    await assert.rejects(appointmentService.getDoctorAppointmentPatientId(missing, doctorUser, appointmentId), (error) => error.status === 404);
+  });
   it("validates route IDs and defaults history pages to five records", () => {
     assert.equal(doctorPatientParamsSchema.safeParse({ patientId }).success, true);
     assert.equal(doctorPatientParamsSchema.safeParse({ patientId, extra: true }).success, false);

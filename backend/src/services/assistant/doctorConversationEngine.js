@@ -1,11 +1,29 @@
 const { AssistantError } = require("./conversationEngine");
 
-function createDoctorConversationEngine({ provider, toolExecutor, maxToolCalls = 4 }) {
+function dateInTimezone(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function isUpcomingListRequest(text, args, today) {
+  if (!/\bappointments?\b/i.test(text) || /\b(?:cancelled|canceled|completed|past|history|previous|last|confirmed)\b/i.test(text)) return false;
+  if (/\b(?:upcoming|future)\s+appointments?\b/i.test(text)) return true;
+  if (!/\b(?:show|list|display|get|find|what|which)\b/i.test(text)) return false;
+  if (args?.day) return args.day === "today" || args.day === "tomorrow";
+  const requestedEnd = args?.to || args?.date;
+  return typeof requestedEnd === "string" && /^\d{4}-\d{2}-\d{2}$/.test(requestedEnd) && requestedEnd >= today;
+}
+
+function createDoctorConversationEngine({ provider, toolExecutor, maxToolCalls = 4, now = () => new Date() }) {
   return {
     async respond({ actor, messages, database, applicationTimezone, tools, systemInstruction, requestId, logger }) {
       if (actor?.role !== "doctor") throw new AssistantError("FORBIDDEN", 403, "This account cannot use the doctor assistant");
       const transcript = messages.slice(-12).map(({ role, content }) => ({ role, content }));
       const results = [];
+      const latestUserText = [...messages].reverse().find(({ role }) => role === "user")?.content || "";
+      const nextAppointmentRequest = /\bnext\s+appointment\b/i.test(latestUserText);
+      const requestNow = now();
       let calls = 0;
       const signal = AbortSignal.timeout(35000);
       for (let round = 0; round <= maxToolCalls; round += 1) {
@@ -31,9 +49,17 @@ function createDoctorConversationEngine({ provider, toolExecutor, maxToolCalls =
         for (const call of completion.toolCalls) {
           calls += 1;
           try {
-            const data = await toolExecutor({ name: call.name, args: call.arguments, actor, database, applicationTimezone });
-            results.push({ tool: call.name, data });
-            toolResults.push({ name: call.name, id: call.id, result: data });
+            const isAppointmentList = call.name === "get_doctor_appointments";
+            const requestUpcomingList = isAppointmentList && isUpcomingListRequest(latestUserText, call.arguments, dateInTimezone(requestNow, "Asia/Kolkata"));
+            const args = isAppointmentList && nextAppointmentRequest
+              ? { scope: "nearest", status: "confirmed" }
+              : requestUpcomingList
+                ? { ...call.arguments, scope: "upcoming", status: "confirmed" }
+                : call.arguments;
+            const data = await toolExecutor({ name: call.name, args, actor, database, applicationTimezone, now: requestNow });
+            const { ui_actions: uiActions, ...modelData } = data;
+            results.push({ tool: call.name, data: modelData, ...(Array.isArray(uiActions) ? { ui_actions: uiActions } : {}) });
+            toolResults.push({ name: call.name, id: call.id, result: modelData });
           } catch (error) {
             logger?.info?.("doctor_tool_failed", { requestId, category: error?.code || "tool_query_failed" });
             throw new AssistantError("DOCTOR_TOOL_QUERY_FAILED", 503, "I couldn't load the requested appointment information. Please try again shortly.");

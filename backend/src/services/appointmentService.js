@@ -349,6 +349,18 @@ async function getDoctorPatient(database, user, patientId) {
   return result.rows[0];
 }
 
+async function getDoctorAppointmentPatientId(database, user, appointmentId) {
+  if (user.role !== "doctor") fail(403, "FORBIDDEN", "Only doctors may view patient details");
+  const result = await database.query(
+    `SELECT a.patient_id FROM appointments a
+     JOIN availability av ON av.id = a.availability_id
+     JOIN doctors d ON d.id = av.doctor_id
+     WHERE a.id = $1 AND d.user_id = $2`, [appointmentId, user.id],
+  );
+  if (!result.rows[0]) fail(404, "APPOINTMENT_NOT_FOUND", "Appointment not found for this doctor");
+  return { patient_id: result.rows[0].patient_id };
+}
+
 async function listDoctorPatientAppointments(database, user, patientId, filters, timeZone = "Asia/Kolkata") {
   await requireDoctorPatientRelationship(database, user, patientId);
   const values = [user.id, patientId];
@@ -842,6 +854,7 @@ module.exports = {
   getAppointment,
   listAppointments,
   getDoctorPatient,
+  getDoctorAppointmentPatientId,
   listDoctorPatientAppointments,
   readAppointmentDetails: readDetails,
   rescheduleAppointment,

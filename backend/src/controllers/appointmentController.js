@@ -36,6 +36,10 @@ const getAppointment = handle(async (_request, response) => ({
   ),
 }));
 
+const getAppointmentPatientProfile = handle(async (_request, response) => ({
+  body: await appointmentService.getDoctorAppointmentPatientId(response.locals.database, response.locals.user, response.locals.params.id),
+}));
+
 const previewCancellationRefund = handle(async (_request, response) => ({
   body: await response.locals.paymentService.previewCancellationRefund(
     response.locals.user,
@@ -91,6 +95,7 @@ module.exports = {
   completeAppointment,
   createAppointment,
   getAppointment,
+  getAppointmentPatientProfile,
   listAppointments,
   previewCancellationRefund,
   rescheduleAppointment,

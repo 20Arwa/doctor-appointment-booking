@@ -58,10 +58,46 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
     // The doctor ID is resolved from the verified local user, never from model arguments.
     if (actor?.role !== "doctor") throw Object.assign(new Error("Tool is unavailable"), { code: "TOOL_UNAVAILABLE" });
     const timeZone = "Asia/Kolkata";
+    if (name === "get_doctor_appointments" && input.scope === "nearest") {
+      const page = await appointmentService.listAppointments(database, actor, {
+        view: "upcoming", status: "confirmed", limit: 1, offset: 0,
+      }, timeZone);
+      const row = page.items[0];
+      const appointments = row ? [{
+        date: row.date, start_time: row.start_time, end_time: row.end_time,
+        status: row.status, ...(row.mode ? { mode: row.mode } : {}),
+      }] : [];
+      return {
+        scope: "nearest",
+        appointments,
+        has_more: false,
+        next_offset: null,
+        ui_actions: row ? [{ type: "appointment", appointment_id: row.id }] : [],
+      };
+    }
     const relativeOffset = input.day === "tomorrow" ? 1 : input.day === "yesterday" ? -1 : 0;
     const requestedDate = input.date || (input.day ? addCalendarDays(dateInTimezone(now, timeZone), relativeOffset) : null);
     const from = requestedDate || input.from;
     const to = requestedDate || input.to;
+    if (name === "get_doctor_appointments" && input.scope === "upcoming") {
+      const offset = input.offset;
+      const page = await appointmentService.listAppointments(database, actor, {
+        view: "upcoming", status: "confirmed", ...(from ? { from } : {}), ...(to ? { to } : {}),
+        limit: 15, offset,
+      }, timeZone);
+      const rows = page.items;
+      return {
+        scope: "upcoming", ...(from ? { from } : {}), ...(to ? { to } : {}),
+        appointments: rows.map(({ date, start_time, end_time, status, mode }) => ({
+          date, start_time, end_time, status, ...(mode ? { mode } : {}),
+        })),
+        has_more: page.has_more,
+        next_offset: page.has_more ? page.next_offset : null,
+        limit: 15,
+        offset,
+        ui_actions: rows.map((row) => ({ type: "appointment", appointment_id: row.id })),
+      };
+    }
     const values = [actor.id, from, to];
     const statusClause = input.status ? ` AND appointment.status = $${values.push(input.status)}` : "";
     if (name === "get_doctor_appointment_statistics") {
@@ -81,7 +117,7 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
     const offset = input.offset;
     values.push(limit + 1, offset);
     const result = await database.query(
-      `SELECT appointment.scheduled_date::text AS date,
+      `SELECT appointment.id, appointment.scheduled_date::text AS date,
               appointment.scheduled_start_time::text AS start_time,
               appointment.scheduled_end_time::text AS end_time,
               appointment.status, av.mode
@@ -93,10 +129,12 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
       values,
     );
     const hasMore = result.rows.length > limit;
-    const appointments = result.rows.slice(0, limit).map(({ date, start_time, end_time, status, mode }) => ({
+    const rows = result.rows.slice(0, limit);
+    const appointments = rows.map(({ date, start_time, end_time, status, mode }) => ({
       date, start_time, end_time, status, ...(mode ? { mode } : {}),
     }));
-    return { from, to, appointments, has_more: hasMore, next_offset: hasMore ? offset + appointments.length : null, limit, offset };
+    return { from, to, appointments, has_more: hasMore, next_offset: hasMore ? offset + appointments.length : null, limit, offset,
+      ui_actions: rows.map((row) => ({ type: "appointment", appointment_id: row.id })) };
   }
 
   if (["get_doctor_schedules", "get_doctor_schedule_exceptions", "get_doctor_schedule_conflicts", "get_doctor_nearest_slots"].includes(name)) {
@@ -131,10 +169,10 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
       offset += rows.length;
       lastPageWasFull = rows.length === limit;
       slots.push(...rows.filter((slot) => Number(slot.remaining_capacity) > 0).slice(0, 5 - slots.length)
-        .map(({ date, start_time, end_time, mode, capacity, remaining_capacity }) => ({ date, start_time, end_time, mode: mode || "legacy", capacity, remaining_capacity })));
+        .map(({ id, date, start_time, end_time, mode, capacity, remaining_capacity }) => ({ id, date, start_time, end_time, mode: mode || "legacy", capacity, remaining_capacity })));
       if (rows.length < limit) break;
     }
-    return { slots, scan_limit_reached: slots.length < 5 && offset >= scanLimit && lastPageWasFull, notice: schedulingAssistant.POINT_IN_TIME_NOTICE };
+    return { slots: slots.map(({ id: _id, ...slot }) => slot), ui_actions: slots.map(({ id }) => ({ type: "schedule_slot", availability_id: id })), scan_limit_reached: slots.length < 5 && offset >= scanLimit && lastPageWasFull, notice: schedulingAssistant.POINT_IN_TIME_NOTICE };
   }
 
   if (name === "get_cancellation_refund_preview") {
@@ -202,7 +240,7 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
     await getDoctorSlots({}, response, (error) => { controllerError = error; });
     if (controllerError) throw controllerError;
     if ((response.statusCode || 200) >= 400) throw Object.assign(new Error("Availability could not be loaded"), { code: "TOOL_QUERY_FAILED" });
-    let rows = response.body || [];
+    let rows = (response.body || []).filter((row) => Number(row.remaining_capacity) > 0);
     if (input.exact_start_time) rows = rows.filter((row) => String(row.start_time).slice(0, 5) === input.exact_start_time);
     return { slots: rows.slice(0, input.exact_start_time ? 2 : slotLimit).map(({ id, date, start_time, end_time, doctor_id, doctor_first_name, doctor_last_name, specialty, consultation_fee, mode, capacity, remaining_capacity }) => ({
       id, availability_id: id, date, start_time, end_time, doctor_id, doctor: { id: doctor_id, name: `Dr. ${doctor_first_name} ${doctor_last_name}`.trim() }, specialty, consultation_fee, mode: mode || "legacy", capacity, remaining_capacity,

@@ -3,7 +3,7 @@
 import { useAuth } from "@clerk/nextjs";
 import { ArrowLeft, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, RefreshCw, Stethoscope } from "lucide-react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import { z } from "zod";
 import {
@@ -21,7 +21,7 @@ import { notifyInAppNotificationsChanged, notifySuccess } from "@/lib/notificati
 import { AppShellLoading } from "@/components/app-shell-loading";
 import { CheckoutReturnNotice, type CheckoutReturnState } from "@/components/checkout-return-notice";
 import { cancelAppointmentPaymentOrder, createAppointmentPaymentOrder, getAppointmentPaymentStatus, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
-import { formatDateOnly } from "@/lib/date-format";
+import { dateNavigationTarget, formatDateOnly } from "@/lib/date-format";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
 const inrFormatter = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
@@ -106,11 +106,14 @@ function formatBookingError(error: unknown) {
 export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   const { getToken } = useAuth();
   const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const linkedDate = searchParams.get("date");
+  const linkedDateTarget = dateNavigationTarget(linkedDate, dateInApplicationZone(new Date()));
   const [doctor, setDoctor] = useState<DirectoryDoctor | null>(null);
   const [slots, setSlots] = useState<AvailabilitySlot[]>([]);
-  const [calendarMonth, setCalendarMonth] = useState(() => `${dateInApplicationZone(new Date()).slice(0, 7)}-01`);
-  const [selectedDate, setSelectedDate] = useState(() => dateInApplicationZone(new Date()));
-  const [selectedSlotId, setSelectedSlotId] = useState("");
+  const [calendarMonth, setCalendarMonth] = useState(() => linkedDateTarget.month);
+  const [selectedDate, setSelectedDate] = useState(() => linkedDateTarget.date);
+  const [selectedSlotId, setSelectedSlotId] = useState(() => searchParams.get("slot") || "");
   const [reason, setReason] = useState("");
   const [loading, setLoading] = useState(true);
   const [availabilityLoading, setAvailabilityLoading] = useState(true);
@@ -167,8 +170,9 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
     setBookingDialogOpen(false);
     setSelectedSlotId("");
     setAvailabilityLoading(true);
-    setCalendarMonth(`${dateInApplicationZone(new Date()).slice(0, 7)}-01`);
-    setSelectedDate(dateInApplicationZone(new Date()));
+    const routeDate = dateNavigationTarget(searchParams.get("date"), dateInApplicationZone(new Date()));
+    setCalendarMonth(routeDate.month);
+    setSelectedDate(routeDate.date);
     setBookingError(null);
     setReason("");
     setLoading(true);

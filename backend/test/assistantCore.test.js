@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const { describe, it } = require("node:test");
 const { getPolicyForActor, getToolsForActor } = require("../src/services/assistant/toolRegistry");
 const { executeTool, nextDaysRange, safeAppointment } = require("../src/services/assistant/toolExecutor");
+const { patientUiActions, publicToolResult } = require("../src/services/assistant/conversationEngine");
 const { createConversationEngine, AssistantError, pairedTimeCandidates, selectedAppointmentTimes, timeRangeTarget, timeReferences } = require("../src/services/assistant/conversationEngine");
 const { createGeminiProvider, readRetryAfterMs } = require("../src/services/assistant/geminiProvider");
 
@@ -98,7 +99,7 @@ describe("patient assistant tools", () => {
   it("registers role-specific assistant tools and validates bounded patient date ranges", () => {
     assert.equal(getToolsForActor(user).length, 7);
     assert.match(getPolicyForActor(user), /Never guess or invent records/);
-    assert.equal(getToolsForActor({ ...user, role: "doctor" }).length, 2);
+    assert.equal(getToolsForActor({ ...user, role: "doctor" }).length, 6);
     assert.match(getPolicyForActor({ ...user, role: "doctor" }), /Never book, cancel, reschedule/);
   });
 
@@ -133,6 +134,42 @@ describe("patient assistant tools", () => {
     assert.equal(JSON.stringify(output).includes("private reason"), false);
     assert.equal(JSON.stringify(output).includes("private@example.test"), false);
     assert.deepEqual(safeAppointment(sensitiveRow), output.appointments[0]);
+    assert.deepEqual(patientUiActions("get_patient_appointments", output), [{ type: "appointment", appointment_id: sensitiveRow.id }]);
+    assert.doesNotMatch(JSON.stringify(publicToolResult(output)), /appointment_id|doctor_id|patient_id|"id"/);
+    assert.doesNotMatch(JSON.stringify(publicToolResult({ slots: [{ id: "slot-id", availability_id: "slot-id", doctor_id: doctorId, doctor: { id: doctorId } }] })), /availability_id|doctor_id|"id"/);
+    assert.deepEqual(patientUiActions("get_available_slots", { slots: [{ id: "slot-id", doctor_id: doctorId }] }), [{ type: "slot", availability_id: "slot-id", doctor_id: doctorId }]);
+    assert.deepEqual(patientUiActions("search_doctors", { doctors: [{ id: doctorId }] }), [{ type: "doctor", doctor_id: doctorId }]);
+  });
+
+  it("executes doctor-specific availability searches and preserves doctor context for a date-only follow-up", async () => {
+    const doctor = { id: doctorId, name: "Dr. Ada Morgan", specialty: "Cardiology" };
+    const availabilityId = "33333333-3333-4333-8333-333333333333";
+    const calls = [];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-12-20T08:00:00.000Z"),
+      provider: { generate: async () => { throw new Error("Availability flow should resolve deterministically"); } },
+      toolExecutor: async ({ name, args }) => {
+        calls.push({ name, args });
+        if (name === "search_doctors") return { doctors: [doctor] };
+        return { slots: [{ id: availabilityId, availability_id: availabilityId, doctor_id: doctorId, date: "2027-01-13", start_time: "10:00", end_time: "10:30", doctor }] };
+      },
+    });
+    const first = await engine.respond({ actor: user, messages: [{ role: "user", content: "Show availability for Dr. Ada Morgan on 13 January" }] });
+    assert.deepEqual(calls.map(({ name }) => name), ["search_doctors", "get_available_slots"]);
+    assert.equal(calls[1].args.from, "2027-01-13");
+    assert.deepEqual(first.results.map(({ tool }) => tool), ["search_doctors", "get_available_slots"]);
+    assert.deepEqual(first.results[1].ui_actions, [{ type: "slot", availability_id: availabilityId, doctor_id: doctorId }]);
+    assert.doesNotMatch(JSON.stringify(first.results.map(({ data }) => data)), /availability_id|doctor_id|"id"/);
+
+    calls.length = 0;
+    const followup = await engine.respond({
+      actor: user,
+      messages: [{ role: "user", content: "13 January" }],
+      previousReferences: { version: 1, captured_at: "2026-12-20T08:00:00.000Z", reference_timestamps: { doctors: "2026-12-20T08:00:00.000Z" }, doctors: [doctor], appointments: [], slots: [] },
+    });
+    assert.deepEqual(calls.map(({ name }) => name), ["get_available_slots"]);
+    assert.equal(calls[0].args.from, "2027-01-13");
+    assert.equal(followup.results[0].tool, "get_available_slots");
   });
 
   it("uses Asia/Kolkata calendar boundaries and returns only matching next-days appointments", async () => {
@@ -268,9 +305,11 @@ describe("patient assistant tools", () => {
     assert.equal(nextAvailable.slots[0].date, "2099-08-10");
     let legacySql;
     const legacySlot = { ...slot, id: "55555555-5555-4555-8555-555555555555", date: "2099-08-09", mode: null, capacity: 1, remaining_capacity: 1 };
-    const withLegacy = await executeTool({ name: "get_available_slots", args: {}, actor: user, applicationTimezone: "UTC", database: { query: async (sql) => { legacySql = sql; return { rows: [legacySlot, slot] }; } } });
+    const fullLegacySlot = { ...legacySlot, id: "66666666-6666-4666-8666-666666666666", date: "2099-08-08", remaining_capacity: 0 };
+    const withLegacy = await executeTool({ name: "get_available_slots", args: {}, actor: user, applicationTimezone: "UTC", database: { query: async (sql) => { legacySql = sql; return { rows: [fullLegacySlot, legacySlot, slot] }; } } });
     assert.match(legacySql, /availability\.mode IS NULL OR availability\.capacity > COALESCE\(occupancy\.occupied, 0\)/);
     assert.doesNotMatch(legacySql, /availability\.mode IN \('wave', 'stream'\)/);
+    assert.deepEqual(withLegacy.slots.map(({ mode }) => mode), ["legacy", "wave"]);
     assert.deepEqual(withLegacy.slots.map(({ date, mode, capacity, remaining_capacity }) => ({ date, mode, capacity, remaining_capacity })), [
       { date: "2099-08-09", mode: "legacy", capacity: 1, remaining_capacity: 1 },
       { date: "2099-08-10", mode: "wave", capacity: 4, remaining_capacity: 2 },
@@ -475,6 +514,24 @@ describe("assistant conversation and Gemini adapter errors", () => {
     assert.deepEqual(calls, [{ name: "get_patient_appointments", args: { view: "past", scope: "last_completed" } }]);
     assert.match(response.answer, /no matching most recently completed appointment/i);
     assert.equal(response.results[0].tool, "get_patient_appointments");
+  });
+
+  it("attaches one private navigation action to every appointment in the deterministic upcoming-list response", async () => {
+    const appointments = [
+      { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", appointment_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", date: "2027-01-10", start_time: "09:00", end_time: "09:30", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } },
+      { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", appointment_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", date: "2027-01-11", start_time: "10:00", end_time: "10:30", status: "confirmed", doctor: { id: doctorId, name: "Dr. Ada Morgan" } },
+    ];
+    const engine = createConversationEngine({
+      now: () => Date.parse("2026-11-15T00:00:00Z"),
+      provider: { generate: async () => { throw new Error("upcoming history should use the deterministic tool path"); } },
+      toolExecutor: async () => ({ appointments, has_more: false, next_offset: appointments.length }),
+    });
+    const response = await engine.respond({ actor: user, messages: [{ role: "user", content: "Show my upcoming appointments" }] });
+    const result = response.results[0];
+    assert.equal(result.tool, "get_patient_appointments");
+    assert.deepEqual(result.ui_actions, appointments.map(({ id }) => ({ type: "appointment", appointment_id: id })));
+    assert.equal(result.data.appointments.length, 2);
+    assert.doesNotMatch(JSON.stringify(result.data), /aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa|bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb|appointment_id|"id"/);
   });
 
   it("reports an appointment-history read failure instead of claiming an empty history", async () => {
@@ -1191,7 +1248,7 @@ describe("assistant conversation and Gemini adapter errors", () => {
     assert.deepEqual(response.results, []);
   });
 
-  it("gives Gemini record IDs for action proposals but strips IDs from persisted card results", async () => {
+  it("keeps patient navigation IDs in UI metadata and strips them from model and persisted card results", async () => {
     let providerCall = 0;
     let modelToolResult;
     const engine = createConversationEngine({
@@ -1204,11 +1261,13 @@ describe("assistant conversation and Gemini adapter errors", () => {
       toolExecutor: async () => ({ slots: [{ id: "33333333-3333-4333-8333-333333333333", availability_id: "33333333-3333-4333-8333-333333333333", doctor_id: "22222222-2222-4222-8222-222222222222", date: "2099-08-10", doctor: { id: "22222222-2222-4222-8222-222222222222", name: "Dr. Dee" } }] }),
     });
     const output = await engine.respond({ actor: user, messages: [{ role: "user", content: "Find an appointment" }] });
-    assert.equal(modelToolResult.slots[0].id, "33333333-3333-4333-8333-333333333333");
-    assert.equal(modelToolResult.slots[0].availability_id, "33333333-3333-4333-8333-333333333333");
-    assert.equal(modelToolResult.slots[0].doctor_id, "22222222-2222-4222-8222-222222222222");
+    assert.equal("id" in modelToolResult.slots[0], false);
+    assert.equal("availability_id" in modelToolResult.slots[0], false);
+    assert.equal("doctor_id" in modelToolResult.slots[0], false);
+    assert.equal("ui_actions" in modelToolResult, false);
+    assert.deepEqual(output.results[0].ui_actions, [{ type: "slot", availability_id: "33333333-3333-4333-8333-333333333333", doctor_id: "22222222-2222-4222-8222-222222222222" }]);
     assert.deepEqual(output.results[0].data.slots[0], { date: "2099-08-10", doctor: { name: "Dr. Dee" } });
-    assert.equal(JSON.stringify(output.results).includes("33333333-3333-4333-8333-333333333333"), false);
+    assert.equal(JSON.stringify(output.results[0].data).includes("33333333-3333-4333-8333-333333333333"), false);
     assert.equal(output.answer.includes("33333333-3333-4333-8333-333333333333"), false);
   });
 
@@ -1236,7 +1295,7 @@ describe("assistant conversation and Gemini adapter errors", () => {
         ] };
       },
     });
-    const output = await engine.respond({ actor: user, messages: [{ role: "user", content: "Show Dr. Ali's availability" }] });
+    const output = await engine.respond({ actor: user, messages: [{ role: "user", content: "Show Dr. Ali's calendar" }] });
     assert.equal(availabilityCalls, 0);
     assert.equal(searchCalls, 1);
     assert.deepEqual(output.results[0].data.doctors.map(({ name }) => name), ["Dr. Ali One", "Dr. Ali Two"]);
@@ -1459,7 +1518,7 @@ describe("assistant conversation and Gemini adapter errors", () => {
     assert.equal(followupContents[1].parts[1].thoughtSignature, "function-signature");
     assert.deepEqual(followupContents[2], {
       role: "user",
-      parts: [{ functionResponse: { name: "search_doctors", id: "function-call-1", response: toolOutput } }],
+      parts: [{ functionResponse: { name: "search_doctors", id: "function-call-1", response: { doctors: [{ name: "Dr. Dee Doctor", specialty: "Cardiology" }] } } }],
     });
   });
 
@@ -1486,13 +1545,13 @@ describe("assistant conversation and Gemini adapter errors", () => {
         return { proposal: { action_type: "book", action_args: args }, requires_patient_confirmation: true };
       },
     });
-    const result = await engine.respond({ actor: user, messages: [{ role: "user", content: `Find Dr. Ada Morgan's availability on ${date} at 14:30` }] });
+    const result = await engine.respond({ actor: user, messages: [{ role: "user", content: `Find Dr. Ada Morgan's appointment calendar on ${date} at 14:30` }] });
     assert.equal(result.answer, "Available times.");
     assert.equal(providerContents.length, 3);
     assert.strictEqual(providerContents[1][1], modelTurns[0]);
-    assert.deepEqual(providerContents[1][2].parts[0].functionResponse, { name: "search_doctors", id: "search-call", response: { doctors: [{ id: returnedDoctorId, name: "Dr. Ada Morgan" }] } });
+    assert.deepEqual(providerContents[1][2].parts[0].functionResponse, { name: "search_doctors", id: "search-call", response: { doctors: [{ name: "Dr. Ada Morgan" }] } });
     assert.strictEqual(providerContents[2][3], modelTurns[1]);
-    assert.equal(providerContents[2][4].parts[0].functionResponse.response.slots[0].availability_id, returnedSlotId);
+    assert.equal("availability_id" in providerContents[2][4].parts[0].functionResponse.response.slots[0], false);
     assert.equal(result.results.some(({ tool }) => tool === "get_available_slots"), true);
   });
 

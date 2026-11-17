@@ -4,6 +4,7 @@ const {
   completeAppointment,
   createAppointment,
   getAppointment,
+  getAppointmentPatientProfile,
   listAppointments,
   previewCancellationRefund,
   rescheduleAppointment,
@@ -24,6 +25,7 @@ router.use(requireClerkIdentity, requireLocalUser);
 router.get("/", validate(appointmentQuerySchema, "query"), listAppointments);
 router.post("/", validate(createAppointmentSchema, "body"), createAppointment);
 router.get("/:id", validate(appointmentIdParamsSchema, "params"), getAppointment);
+router.get("/:id/patient-profile", validate(appointmentIdParamsSchema, "params"), getAppointmentPatientProfile);
 router.get("/:id/assisted-reschedule-request", validate(appointmentIdParamsSchema, "params"), assistedRescheduleController.getPatientRequest);
 router.post("/assisted-reschedule-requests/:requestId/confirm", validate(assistedRescheduleRequestParamsSchema, "params"), validate(confirmAssistedRescheduleSchema, "body"), assistedRescheduleController.confirmPatientRequest);
 router.post("/assisted-reschedule-requests/:requestId/decline", validate(assistedRescheduleRequestParamsSchema, "params"), assistedRescheduleController.declinePatientRequest);
