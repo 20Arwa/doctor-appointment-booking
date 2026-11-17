@@ -38,6 +38,14 @@ function createFixture() {
         if (values[0] === "clerk_other") return { rows: [{ id: otherPatientId, first_name: "Other", last_name: "Patient", email: "other@example.test", phone: null, role: "patient", is_active: true }] };
         return { rows: [] };
       }
+      if (sql.includes("LEFT JOIN payments p ON p.appointment_id = a.id")) {
+        if (values[0] !== ownerId || values[1] !== appointmentId) return { rows: [] };
+        const appointment = { appointment_id: appointmentId, appointment_status: "cancelled", appointment_date: "2026-10-26", appointment_start_time: "10:00:00", doctor_id: doctorId, doctor_first_name: "Dara", doctor_last_name: "Doctor" };
+        return { rows: [
+          { ...appointment, payment_id: paymentId, payment_amount: "500.00", payment_currency: "INR ", payment_status: "partially_refunded", refund_id: "11111111-1111-4111-8111-111111111111", refund_amount: "250.00", refund_currency: "INR ", refund_status: "processed", refund_reason: "patient_cancellation", refund_created_at: "2026-10-25T08:05:00.000Z", refund_processed_at: "2026-10-25T08:06:00.000Z" },
+          { ...appointment, payment_id: paymentWithoutReceiptId, payment_amount: "500.00", payment_currency: "INR ", payment_status: "failed", refund_id: null },
+        ] };
+      }
       if (sql.includes("FROM payments p") && sql.includes("patient_owner.user_id = $1")) {
         if (values[0] !== ownerId) return { rows: [] };
         return { rows: values.length > 1 ? historyRows.slice(values[2], values[2] + values[1]) : historyRows };
@@ -71,7 +79,7 @@ function createFixture() {
     },
     emailNotificationService: { async sendAppointmentNotification() {} },
   });
-  return { app, databaseCalls, stripeCalls };
+  return { app, databaseCalls, stripeCalls, paymentService };
 }
 
 describe("patient payment history API", () => {
@@ -132,5 +140,22 @@ describe("patient payment history API", () => {
     assert.deepEqual(await response.json(), []);
     assert.deepEqual(fixture.stripeCalls, [intentId, "pi_test_no_receipt"]);
     assert.ok(fixture.databaseCalls.some(({ sql, values }) => sql.includes("patient_owner.user_id = $1") && values[0] === otherPatientId));
+  });
+
+  it("loads every payment attempt and refund by the verified appointment ID", async () => {
+    const history = await fixture.paymentService.getPaymentHistoryForAppointment({ id: ownerId, role: "patient" }, appointmentId);
+    assert.equal(history.appointment.id, appointmentId);
+    assert.equal(history.payments.length, 2);
+    assert.equal(history.payments[0].status, "partially_refunded");
+    assert.equal(history.payments[0].refunds[0].amount, "250.00");
+    assert.equal(history.payments[0].refunds[0].status, "processed");
+    assert.equal(history.payments[1].status, "failed");
+    const directLookup = fixture.databaseCalls.find(({ sql }) => sql.includes("LEFT JOIN payments p ON p.appointment_id = a.id"));
+    assert.match(directLookup.sql, /patient_owner\.user_id = \$1/);
+    assert.doesNotMatch(directLookup.sql, /\bLIMIT\b/i);
+    assert.deepEqual(directLookup.values, [ownerId, appointmentId]);
+
+    const otherPatientHistory = await fixture.paymentService.getPaymentHistoryForAppointment({ id: otherPatientId, role: "patient" }, appointmentId);
+    assert.equal(otherPatientHistory, null);
   });
 });

@@ -63,14 +63,43 @@ async function send(request, response) {
         requestId,
         attempt: Number(details.attempt || 0),
         stage,
+        conversationId: request.params.conversationId,
         elapsedMs: Date.now() - started,
+        ...(Number.isInteger(details.stateVersion) ? { stateVersion: details.stateVersion } : {}),
+        ...(typeof details.toolName === "string" ? { toolName: details.toolName } : {}),
+        ...(typeof details.executionStage === "string" ? { executionStage: details.executionStage } : {}),
         ...(typeof details.category === "string" ? { category: details.category } : {}),
         ...(Number.isFinite(details.providerStatus) ? { providerStatus: details.providerStatus } : {}),
+        ...(typeof details.finishReason === "string" ? { finishReason: details.finishReason } : {}),
+        ...(Array.isArray(details.outputPartTypes) ? { outputPartTypes: details.outputPartTypes } : {}),
+        ...(typeof details.hasFinalText === "boolean" ? { hasFinalText: details.hasFinalText } : {}),
+        ...(Number.isInteger(details.finalTextLength) ? { finalTextLength: details.finalTextLength } : {}),
+        ...(Number.isInteger(details.pendingToolCalls) ? { pendingToolCalls: details.pendingToolCalls } : {}),
+        ...(Number.isInteger(details.responseStatus) ? { responseStatus: details.responseStatus } : {}),
+        ...(typeof details.blockReason === "string" ? { blockReason: details.blockReason } : {}),
+        ...(typeof details.apiResponseValid === "boolean" ? { apiResponseValid: details.apiResponseValid } : {}),
+        ...(typeof details.assistantMessagePersisted === "boolean" ? { assistantMessagePersisted: details.assistantMessagePersisted } : {}),
+        ...(typeof details.assistantTextPresent === "boolean" ? { assistantTextPresent: details.assistantTextPresent } : {}),
+        ...(Number.isInteger(details.assistantTextLength) ? { assistantTextLength: details.assistantTextLength } : {}),
+        ...(Number.isInteger(details.assistantResultCount) ? { assistantResultCount: details.assistantResultCount } : {}),
+        ...(Array.isArray(details.assistantResultTools) ? { assistantResultTools: details.assistantResultTools } : {}),
       }));
     },
   };
   try {
     const result = await getService(response).send({ database: response.locals.database, user: response.locals.user, conversationId: response.locals.params.conversationId, requestId: response.locals.body.request_id, diagnosticRequestId: requestId, content: response.locals.body.content, applicationTimezone: response.locals.applicationTimezone, paymentService: response.locals.paymentService, logger });
+    const userMessage = result?.user_message;
+    const assistantMessage = result?.assistant_message;
+    logger.info("api_response_ready", {
+      apiResponseValid: userMessage?.role === "user" && typeof userMessage.id === "string" && typeof userMessage.content === "string"
+        && assistantMessage?.role === "assistant" && typeof assistantMessage.id === "string" && typeof assistantMessage.content === "string"
+        && (assistantMessage.results === undefined || Array.isArray(assistantMessage.results)) && typeof result?.replayed === "boolean",
+      assistantMessagePersisted: assistantMessage?.role === "assistant" && typeof assistantMessage.id === "string",
+      assistantTextPresent: typeof assistantMessage?.content === "string" && assistantMessage.content.length > 0,
+      ...(typeof assistantMessage?.content === "string" ? { assistantTextLength: assistantMessage.content.length } : {}),
+      assistantResultCount: Array.isArray(assistantMessage?.results) ? assistantMessage.results.length : 0,
+      assistantResultTools: Array.isArray(assistantMessage?.results) ? assistantMessage.results.map((item) => item?.tool).filter((tool) => typeof tool === "string").slice(0, 8) : [],
+    });
     return response.json(result);
   } catch (error) {
     const assistantError = error instanceof AssistantError || error instanceof AssistantConversationError;

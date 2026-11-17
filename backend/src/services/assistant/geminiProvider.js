@@ -76,17 +76,29 @@ function createGeminiProvider({ apiKey, model = "gemini-3.5-flash-lite", client 
         safe.name = error?.name;
         throw safe;
       }
-      const providerContent = response?.candidates?.[0]?.content;
+      const candidate = response?.candidates?.[0];
+      const providerContent = candidate?.content;
       const candidateParts = providerContent?.parts;
       if (!Array.isArray(candidateParts)) throw new Error("Gemini response did not contain a candidate");
+      const text = candidateParts.filter((part) => typeof part.text === "string").map((part) => part.text).join("\n");
+      const toolCalls = candidateParts.filter((part) => part.functionCall).map(({ functionCall }) => ({
+        name: functionCall.name,
+        arguments: functionCall.args,
+        id: functionCall.id,
+      }));
       return {
-        text: candidateParts.filter((part) => typeof part.text === "string").map((part) => part.text).join("\n"),
-        toolCalls: candidateParts.filter((part) => part.functionCall).map(({ functionCall }) => ({
-          name: functionCall.name,
-          arguments: functionCall.args,
-          id: functionCall.id,
-        })),
+        text,
+        toolCalls,
         providerContent,
+        providerMetadata: {
+          ...(typeof candidate?.finishReason === "string" ? { finishReason: candidate.finishReason } : {}),
+          outputPartTypes: candidateParts.map((part) => part.functionCall ? "function_call" : typeof part.text === "string" ? "text" : "other"),
+          hasFinalText: Boolean(text.trim()),
+          finalTextLength: text.length,
+          pendingToolCalls: toolCalls.length,
+          ...(Number.isInteger(response?.sdkHttpResponse?.status) ? { responseStatus: response.sdkHttpResponse.status } : {}),
+          ...(typeof response?.promptFeedback?.blockReason === "string" ? { blockReason: response.promptFeedback.blockReason } : {}),
+        },
       };
     },
   };

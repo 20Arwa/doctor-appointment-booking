@@ -64,7 +64,17 @@ async function request<T>(token: string, path: string, init: RequestInit, schema
     throw new AssistantApiError(response.status, (code && safeMessages[code]) || "The assistant couldn't respond. Please try again.", code);
   }
   const parsed = schema.safeParse(payload);
-  if (!parsed.success) throw new AssistantApiError(502, invalidResponseMessage || "The assistant returned an incomplete response. Please try again.", "ASSISTANT_RESPONSE_INVALID");
+  if (!parsed.success) {
+    if (path.includes("/messages")) {
+      const issues = parsed.error.issues.slice(0, 12).map((issue) => ({
+        path: issue.path.filter((part) => typeof part === "string" || typeof part === "number"),
+        code: issue.code,
+      }));
+      try { console.warn("assistant_api_response_rejected", JSON.stringify({ status: response.status, issueCount: parsed.error.issues.length, issues })); }
+      catch { /* Diagnostics must not replace the safe client error. */ }
+    }
+    throw new AssistantApiError(502, invalidResponseMessage || "The assistant returned an incomplete response. Please try again.", "ASSISTANT_RESPONSE_INVALID");
+  }
   return parsed.data;
 }
 
@@ -77,6 +87,7 @@ export const getAssistantConversation = (token: string, id: string, { limit = 20
 };
 export const deleteAssistantConversation = (token: string, id: string) => request(token, `/conversations/${encodeURIComponent(id)}`, { method: "DELETE" }, z.undefined());
 export const sendAssistantMessage = (token: string, conversationId: string, requestId: string, content: string) => request(token, `/conversations/${encodeURIComponent(conversationId)}/messages`, { method: "POST", body: JSON.stringify({ request_id: requestId, content }) }, sentSchema);
+
 export type AssistantActionType = z.infer<typeof actionTypeSchema>;
 export type AssistantActionIntent = z.infer<typeof actionIntentSchema>;
 export type AssistantActionPrepareResponse = AssistantActionIntent | z.infer<typeof dismissedProposalSchema>;

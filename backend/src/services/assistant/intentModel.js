@@ -3,10 +3,10 @@ const { dateReferences, resolveDateReference } = require("./temporalInterpretati
 
 const canonicalIntentSchema = z.object({
   category: z.enum(["doctor_search", "availability", "booking", "rescheduling", "cancellation", "payment_history", "refund_preview", "appointment_history", "unknown"]),
-  historyScope: z.enum(["next_upcoming", "all_upcoming", "past", "last", "last_completed", "cancelled"]).nullable(),
+  historyScope: z.enum(["next_upcoming", "furthest_upcoming", "all_upcoming", "past", "last", "last_completed", "cancelled"]).nullable(),
   historyQuery: z.object({
     view: z.enum(["upcoming", "past", "cancelled", "date"]),
-    scope: z.enum(["all", "nearest", "next_days", "last", "last_completed"]),
+    scope: z.enum(["all", "nearest", "furthest", "next_days", "last", "last_completed"]),
     from: z.string().optional(),
     to: z.string().optional(),
   }).nullable(),
@@ -27,6 +27,7 @@ function recognizeAppointmentHistory(text, timeZone = "Asia/Kolkata", nowValue =
   }
   if (/\b(?:cancelled|canceled)\b/.test(value)) return { view: "cancelled", scope: "all" };
   if (/\b(?:last|most recent)\b/.test(value) && /\bcompleted\b/.test(value)) return { view: "past", scope: "last_completed" };
+  if (/\b(?:latest|furthest|last)\s+(?:upcoming|future)\b|\b(?:upcoming|future)\s+(?:latest|furthest|last)\b/.test(value)) return { view: "upcoming", scope: "furthest" };
   if (/\blast week\b/.test(value)) {
     const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", weekday: "short" }).formatToParts(new Date(nowValue));
     const current = Object.fromEntries(parts.map(({ type, value: part }) => [type, part]));
@@ -73,7 +74,7 @@ function recognizeCanonicalIntent(text, timeZone = "Asia/Kolkata", nowValue = Da
         : cancellationRequest ? "cancellation"
           : reschedulingRequest ? "rescheduling"
             : bookingRequest ? "booking"
-              : historyQuery ? "appointment_history"
+                : historyQuery ? "appointment_history"
                 : /\b(?:available|availability|slots?)\b/i.test(value) ? "availability"
                   : /\bdoctor|physician\b|\bDr\.?\s+[\p{L}]/iu.test(value) ? "doctor_search" : "unknown";
   const reference = /^\s*\d{1,2}\s*$/.test(value) ? "numeric"
@@ -85,7 +86,7 @@ function recognizeCanonicalIntent(text, timeZone = "Asia/Kolkata", nowValue = Da
   const rangeIndex = value.search(/\b(?:to|until|for)\b|[-–—]/i);
   const model = {
     category,
-    historyScope: historyQuery ? (historyQuery.scope === "nearest" ? "next_upcoming" : historyQuery.scope === "all" && historyQuery.view === "upcoming" ? "all_upcoming" : historyQuery.scope === "all" ? (historyQuery.view === "cancelled" ? "cancelled" : "past") : historyQuery.scope) : null,
+    historyScope: historyQuery ? (historyQuery.scope === "nearest" ? "next_upcoming" : historyQuery.scope === "furthest" ? "furthest_upcoming" : historyQuery.scope === "all" && historyQuery.view === "upcoming" ? "all_upcoming" : historyQuery.scope === "all" ? (historyQuery.view === "cancelled" ? "cancelled" : "past") : historyQuery.scope) : null,
     historyQuery,
     reference,
     timePrecision: /\b(?:around|about|approximately|roughly|near)\b/i.test(value) ? "approximate" : times.length ? "exact" : "unspecified",

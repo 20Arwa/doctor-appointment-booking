@@ -17,10 +17,42 @@ function loadTs(relativePath) {
 }
 const { assistantActiveConversationStorageKey, assistantConversationTitle, assistantMessageDateKey, assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, classifyAssistantError, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, resolveAssistantConversationId, restoreDraftAfterFailedSubmission, shouldForceScrollAfterAssistantAction, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery, retryOperation } = loadTs("lib/assistant-chat-state.ts");
 const { dateNavigationTarget } = loadTs("lib/date-format.ts");
+const { AssistantMarkdown } = loadTs("components/assistant-markdown.tsx");
+const { assistantResultCardSpeech } = loadTs("lib/assistant-speech.ts");
 const { AssistantApiError, confirmAssistantAction, dismissAssistantProposal, getAssistantActionStatus, getAssistantConversation, listAssistantConversations, prepareAssistantAction, sendAssistantMessage } = loadTs("lib/assistant-api.ts");
 const { confirmationStatus, isProposalExpired, preserveDismissalOnPrepare, proposalDescription, proposalStatusFromBackend, proposalTitle, proposalTypeForResult, reconcileActionStatus } = loadTs("lib/assistant-action-state.ts");
 
 describe("patient assistant chat", () => {
+  it("omits an unavailable payment appointment time instead of rendering a dangling at", () => {
+    const spoken = assistantResultCardSpeech([{ tool: "get_patient_payment_history", data: { items: [
+      { status: "refunded", amount: "500.00", currency: "INR", appointment: { date: "2026-12-16", start_time: "" } },
+    ] } }]);
+    assert.match(spoken, /2026-12-16/);
+    assert.doesNotMatch(spoken, /\bat\b/);
+
+    const component = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(component, /paymentAppointmentTime \? ` at \$\{paymentAppointmentTime\}` : ""/);
+  });
+  it("renders escaped provider statistics as safe bold labels and list items", () => {
+    const content = "Weekly appointments:\n\\- \\*\\*Confirmed:\\*\\* 5\n\\- \\*\\*Completed:\\*\\* 2";
+    const markup = renderToStaticMarkup(createElement(AssistantMarkdown, { content }));
+    assert.match(markup, /<ul[^>]*>/);
+    assert.match(markup, /<strong>Confirmed:<\/strong> 5/);
+    assert.match(markup, /<strong>Completed:<\/strong> 2/);
+    assert.doesNotMatch(markup, /\\\\[\-*]/);
+    const unsafe = renderToStaticMarkup(createElement(AssistantMarkdown, { content: "<script>alert(1)</script>" }));
+    assert.match(unsafe, /&lt;script&gt;/);
+    assert.doesNotMatch(unsafe, /<script>/);
+  });
+  it("renders active assisted-rescheduling appointments separately from open availability", () => {
+    const component = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(component, /pending_assisted_reschedules/);
+    assert.match(component, /Appointments awaiting assisted rescheduling/);
+    assert.match(component, /Awaiting patient response/);
+    assert.match(component, /current alternative/);
+    assert.match(component, /Private one-off availability/);
+    assert.match(component, /pendingAssistedReschedules.length/);
+  });
   it("resolves deep-link month boundaries across years and rejects invalid dates", () => {
     assert.deepEqual(dateNavigationTarget("2027-01-04", "2026-11-15"), { date: "2027-01-04", month: "2027-01-01" });
     assert.deepEqual(dateNavigationTarget("2028-02-29", "2026-11-15"), { date: "2028-02-29", month: "2028-02-01" });
@@ -807,7 +839,6 @@ describe("patient assistant chat", () => {
     assert.match(history, /onSelectConversation\(item\.id\)/);
   });
 
-
   it("uses collision-aware portaled voice menus and compact listening controls", () => {
     const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
     assert.match(chat, /import \{ Popover, PopoverContent, PopoverTrigger \}/);
@@ -826,11 +857,11 @@ describe("patient assistant chat", () => {
     assert.match(chat, /ResultCards result=\{result\} doctorMode=\{doctorMode\} compact=\{compact\}/);
   });
 
-  it("adds voice controls beside the existing composer", () => {
+  it("pins Send to the right of the microphone in a stable composer grid", () => {
     const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
-    const composer = chat.slice(chat.indexOf('<form onSubmit={submit}'), chat.indexOf("</form>"));
-    assert.match(composer, /aria-label=\{!voice\.sessionActive[\s\S]*voice\.status === "listening" \? <MicOff[\s\S]*aria-label="Send message"/);
-    assert.match(composer, /aria-label="Stop speaking"/);
+    const composer = chat.slice(chat.indexOf('<div className="mx-auto grid w-full grid-cols-[minmax(0,1fr)_auto_auto]'), chat.indexOf("</form>", chat.indexOf('<div className="mx-auto grid w-full grid-cols-[minmax(0,1fr)_auto_auto]')));
+    assert.match(composer, /<textarea[\s\S]*?<span className="flex shrink-0 items-center gap-1">[\s\S]*aria-label=\{!voice\.sessionActive[\s\S]*<Button type="submit"[^>]+aria-label="Send message"/);
+    assert.match(composer, /min-w-0 resize-y/);
   });
 
   it("keeps one accessible floating panel dismissal control", () => {
@@ -891,5 +922,53 @@ describe("patient assistant chat", () => {
     assert.match(voiceHook, /retries < 20/);
     assert.match(voiceHook, /voiceSelectionEvent/);
     assert.match(voiceHook, /window\.localStorage\.setItem\(voiceStorageKey, name\)/);
+  });
+
+  it("animates the floating panel without changing its dimensions or motion preferences", () => {
+    const launcher = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-launcher.tsx"), "utf8");
+    assert.match(launcher, /motion-safe:animate-in motion-safe:fade-in motion-safe:zoom-in-95 motion-safe:slide-in-from-bottom-2/);
+    assert.match(launcher, /motion-safe:animate-out motion-safe:fade-out motion-safe:zoom-out-95 motion-safe:slide-out-to-bottom-2/);
+    assert.match(launcher, /motion-reduce:animate-none/);
+    assert.match(launcher, /sm:bottom-16/);
+    assert.match(launcher, /sm:h-\[min\(42rem,calc\(100dvh-8rem\)\)\]/);
+    assert.match(launcher, /sm:w-\[min\(31rem,calc\(100vw-3rem\)\)\]/);
+    assert.match(launcher, /bg-card shadow-2xl ring-1 ring-border\/50/);
+  });
+
+  it("places an accessible red retry icon outside the failed bubble and bounds the composer", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(chat, /UserRound/);
+    assert.doesNotMatch(chat, /message\.role === "user" \? "You"/);
+    assert.match(chat, /mx-auto grid w-full grid-cols-\[minmax\(0,1fr\)_auto_auto\] items-end/);
+    assert.match(chat, /import \{[^}]*RefreshCw[^}]*\} from "lucide-react"/);
+    assert.match(chat, /aria-label="Retry this message"/);
+    assert.match(chat, /role="tooltip"[^>]*>Retry this message<\/span>/);
+    assert.match(chat, /group-hover:opacity-100 group-focus-within:opacity-100/);
+    assert.match(chat, /text-destructive hover:bg-destructive\/10/);
+    assert.match(chat, /aria-label="Retry this message"[^\n]*onClick=\{\(\) => void deliver\(message\.requestId!, message\.content\)\}/);
+    assert.match(chat, /if \(requestInFlight\.current\) return/);
+    assert.match(chat, /<\/div>\s*<\/div>\s*<time[\s\S]*?<\/time>\s*\{message\.failed && message\.requestId \? <div className="mt-1/);
+    assert.match(chat, /Your care, easier to navigate/);
+  });
+
+  it("keeps the composer visible and the message list independently scrollable", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(chat, /className=\{`absolute inset-0 space-y-4 overscroll-contain p-4 sm:p-5 \$\{state\.messages\.length \? "overflow-y-auto" : "flex flex-col justify-center overflow-hidden"\}`\}/);
+    assert.match(chat, /sticky bottom-0 z-10 shrink-0 border-t/);
+    assert.match(chat, /relative mb-4 flex min-h-0 min-w-0 flex-1/);
+    assert.match(chat, /grid min-h-0 min-w-0 flex-1 gap-4/);
+    assert.match(chat, /history\.hasMore && nearTop/);
+    assert.match(chat, /border-b border-border pb-2/);
+    assert.match(chat, /ArrowUp/);
+    assert.match(chat, /Load older messages/);
+    assert.match(chat, /Scroll to latest messages/);
+    assert.match(chat, /absolute bottom-4 right-4/);
+    assert.match(chat, /element\.scrollTo\(\{ top: element\.scrollHeight, behavior:/);
+    assert.match(chat, /prefers-reduced-motion: reduce/);
+    assert.match(chat, /prependAnchor\.current = \{ scrollHeight: container\.scrollHeight, scrollTop: container\.scrollTop \}/);
+    assert.match(chat, /if \(prependAnchor\.current\) \{[\s\S]*?prependAnchor\.current = null;\s*return;/);
+    assert.match(chat, /shouldForceScrollAfterAssistantAction\(scrollAfterAssistantAction\.current, state\.messages\.at\(-1\)\?\.role, false\)/);
+    assert.match(chat, /scrollAfterAssistantAction\.current = true/);
+    assert.match(chat, /isNearMessageListBottom\(element\.scrollHeight, element\.clientHeight, element\.scrollTop\)/);
   });
 });

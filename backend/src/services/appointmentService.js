@@ -299,7 +299,9 @@ async function listAppointments(database, user, filters, timeZone = "Asia/Kolkat
     values.push(filters.to);
     where.push(`a.scheduled_date <= $${values.length}::date`);
   }
-  const order = filters.view === "past" || filters.view === "cancelled"
+  const order = filters.order === "furthest"
+    ? "a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC"
+    : filters.view === "past" || filters.view === "cancelled"
     ? "a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC"
     : "a.scheduled_date, a.scheduled_start_time, a.id";
   let pagination = "";
