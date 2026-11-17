@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const configPath = require.resolve("../src/config/env");
-const controlledKeys = ["NODE_ENV", "CLERK_SECRET_KEY", "DATABASE_URL", "FRONTEND_ORIGIN", "STRIPE_SECRET_KEY"];
+const controlledKeys = ["NODE_ENV", "CLERK_SECRET_KEY", "DATABASE_URL", "FRONTEND_ORIGIN", "STRIPE_SECRET_KEY", "GEMINI_MODEL"];
 
 function loadConfig(overrides) {
   const original = Object.fromEntries(controlledKeys.map((key) => [key, process.env[key]]));
@@ -33,6 +33,12 @@ test("uses the localhost frontend origin default outside production", () => {
   const { config, error } = loadConfig({ NODE_ENV: "development" });
   assert.equal(error, undefined);
   assert.equal(config.FRONTEND_ORIGIN, "http://localhost:3000");
+});
+
+test("defaults to the approved Gemini chat model", () => {
+  const { config, error } = loadConfig({ NODE_ENV: "development" });
+  assert.equal(error, undefined);
+  assert.equal(config.GEMINI_MODEL, "gemini-3.5-flash-lite");
 });
 
 test("requires an explicit HTTPS frontend origin in production", () => {
