@@ -18,6 +18,17 @@ describe("assisted rescheduling patient navigation", () => {
     assert.match(source, /getPatientAssistedRequest\(token, assistedTargetAppointmentId\)/);
   });
 
+  it("keeps the in-app missed-email fallback scoped to a real pending request with saved suggestions", () => {
+    const source = fs.readFileSync(path.join(root, "components/patient-appointments-page.tsx"), "utf8");
+    const gate = source.match(/const hasActiveAssistedRequest = Boolean\([\s\S]*?\);/);
+    assert.ok(gate, "the Suggested appointment change section must have a narrow request gate");
+    assert.match(gate[0], /assistedRequest\.appointment_id === activeAssistedRequestTargetId/);
+    assert.match(gate[0], /assistedRequest\.status === "pending_patient"/);
+    assert.match(gate[0], /assistedRequest\.suggestions\.length > 0/);
+    assert.match(source, /\{activeAssistedRequest \? <section ref=\{assistedSectionRef\}/);
+    assert.match(source, /\{activeAssistedRequest\.suggestions\.map/);
+  });
+
   it("loads requests from the retained appointment target independently of URL cleanup", () => {
     const source = fs.readFileSync(path.join(root, "components/patient-appointments-page.tsx"), "utf8");
     const requestEffect = source.match(/useEffect\(\(\) => \{\s*if \(!assistedTargetAppointmentId\) return;[\s\S]*?\}, \[assistedTargetAppointmentId,[^\]]*assistedReload\]\);/);

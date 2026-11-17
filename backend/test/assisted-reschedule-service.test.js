@@ -205,6 +205,28 @@ test("request read endpoints enforce the patient and doctor ownership boundaries
   assert.equal((await getPatientRequest(database, { role: "doctor", id: "doctor-user" }, "appointment-1")).forbidden, true);
 });
 
+test("doctor request status filters are applied in SQL while an unfiltered list stays general", async () => {
+  const requestQueries = [];
+  const database = { async query(sql, values) {
+    if (sql.includes("SELECT id FROM doctors WHERE user_id")) return { rows: [{ id: "doctor-1" }] };
+    if (sql.startsWith("UPDATE assisted_reschedule_requests")) return { rows: [], rowCount: 0 };
+    if (sql.includes("FROM assisted_reschedule_requests request") && sql.includes("JOIN users patient_user")) {
+      requestQueries.push({ sql, values });
+      return { rows: [] };
+    }
+    throw new Error(`Unexpected query: ${sql}`);
+  } };
+  const doctorUser = { role: "doctor", id: "doctor-user" };
+
+  await listDoctorRequests(database, doctorUser, "doctor-1", { status: "pending_patient", limit: 100, offset: 0 });
+  await listDoctorRequests(database, doctorUser, "doctor-1", { limit: 100, offset: 0 });
+
+  assert.match(requestQueries[0].sql, /request\.status = \$2/);
+  assert.deepEqual(requestQueries[0].values, ["doctor-1", "pending_patient", 101, 0]);
+  assert.doesNotMatch(requestQueries[1].sql, /request\.status = \$\d/);
+  assert.deepEqual(requestQueries[1].values, ["doctor-1", 101, 0]);
+});
+
 test("an error while persisting requests rolls back the caller's schedule transaction", async () => {
   const statements = [];
   const database = { async query(sql, values) {

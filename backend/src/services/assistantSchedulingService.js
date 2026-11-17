@@ -1,7 +1,7 @@
 const { findSchedulePeriodOverlaps } = require("./schedulePeriodConflictService");
-const { countOccupiedPlaces } = require("./appointmentService");
+const { countOccupiedPlaces, countOccupiedPlacesForSlots } = require("./appointmentService");
 
-const POINT_IN_TIME_NOTICE = "Availability and suggestions are point-in-time and do not guarantee booking.";
+const POINT_IN_TIME_NOTICE = "Availability can change; booking is not guaranteed.";
 
 async function requireDoctorId(database, actor) {
   if (actor?.role !== "doctor" || !actor.id) throw Object.assign(new Error("Tool is unavailable"), { code: "TOOL_UNAVAILABLE" });
@@ -111,9 +111,8 @@ async function getConflicts(database, doctorId, from, to, limit = 50) {
     const row = detail.rows[0] || {};
     const reasons = [];
     if (scheduleOverlaps.length) reasons.push("schedule_overlap");
-    if (row.has_confirmed_appointment) reasons.push("confirmed_appointment");
-    if (row.has_active_reservation) reasons.push("active_reservation");
-    if (row.has_active_payment_hold) reasons.push("payment_hold");
+    // Occupancy is reported as capacity context below. It is not itself a
+    // scheduling conflict while the slot still has room for another patient.
     if (occupancy >= Number(slot.capacity || 1)) reasons.push("capacity_reached");
     if (reasons.length) items.push({ date: slot.date, start_time: slot.start_time, end_time: slot.end_time,
       mode: slot.mode || "legacy", capacity: Number(slot.capacity || 1), occupied: occupancy,
@@ -123,4 +122,51 @@ async function getConflicts(database, doctorId, from, to, limit = 50) {
   return { conflicts: items.slice(0, limit), truncated: items.length > limit || slots.rows.length > 500, notice: POINT_IN_TIME_NOTICE };
 }
 
-module.exports = { POINT_IN_TIME_NOTICE, getConflicts, getExceptions, getSchedules, requireDoctorId };
+async function getPendingAssistedReschedules(database, doctorId, from, to) {
+  const result = await database.query(
+    `SELECT request.id AS request_id, appointment.scheduled_date::text AS date,
+            appointment.scheduled_start_time::text AS start_time,
+            appointment.scheduled_end_time::text AS end_time, request.mode,
+            suggestion.availability_id, target.capacity
+     FROM assisted_reschedule_requests request
+     JOIN appointments appointment ON appointment.id = request.appointment_id
+     JOIN assisted_reschedule_suggestions suggestion ON suggestion.request_id = request.id
+     JOIN availability target ON target.id = suggestion.availability_id
+     WHERE request.doctor_id = $1 AND request.status = 'pending_patient' AND request.expires_at > NOW()
+       AND appointment.status = 'confirmed' AND appointment.updated_at = request.appointment_updated_at
+       AND appointment.scheduled_date BETWEEN $2::date AND $3::date
+       AND target.deleted_at IS NULL AND target.booking_visibility = 'public'
+       AND target.mode = suggestion.mode AND target.date = suggestion.service_date
+       AND target.start_time = suggestion.start_time AND target.end_time = suggestion.end_time
+       AND NOT EXISTS (SELECT 1 FROM appointments own WHERE own.availability_id = target.id
+         AND own.patient_id = request.patient_id AND own.status = 'confirmed')
+       AND NOT EXISTS (SELECT 1 FROM appointment_allocations own WHERE own.availability_id = target.id
+         AND own.patient_id = request.patient_id AND (own.status = 'confirmed'
+           OR (own.status = 'held' AND own.expires_at > NOW())))
+       AND NOT EXISTS (SELECT 1 FROM appointment_slot_holds own WHERE own.availability_id = target.id
+         AND own.patient_id = request.patient_id AND own.status = 'active' AND own.expires_at > NOW())
+     ORDER BY appointment.scheduled_date, appointment.scheduled_start_time, request.id, suggestion.rank`,
+    [doctorId, from, to],
+  );
+  const slots = [...new Set(result.rows.map(({ availability_id }) => availability_id))];
+  if (!slots.length) return [];
+  const occupied = await countOccupiedPlacesForSlots(database, slots);
+  const requests = new Map();
+  for (const row of result.rows) {
+    const remaining = Number(row.capacity) - (occupied.get(row.availability_id) || 0);
+    if (remaining <= 0) continue;
+    const item = requests.get(row.request_id) || {
+      date: row.date,
+      start_time: row.start_time,
+      end_time: row.end_time,
+      mode: row.mode || "legacy",
+      status: "pending_patient",
+      valid_suggestion_count: 0,
+    };
+    item.valid_suggestion_count += 1;
+    requests.set(row.request_id, item);
+  }
+  return [...requests.values()];
+}
+
+module.exports = { POINT_IN_TIME_NOTICE, getConflicts, getExceptions, getPendingAssistedReschedules, getSchedules, requireDoctorId };

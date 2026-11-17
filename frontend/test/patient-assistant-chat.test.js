@@ -5,6 +5,8 @@ import path from "node:path";
 import ts from "typescript";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 function loadTs(relativePath) {
@@ -13,7 +15,7 @@ function loadTs(relativePath) {
   loadedModule._compile(ts.transpileModule(fs.readFileSync(filename, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, baseUrl: projectRoot, paths: { "@/*": ["./*"] } } }).outputText, filename);
   return loadedModule.exports;
 }
-const { assistantMessageDateKey, assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, classifyAssistantError, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, shouldForceScrollAfterAssistantAction, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery, retryOperation } = loadTs("lib/assistant-chat-state.ts");
+const { assistantActiveConversationStorageKey, assistantConversationTitle, assistantMessageDateKey, assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, classifyAssistantError, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, resolveAssistantConversationId, restoreDraftAfterFailedSubmission, shouldForceScrollAfterAssistantAction, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery, retryOperation } = loadTs("lib/assistant-chat-state.ts");
 const { dateNavigationTarget } = loadTs("lib/date-format.ts");
 const { AssistantApiError, confirmAssistantAction, dismissAssistantProposal, getAssistantActionStatus, getAssistantConversation, listAssistantConversations, prepareAssistantAction, sendAssistantMessage } = loadTs("lib/assistant-api.ts");
 const { confirmationStatus, isProposalExpired, preserveDismissalOnPrepare, proposalDescription, proposalStatusFromBackend, proposalTitle, proposalTypeForResult, reconcileActionStatus } = loadTs("lib/assistant-action-state.ts");
@@ -274,7 +276,7 @@ describe("patient assistant chat", () => {
 
   it("clears the composer immediately after appending and restores a failed submission draft", () => {
     const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
-    const submitStart = chat.indexOf("function submit(event:");
+    const submitStart = chat.indexOf("function submitContent(value:");
     const appendUser = chat.indexOf('dispatch({ type: "submit", message:', submitStart);
     const clearDraft = chat.indexOf('setDraft((current) => current.trim() === content ? "" : current)', submitStart);
     const deliverRequest = chat.indexOf("void deliver(requestId, content)", submitStart);
@@ -405,8 +407,8 @@ describe("patient assistant chat", () => {
     assert.match(chat, /audience === "doctor" \? "\/doctor\/assistant" : "\/patient\/assistant"/);
     assert.match(chat, /!doctorMode && message\.role === "assistant"[\s\S]*proposalTypeForResult/);
     assert.match(launcher, /PatientAssistantChat compact/);
-    assert.match(launcher, /pathname === "\/patient\/assistant" \|\| pathname\.startsWith\("\/patient\/assistant\/"\)/);
-    assert.match(shell, /requiredRole === "patient" \? <PatientAssistantLauncher/);
+    assert.match(launcher, /const assistantPath = audience === "doctor" \? "\/doctor\/assistant" : "\/patient\/assistant"/);
+    assert.match(shell, /<PatientAssistantLauncher audience=\{requiredRole\} \/>/);
   });
 
   it("keeps patient navigation identifiers in UI metadata and opens deep links in their requested month", () => {
@@ -597,6 +599,51 @@ describe("patient assistant chat", () => {
     } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
   });
 
+  it("accepts the persisted API shape for a doctor search reply after a tool call", async () => {
+    const originalFetch = globalThis.fetch; const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      user_message: { id: "user-row", role: "user", content: "Find Dr. James Wilson.", request_id: "retry-key", request_status: "complete", created_at: "2026-11-17T09:00:00.000Z" },
+      assistant_message: { id: "assistant-row", role: "assistant", content: "I found Dr. James Wilson.", created_at: "2026-11-17T09:00:01.000Z", results: [{
+        tool: "search_doctors", data: { doctors: [{ name: "Dr. James Wilson", specialty: "Cardiology" }] }, ui_actions: [{ type: "doctor", doctor_id: "77777777-7777-4777-8777-777777777777" }],
+      }] },
+      replayed: false,
+    }), { status: 200, headers: { "content-type": "application/json" } });
+    try {
+      const result = await sendAssistantMessage("session", "conversation", "retry-key", "Find Dr. James Wilson.");
+      assert.equal(result.assistant_message.content, "I found Dr. James Wilson.");
+      assert.equal(result.assistant_message.results[0].tool, "search_doctors");
+      assert.equal(result.assistant_message.results[0].ui_actions[0].type, "doctor");
+    } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
+  });
+
+  it("accepts and renders authorized Doctor Assistant assisted-rescheduling request details", async () => {
+    const originalFetch = globalThis.fetch; const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
+    process.env.NEXT_PUBLIC_API_URL = "https://api.example.test";
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      user_message: { id: "user-row", role: "user", content: "Show assisted rescheduling requests", request_id: "request-key", request_status: "complete" },
+      assistant_message: { id: "assistant-row", role: "assistant", content: "Here are the requests.", results: [{
+        tool: "get_doctor_assisted_reschedule_requests", data: { items: [{
+          patient_name: "Asha Rao", status: "pending_patient", patient_response: "Awaiting patient response",
+          appointment: { date: "2027-01-14", start_time: "10:00:00", end_time: "10:30:00", status: "confirmed", reason: "Follow-up" },
+          alternatives: [{ date: "2027-01-15", start_time: "11:00:00", end_time: "11:30:00", mode: "wave", rank: 1 }],
+        }] },
+      }] },
+      replayed: false,
+    }), { status: 200, headers: { "content-type": "application/json" } });
+    try {
+      const result = await sendAssistantMessage("session", "conversation", "request-key", "Show assisted rescheduling requests");
+      assert.equal(result.assistant_message.results[0].tool, "get_doctor_assisted_reschedule_requests");
+      const component = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+      assert.match(component, /Assisted rescheduling requests/);
+      assert.match(component, /Patient response:/);
+      const requestCard = component.slice(component.indexOf('result.tool === "get_doctor_assisted_reschedule_requests" && assistedAppointment'), component.indexOf('typeof item.remaining_capacity', component.indexOf('result.tool === "get_doctor_assisted_reschedule_requests" && assistedAppointment')));
+      assert.match(requestCard, /Request status:/);
+      assert.match(requestCard, /Current appointment:[\s\S]*currentAppointment\.end_time/);
+      assert.doesNotMatch(requestCard, /Reason:|item\.alternatives/);
+    } finally { globalThis.fetch = originalFetch; if (originalApiUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL; else process.env.NEXT_PUBLIC_API_URL = originalApiUrl; }
+  });
+
   it("parses the multi-appointment history response with a distinct UI action for each appointment", async () => {
     const originalFetch = globalThis.fetch; const originalApiUrl = process.env.NEXT_PUBLIC_API_URL;
     const firstId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -663,9 +710,9 @@ describe("patient assistant chat", () => {
     const assignAfterCreate = chat.indexOf("conversationId.current = id;", createConversation);
     assert.ok(retainedReference >= 0 && retainedReference < historyLookup);
     assert.ok(createConversation >= 0 && assignAfterCreate > createConversation);
-    assert.match(chat, /finally \{ setReady\(true\)/);
+    assert.match(chat, /if \(isCurrentSession\(ownerUserId, generation\)\) \{\s*setReady\(true\)/);
     assert.match(chat, /retryOperation\(state\.errorSource\)/);
-    const submitHandler = chat.slice(chat.indexOf("function submit("), chat.indexOf("const retry ="));
+    const submitHandler = chat.slice(chat.indexOf("function submitContent(value:"), chat.indexOf("const retry ="));
     assert.ok(submitHandler.indexOf('dispatch({ type: "submit"') < submitHandler.indexOf('setDraft((current) => current.trim() === content ? "" : current)'));
     assert.ok(submitHandler.indexOf('setDraft((current) => current.trim() === content ? "" : current)') < submitHandler.indexOf("void deliver(requestId, content)"));
     assert.match(chat, /restoreDraftAfterFailedSubmission\(current, content\)/);
@@ -693,43 +740,71 @@ describe("patient assistant chat", () => {
     const shell = fs.readFileSync(path.join(projectRoot, "components/role-application-shell.tsx"), "utf8");
     assert.match(chat, /export function PatientAssistantChat/);
     assert.match(launcher, /<PatientAssistantChat compact/);
-    assert.match(shell, /requiredRole === "patient" \? <PatientAssistantLauncher/);
+    assert.match(shell, /<PatientAssistantLauncher audience=\{requiredRole\} \/>/);
   });
 
-  it("places an accessible red retry icon outside the failed bubble and bounds the composer", () => {
+  it("shares the authenticated active conversation between full and floating chat by role", () => {
     const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
-    assert.match(chat, /UserRound/);
-    assert.doesNotMatch(chat, /message\.role === "user" \? "You"/);
-    assert.match(chat, /mx-auto flex w-full items-end/);
-    assert.match(chat, /import \{[^}]*RefreshCw[^}]*\} from "lucide-react"/);
-    assert.match(chat, /aria-label="Retry this message"/);
-    assert.match(chat, /role="tooltip"[^>]*>Retry this message<\/span>/);
-    assert.match(chat, /group-hover:opacity-100 group-focus-within:opacity-100/);
-    assert.match(chat, /text-destructive hover:bg-destructive\/10/);
-    assert.match(chat, /aria-label="Retry this message"[^\n]*onClick=\{\(\) => void deliver\(message\.requestId!, message\.content\)\}/);
-    assert.match(chat, /if \(requestInFlight\.current\) return/);
-    assert.match(chat, /<\/div>\s*<\/div>\s*<time[\s\S]*?<\/time>\s*\{message\.failed && message\.requestId \? <div className="mt-1/);
-    assert.match(chat, /Your care, easier to navigate/);
+    const history = fs.readFileSync(path.join(projectRoot, "components/assistant-conversation-history.tsx"), "utf8");
+    assert.match(chat, /assistantActiveConversationStorageKey\(audience, userId\)/);
+    assert.match(chat, /resolveAssistantConversationId\(requested, remembered, savedConversations\.items\)/);
+    assert.match(chat, /rememberActiveConversation\(audience, ownerUserId, stored\.conversation\.id\)/);
+    assert.match(chat, /window\.addEventListener\("storage", onStorage\)/);
+    assert.match(chat, /conversationId\.current \? `\?conversation=\$\{encodeURIComponent\(conversationId\.current\)\}`/);
+    assert.match(chat, /const historyPanel = <AssistantConversationHistory audience=\{audience\} activeConversationId=\{conversationId\.current\} refreshKey=\{historyRevision\} compact=\{compact\} onClose=/);
+    assert.match(history, /onSelectConversation\(item\.id\)/);
+    assert.match(history, /listAssistantConversations\(token\)/);
+    assert.match(history, /assistantConversationTitle\(item\.preview\)/);
   });
 
-  it("keeps the composer visible and the message list independently scrollable", () => {
+  it("keeps active conversations role-scoped and prefers an explicit deep link over saved state", () => {
+    assert.equal(assistantActiveConversationStorageKey("patient", "user-a"), "medrella-assistant-active-conversation-patient-user-a");
+    assert.equal(assistantActiveConversationStorageKey("doctor", "user-a"), "medrella-assistant-active-conversation-doctor-user-a");
+    assert.notEqual(assistantActiveConversationStorageKey("patient", "user-a"), assistantActiveConversationStorageKey("patient", "user-b"));
+    const conversations = [{ id: "latest" }, { id: "older" }];
+    assert.equal(resolveAssistantConversationId("linked", "remembered", conversations), "linked");
+    assert.equal(resolveAssistantConversationId(null, "remembered", conversations), "remembered");
+    assert.equal(resolveAssistantConversationId(null, null, conversations), "latest");
+    assert.equal(resolveAssistantConversationId(null, null, []), null);
+    assert.equal(assistantConversationTitle("  Book with Dr. Wilson  "), "Book with Dr. Wilson");
+    assert.equal(assistantConversationTitle(" "), "New conversation");
+    assert.equal(assistantConversationTitle("x".repeat(90)).length, 70);
+  });
+
+  it("resets active chat on Clerk account changes and ignores stale account requests", () => {
     const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
-    assert.match(chat, /className="absolute inset-0 space-y-4 overflow-y-auto/);
-    assert.match(chat, /sticky bottom-0 z-10 shrink-0 border-t/);
-    assert.match(chat, /h-\[calc\(100dvh-4rem\)\] min-h-0/);
-    assert.match(chat, /history\.hasMore && nearTop/);
-    assert.match(chat, /border-b border-border pb-2/);
-    assert.match(chat, /ArrowUp/);
-    assert.match(chat, /Load older messages/);
-    assert.match(chat, /Scroll to latest messages/);
-    assert.match(chat, /absolute bottom-4 right-4/);
-    assert.match(chat, /element\.scrollTo\(\{ top: element\.scrollHeight, behavior:/);
-    assert.match(chat, /prefers-reduced-motion: reduce/);
-    assert.match(chat, /prependAnchor\.current = \{ scrollHeight: container\.scrollHeight, scrollTop: container\.scrollTop \}/);
-    assert.match(chat, /if \(prependAnchor\.current\) \{[\s\S]*?prependAnchor\.current = null;\s*return;/);
-    assert.match(chat, /shouldForceScrollAfterAssistantAction\(scrollAfterAssistantAction\.current, state\.messages\.at\(-1\)\?\.role, false\)/);
-    assert.match(chat, /scrollAfterAssistantAction\.current = true/);
-    assert.match(chat, /isNearMessageListBottom\(element\.scrollHeight, element\.clientHeight, element\.scrollTop\)/);
+    const history = fs.readFileSync(path.join(projectRoot, "components/assistant-conversation-history.tsx"), "utf8");
+    assert.match(chat, /const \{ getToken, isLoaded, userId \} = useAuth\(\)/);
+    assert.match(chat, /loadedUserIdRef\.current === nextUserId && !authReloadNeeded\.current/);
+    assert.match(chat, /dispatch\(\{ type: "clear" \}\)/);
+    assert.match(chat, /const assistantReady = ready && isLoaded && Boolean\(userId\) && loadedUserIdRef\.current === userId/);
+    assert.match(chat, /if \(!isCurrentSession\(ownerUserId, generation\)\) return;/);
+    assert.match(history, /const \{ getToken, isLoaded, userId \} = useAuth\(\)/);
+    assert.match(history, /itemsOwnerUserId === userId/);
+    assert.match(history, /requestGeneration\.current !== generation/);
+  });
+
+  it("exposes the same role-aware floating assistant to doctor and patient workspaces", () => {
+    const shell = fs.readFileSync(path.join(projectRoot, "components/role-application-shell.tsx"), "utf8");
+    const launcher = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-launcher.tsx"), "utf8");
+    assert.match(shell, /PatientAssistantLauncher audience=\{requiredRole\}/);
+    assert.match(launcher, /<PatientAssistantChat compact audience=\{audience\}/);
+    assert.match(launcher, /h-dvh w-full/);
+    assert.match(launcher, /sm:w-\[min\(31rem/);
+  });
+
+  it("uses one collapsible history panel across the full and floating chat layouts", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    const historyPanelCount = (chat.match(/const historyPanel = <AssistantConversationHistory/g) || []).length;
+    assert.equal(historyPanelCount, 1);
+    assert.doesNotMatch(chat, /historyPopover|<AssistantConversationHistory[^\n]+compact onSelectConversation/);
+    assert.match(chat, /aria-label="Chat history"[^>]+aria-expanded=\{historyOpen\}[^>]+onClick=\{\(\) => \{ setHistoryOpen/);
+    assert.match(chat, /historyOpen \? "lg:grid-cols-\[minmax\(0,1fr\)_17rem\]/);
+    assert.match(chat, /fixed inset-0 z-40 flex bg-background\/70[^\n]+lg:static/);
+    assert.match(chat, /setHistoryOpen\(!compact\)/);
+    const history = fs.readFileSync(path.join(projectRoot, "components/assistant-conversation-history.tsx"), "utf8");
+    assert.match(history, /aria-label="Close chat history"/);
+    assert.match(history, /onSelectConversation\(item\.id\)/);
   });
 
 
@@ -747,6 +822,8 @@ describe("patient assistant chat", () => {
     assert.doesNotMatch(chat, /Finish current voice message|>Enable voice<|>Resume voice</);
     assert.match(chat, /if \(voice\.status === "listening"\) \{\s*voice\.stop\(\)/);
     assert.match(chat, /if \(voice\.status !== "speaking"\) voice\.resumeAfterResponse\(\)/);
+    assert.match(chat, /compact \? "grid-cols-1" : "sm:grid-cols-2"/);
+    assert.match(chat, /ResultCards result=\{result\} doctorMode=\{doctorMode\} compact=\{compact\}/);
   });
 
   it("adds voice controls beside the existing composer", () => {
@@ -757,10 +834,47 @@ describe("patient assistant chat", () => {
   });
 
   it("keeps one accessible floating panel dismissal control", () => {
+    const launcher = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-launcher.tsx"), "utf8");
     const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(launcher, /<PatientAssistantChat compact audience=\{audience\} onClose=\{dismissPanel\} \/>/);
+    assert.match(launcher, /open \? "hidden" : "flex"/);
+    assert.doesNotMatch(launcher, /minimized|onMinimize/);
+    assert.doesNotMatch(chat, /Minimize assistant|onMinimize|<Minus/);
     assert.match(chat, /onClick=\{\(\) => \{ voice\.stop\(\); voiceEnabledRef\.current = false; onClose\?\.\(\); \}\} aria-label="Close assistant"/);
     const voiceHook = fs.readFileSync(path.join(projectRoot, "lib/use-voice-assistant.ts"), "utf8");
     assert.match(voiceHook, /useEffect\(\(\) => \(\) => controllerRef\.current\?\.dispose\(\), \[\]\)/);
+  });
+
+  it("separates floating window controls from conversation tools in a compact top row", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(chat, /role="group" aria-label="Assistant window controls" className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-muted\/40 p-1"/);
+    assert.match(chat, /aria-label="Expand to full assistant" title="Expand to full assistant"/);
+    assert.match(chat, /aria-label="Close assistant" title="Close assistant"/);
+    assert.match(chat, /col-span-2 flex min-w-0 flex-wrap items-center justify-end gap-1 border-t/);
+    assert.match(chat, /onClick=\{\(\) => \{ voice\.stop\(\); voiceEnabledRef\.current = false; onClose\?\.\(\); \}\} aria-label="Close assistant"/);
+    assert.match(chat, /conversationId\.current \? `\?conversation=\$\{encodeURIComponent\(conversationId\.current\)\}`/);
+  });
+
+  it("keeps full assistant layout inside the role shell content and scrolls messages independently", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    const shell = fs.readFileSync(path.join(projectRoot, "components/role-application-shell.tsx"), "utf8");
+    assert.doesNotMatch(chat, /h-\[calc\(100dvh/);
+    assert.doesNotMatch(chat, /-my-7|-my-9|-my-11/);
+    assert.match(chat, /relative mb-4 flex min-h-0 min-w-0 flex-1/);
+    assert.match(chat, /grid min-h-0 min-w-0 flex-1 gap-4/);
+    assert.match(chat, /<div className="flex min-h-0 min-w-0 flex-col">\{content\}<\/div>/);
+    assert.match(chat, /compact \? "grid grid-cols-\[minmax\(0,1fr\)_auto\] items-center gap-x-2 gap-y-2 px-3 py-3 sm:px-4" : "relative flex items-center gap-2 sm:gap-3 mb-5 shrink-0"/);
+    assert.match(chat, /flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl/);
+    assert.match(chat, /relative min-h-0 flex-1/);
+    assert.match(chat, /absolute inset-0 space-y-4 overscroll-contain p-4 sm:p-5/);
+    assert.match(chat, /sticky bottom-0 z-10 shrink-0/);
+    assert.match(chat, /historyOpen \? "lg:grid-cols-\[minmax\(0,1fr\)_17rem\]/);
+    assert.match(shell, /assistantPage \? "flex h-dvh min-h-0 flex-col overflow-hidden md:flex-row"/);
+    assert.match(shell, /assistantPage \? "flex min-h-0 min-w-0 flex-1 flex-col"/);
+    assert.match(shell, /assistantPage \? "mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col overflow-hidden px-5 pt-7 pb-0/);
+    assert.match(chat, /className="relative mb-4 flex min-h-0 min-w-0 flex-1"/);
+    assert.match(chat, /state\.messages\.length \? "overflow-y-auto" : "flex flex-col justify-center overflow-hidden"/);
+    assert.doesNotMatch(chat, /min-h-64 max-w-lg/);
   });
 
   it("uses the shared Select and independent voice popovers with shared asynchronous browser voices", () => {
@@ -769,6 +883,8 @@ describe("patient assistant chat", () => {
     assert.match(chat, /voice\.selectedVoiceName \|\| "default"/);
     assert.match(chat, /onValueChange=\{\(value\) => voice\.selectVoice/);
     assert.doesNotMatch(chat, /<select\b/);
+    assert.match(chat, /setVoiceSettingsOpen\(open\); if \(open\) setHistoryOpen\(false\)/);
+    assert.match(chat, /setPrivacyNoticeOpen\(open\); if \(open\) setHistoryOpen\(false\)/);
     const voiceHook = fs.readFileSync(path.join(projectRoot, "lib/use-voice-assistant.ts"), "utf8");
     assert.match(voiceHook, /useSyncExternalStore\(subscribeToEnglishVoices, getEnglishVoicesSnapshot/);
     assert.match(voiceHook, /synthesis\.addEventListener\("voiceschanged", refresh\)/);

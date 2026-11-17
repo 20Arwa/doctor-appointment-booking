@@ -68,6 +68,7 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
   const { getToken, isLoaded, isSignedIn } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
+  const assistantPage = pathname === (requiredRole === "patient" ? "/patient/assistant" : "/doctor/assistant");
   const hasChecked = useRef(false);
   const mobileNavigation = useRef<HTMLDetailsElement>(null);
   const [status, setStatus] = useState<"checking" | "ready" | "error">("checking");
@@ -135,7 +136,7 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
   return (
     <ProfileContext.Provider value={profile}>
       <UpdateProfileContext.Provider value={setProfile}>
-      <div className="min-h-screen bg-background text-foreground md:flex">
+      <div className={`${assistantPage ? "flex h-dvh min-h-0 flex-col overflow-hidden md:flex-row" : "min-h-screen md:flex"} bg-background text-foreground`}>
         <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r border-sidebar-border bg-sidebar px-4 py-6 text-sidebar-foreground md:flex">
           {/* <Link href={dashboardPath(requiredRole)} aria-label="Medrella dashboard" className="flex items-center gap-2 px-3 text-xl font-semibold tracking-tight focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sidebar-ring"> */}
           <Link href="/" aria-label="Medrella dashboard" className="flex items-center gap-2 px-3 text-xl font-semibold tracking-tight focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sidebar-ring">
@@ -154,8 +155,8 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
           </div>
         </aside>
 
-        <div className="min-w-0 flex-1 md:pl-64">
-          <header className="sticky top-0 z-20 flex min-h-16 items-center justify-between gap-4 border-b border-border bg-background/95 px-4 backdrop-blur sm:px-6 md:px-8">
+        <div className={`${assistantPage ? "flex min-h-0 min-w-0 flex-1 flex-col" : "min-w-0 flex-1"} md:pl-64`}>
+          <header className={`sticky top-0 z-20 flex min-h-16 items-center justify-between gap-4 border-b border-border bg-background/95 px-4 backdrop-blur sm:px-6 md:px-8 ${assistantPage ? "shrink-0" : ""}`}>
             <Link href={dashboardPath(requiredRole)} aria-label="Medrella dashboard" className="text-lg font-semibold tracking-tight text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring md:hidden">Medrella<span className="text-primary">.</span></Link>
             <p className="hidden text-sm font-medium text-muted-foreground md:block">{roleLabel}</p>
           <HomepageSectionNavigation role={requiredRole} />
@@ -179,9 +180,9 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
               </details>
             </div>
           </header>
-          <main className="mx-auto w-full max-w-7xl px-5 py-7 sm:px-7 sm:py-9 lg:px-10 lg:py-11">{children}</main>
+          <main className={assistantPage ? "mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col overflow-hidden px-5 pt-7 pb-0 sm:px-7 sm:pt-9 sm:pb-0 lg:px-10 lg:pt-11 lg:pb-0" : "mx-auto w-full max-w-7xl px-5 py-7 sm:px-7 sm:py-9 lg:px-10 lg:py-11"}>{children}</main>
         </div>
-        {requiredRole === "patient" ? <PatientAssistantLauncher /> : null}
+        <PatientAssistantLauncher audience={requiredRole} />
       </div>
       </UpdateProfileContext.Provider>
     </ProfileContext.Provider>

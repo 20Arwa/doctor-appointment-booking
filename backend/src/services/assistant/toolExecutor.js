@@ -2,6 +2,7 @@ const appointmentService = require("../appointmentService");
 const doctorService = require("../doctorService");
 const { getDoctorSlots } = require("../../controllers/availabilityController");
 const schedulingAssistant = require("../assistantSchedulingService");
+const assistedRescheduleService = require("../assistedRescheduleService");
 const { getTool } = require("./toolRegistry");
 
 function safeAppointment(row) {
@@ -169,10 +170,66 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
       offset += rows.length;
       lastPageWasFull = rows.length === limit;
       slots.push(...rows.filter((slot) => Number(slot.remaining_capacity) > 0).slice(0, 5 - slots.length)
-        .map(({ id, date, start_time, end_time, mode, capacity, remaining_capacity }) => ({ id, date, start_time, end_time, mode: mode || "legacy", capacity, remaining_capacity })));
+        .map(({ id, date, start_time, end_time, mode, capacity, remaining_capacity, is_private_one_off }) => ({ id, date, start_time, end_time, mode: mode || "legacy", capacity, remaining_capacity, ...(is_private_one_off === true ? { source: "private_one_off" } : {}) })));
       if (rows.length < limit) break;
     }
-    return { slots: slots.map(({ id: _id, ...slot }) => slot), ui_actions: slots.map(({ id }) => ({ type: "schedule_slot", availability_id: id })), scan_limit_reached: slots.length < 5 && offset >= scanLimit && lastPageWasFull, notice: schedulingAssistant.POINT_IN_TIME_NOTICE };
+    const pendingAssistedReschedules = await schedulingAssistant.getPendingAssistedReschedules(database, doctorId, from, to);
+    return {
+      slots: slots.map(({ id: _id, ...slot }) => slot),
+      pending_assisted_reschedules: pendingAssistedReschedules,
+      ui_actions: slots.map(({ id }) => ({ type: "schedule_slot", availability_id: id })),
+      scan_limit_reached: slots.length < 5 && offset >= scanLimit && lastPageWasFull,
+      notice: schedulingAssistant.POINT_IN_TIME_NOTICE,
+    };
+  }
+
+  if (name === "get_doctor_assisted_reschedule_requests") {
+    const doctorId = await schedulingAssistant.requireDoctorId(database, actor);
+    const page = await assistedRescheduleService.listDoctorRequests(database, actor, doctorId, input);
+    if (page.forbidden) throw Object.assign(new Error("Tool is unavailable"), { code: "TOOL_UNAVAILABLE" });
+    const patientResponses = {
+      pending_patient: "Awaiting patient response",
+      no_alternatives: "No alternatives were available",
+      accepted: "Accepted",
+      declined: "Declined",
+      expired: "Expired without a recorded response",
+      superseded: "Superseded after the appointment changed",
+    };
+    return {
+      items: page.items.map((request) => ({
+        patient_name: `${request.patient_first_name} ${request.patient_last_name}`.trim(),
+        appointment: {
+          date: request.previous_date,
+          start_time: request.previous_start_time,
+          end_time: request.previous_end_time,
+          status: request.appointment_status,
+          reason: request.appointment_reason || null,
+        },
+        current_appointment: {
+          date: request.appointment_date,
+          start_time: request.appointment_start_time,
+          end_time: request.appointment_end_time,
+          status: request.appointment_status,
+        },
+        mode: request.mode,
+        status: request.status,
+        patient_response: patientResponses[request.status] || "No response recorded",
+        responded_at: request.responded_at,
+        alternatives: request.suggestions.map((suggestion) => ({
+          date: suggestion.date,
+          start_time: suggestion.start_time,
+          end_time: suggestion.end_time,
+          mode: suggestion.mode,
+          rank: suggestion.rank,
+          selected: suggestion.availability_id === request.selected_availability_id,
+          capacity_at_suggestion: suggestion.remaining_capacity_at_suggestion,
+        })),
+      })),
+      limit: page.limit,
+      offset: page.offset,
+      has_more: page.has_more,
+      next_offset: page.next_offset,
+    };
   }
 
   if (name === "get_cancellation_refund_preview") {
