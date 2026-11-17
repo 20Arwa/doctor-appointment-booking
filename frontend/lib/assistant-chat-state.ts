@@ -12,6 +12,21 @@ export type ChatAction =
   | { type: "clear" };
 export const initialChatState: ChatState = { messages: [], loading: false, error: null, errorCode: null, errorSource: null };
 
+export type AssistantAudience = "patient" | "doctor";
+
+export function assistantActiveConversationStorageKey(audience: AssistantAudience, userId: string) {
+  return `medrella-assistant-active-conversation-${audience}-${encodeURIComponent(userId)}`;
+}
+
+export function resolveAssistantConversationId(requestedId: string | null, rememberedId: string | null, conversations: Array<{ id: string }>) {
+  return requestedId || rememberedId || conversations[0]?.id || null;
+}
+
+export function assistantConversationTitle(preview: string | null | undefined) {
+  const title = preview?.trim().replace(/\s+/g, " ");
+  return title ? title.length > 72 ? `${title.slice(0, 69)}…` : title : "New conversation";
+}
+
 export function retryOperation(source: ChatState["errorSource"]): "history" | "send" | "saved_conversations" | "new_conversation" {
   return source || "history";
 }

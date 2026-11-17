@@ -3,6 +3,7 @@ const DEFAULT_HISTORY_LIMIT = 20;
 const MODEL_CONTEXT_LIMIT = 11;
 const PROCESSING_STALE_AFTER_SECONDS = 120;
 const INTERNAL_ACTION_CONTEXT_TOOL = "__internal_action_context";
+const BOOKING_CONTEXT_VERSION = 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function persistableProposalEvidence(value, userId, conversationId, assistantMessageId) {
@@ -51,6 +52,32 @@ function safeReferenceRows(rows, kind) {
   }));
 }
 
+function safeBookingContext(value) {
+  if (value === null) return null;
+  if (!value || typeof value !== "object" || value.version !== BOOKING_CONTEXT_VERSION
+      || !["awaiting_date_time", "awaiting_slot_choice", "awaiting_slot_confirmation"].includes(value.stage)
+      || !value.doctor || !UUID_PATTERN.test(value.doctor.id || "")) return undefined;
+  const requestedDate = typeof value.requested_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.requested_date) ? value.requested_date : null;
+  const displayedSlots = Array.isArray(value.displayed_slots) ? value.displayed_slots.slice(0, 20).flatMap((slot) => {
+    if (!slot || !UUID_PATTERN.test(slot.slot_id || "") || typeof slot.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(slot.date)
+        || !requestedDate || slot.date !== requestedDate) return [];
+    return [{ slot_id: slot.slot_id, date: slot.date,
+      ...(typeof slot.start_time === "string" ? { start_time: slot.start_time.slice(0, 8) } : {}),
+      ...(typeof slot.end_time === "string" ? { end_time: slot.end_time.slice(0, 8) } : {}),
+    }];
+  }) : [];
+  const selectedSlotId = UUID_PATTERN.test(value.selected_slot_id || "") && displayedSlots.some((slot) => slot.slot_id === value.selected_slot_id) ? value.selected_slot_id : null;
+  return {
+    version: BOOKING_CONTEXT_VERSION,
+    stage: value.stage,
+    doctor: { id: value.doctor.id, name: String(value.doctor.name || "").slice(0, 120), ...(typeof value.doctor.specialty === "string" ? { specialty: value.doctor.specialty.slice(0, 120) } : {}) },
+    requested_date: requestedDate,
+    displayed_slots: displayedSlots,
+    selected_slot_id: selectedSlotId,
+    ...(typeof value.pending_question === "string" ? { pending_question: value.pending_question.slice(0, 500) } : {}),
+  };
+}
+
 function safeReferences(value) {
   if (!value || typeof value !== "object") return null;
   const page = value.history_page && typeof value.history_page === "object" ? value.history_page : null;
@@ -84,6 +111,21 @@ function safeReferences(value) {
     ...(value.pending_action === "book" || value.pending_action === "reschedule" || value.pending_action === "cancel" ? { pending_action: value.pending_action } : {}),
     ...(UUID_PATTERN.test(value.pending_appointment_id || "") ? { pending_appointment_id: value.pending_appointment_id } : {}),
     ...(typeof value.pending_target_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.pending_target_date) ? { pending_target_date: value.pending_target_date } : {}),
+    ...(UUID_PATTERN.test(value.pending_slot_id || "") ? { pending_slot_id: value.pending_slot_id } : {}),
+    ...(value.pending_response === "date_time" || value.pending_response === "slot_choice" || value.pending_response === "slot_confirmation" ? { pending_response: value.pending_response } : {}),
+    ...(typeof value.last_assistant_question === "string" ? { last_assistant_question: value.last_assistant_question.slice(0, 500) } : {}),
+    ...(Object.hasOwn(value, "booking_context") ? { booking_context: safeBookingContext(value.booking_context) } : {}),
+    ...(value.reschedule_context && value.reschedule_context.version === 1
+      && typeof value.reschedule_context.source_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.reschedule_context.source_date)
+      ? { reschedule_context: {
+        version: 1,
+        source_date: value.reschedule_context.source_date,
+        ...(typeof value.reschedule_context.target_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.reschedule_context.target_date) ? { target_date: value.reschedule_context.target_date } : {}),
+        ...(typeof value.reschedule_context.target_time === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value.reschedule_context.target_time) ? { target_time: value.reschedule_context.target_time } : {}),
+        ...(UUID_PATTERN.test(value.reschedule_context.selected_appointment_id || "") ? { selected_appointment_id: value.reschedule_context.selected_appointment_id } : {}),
+        ...(typeof value.reschedule_context.doctor_name === "string" ? { doctor_name: value.reschedule_context.doctor_name.slice(0, 120) } : {}),
+        stage: ["selecting_appointment", "awaiting_target", "clarifying_doctor"].includes(value.reschedule_context.stage) ? value.reschedule_context.stage : "awaiting_target",
+      } } : {}),
     ...(historyPage ? { history_page: historyPage } : {}),
   };
 }
@@ -235,7 +277,7 @@ function createAssistantConversationService({ engine, actionService, now = Date.
         }
         await client.query("UPDATE assistant_conversations SET updated_at = NOW() WHERE id = $1", [conversationId]);
         const prior = await client.query(
-          `SELECT id, role, content, tool_results FROM assistant_messages
+          `SELECT id, role, content, tool_results, created_at FROM assistant_messages
            WHERE conversation_id = $1 AND id <> $2
              AND (role = 'assistant' OR (role = 'user' AND request_status = 'complete'))
            ORDER BY created_at DESC, id DESC LIMIT $3`,
@@ -273,7 +315,7 @@ function createAssistantConversationService({ engine, actionService, now = Date.
           const dismissedTypes = message.tool_results.flatMap((result) => result?.tool === INTERNAL_ACTION_CONTEXT_TOOL ? Object.keys(result.data?.dismissed_proposals || {}) : []);
           if (proposalEvidence?.proposal_succeeded === true && proposalEvidence.requires_patient_confirmation === true
               && ["book", "reschedule", "cancel"].includes(proposalEvidence.action_type) && !dismissedTypes.includes(proposalEvidence.action_type)) {
-            previousProposal = { assistant_message_id: message.id, action_type: proposalEvidence.action_type };
+            previousProposal = { assistant_message_id: message.id, action_type: proposalEvidence.action_type, created_at: message.created_at };
           }
           if (dismissedTypes.includes("cancel")) {
             if (previousActionContext?.action_type === "cancel") previousActionContext = null;
@@ -284,6 +326,31 @@ function createAssistantConversationService({ engine, actionService, now = Date.
             previousReferences = references;
             if (references.appointments.length && context?.action_type !== "cancel" && context?.action_type !== "cancel_pending") previousActionContext = null;
           }
+        }
+        // Booking context is private server state, not model transcript state.
+        // Restore its latest snapshot independently of the bounded prompt window.
+        const latestPrivateState = await client.query(
+          `SELECT tool_results FROM assistant_messages
+           WHERE conversation_id = $1 AND role = 'assistant'
+             AND tool_results @> '[{"tool":"${INTERNAL_ACTION_CONTEXT_TOOL}"}]'::jsonb
+           ORDER BY created_at DESC, id DESC LIMIT 1`,
+          [conversationId],
+        );
+        const latestStateResult = latestPrivateState.rows[0]?.tool_results?.find((result) => result?.tool === INTERNAL_ACTION_CONTEXT_TOOL);
+        if (latestStateResult?.data && Object.hasOwn(latestStateResult.data, "references")) {
+          previousReferences = safeReferences(latestStateResult.data.references);
+        }
+        if (previousProposal) {
+          const intent = await client.query(
+            `SELECT status, expires_at, expires_at <= NOW() AS is_expired
+             FROM assistant_action_intents
+             WHERE user_id = $1 AND conversation_id = $2 AND assistant_message_id = $3 AND action_type = $4
+             ORDER BY created_at DESC LIMIT 1`,
+            [user.id, conversationId, previousProposal.assistant_message_id, previousProposal.action_type],
+          );
+          const currentIntent = intent.rows[0];
+          if (currentIntent && (currentIntent.is_expired || ["completed", "failed", "expired"].includes(currentIntent.status))) previousProposal = null;
+          else previousProposal.status = currentIntent?.status || "awaiting_preparation";
         }
         return { userMessage, previousActionContext, previousProposal, previousReferences, context: priorMessages.map(({ role, content: priorContent }) => ({ role, content: priorContent })).concat({ role: "user", content }) };
       });
@@ -297,6 +364,7 @@ function createAssistantConversationService({ engine, actionService, now = Date.
       try {
         completion = await engine.respond({
           actor: user,
+          conversationId,
           messages: claimed.context,
           database,
           applicationTimezone,

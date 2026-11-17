@@ -200,16 +200,20 @@ async function listDoctorRequests(database, user, doctorId, filters) {
     values.push(filters.status);
     where.push(`request.status = $${values.length}`);
   }
-  values.push(filters.limit, filters.offset);
+  values.push(filters.limit + 1, filters.offset);
   const result = await database.query(
     `SELECT request.id, request.appointment_id, request.patient_id,
             request.source_availability_id, request.previous_date::text AS previous_date,
             request.previous_start_time::text AS previous_start_time,
             request.previous_end_time::text AS previous_end_time,
             request.mode, request.status, request.created_at, request.updated_at,
-            request.expires_at,
+            request.expires_at, request.responded_at,
             patient_user.first_name AS patient_first_name, patient_user.last_name AS patient_last_name,
-            appointment.status AS appointment_status,
+            appointment.status AS appointment_status, appointment.reason AS appointment_reason,
+            appointment.scheduled_date::text AS appointment_date,
+            appointment.scheduled_start_time::text AS appointment_start_time,
+            appointment.scheduled_end_time::text AS appointment_end_time,
+            request.selected_availability_id,
             (SELECT COUNT(*)::int FROM assisted_reschedule_suggestions suggestion
              WHERE suggestion.request_id = request.id) AS suggestion_count
      FROM assisted_reschedule_requests request
@@ -221,7 +225,32 @@ async function listDoctorRequests(database, user, doctorId, filters) {
      LIMIT $${values.length - 1} OFFSET $${values.length}`,
     values,
   );
-  return { items: result.rows, limit: filters.limit, offset: filters.offset };
+  const hasMore = result.rows.length > filters.limit;
+  const items = result.rows.slice(0, filters.limit);
+  const requestIds = items.map(({ id }) => id);
+  const suggestionRows = requestIds.length ? (await database.query(
+    `SELECT suggestion.request_id, suggestion.availability_id, suggestion.mode,
+            suggestion.service_date::text AS date, suggestion.start_time::text AS start_time,
+            suggestion.end_time::text AS end_time, suggestion.rank,
+            suggestion.remaining_capacity_at_suggestion
+     FROM assisted_reschedule_suggestions suggestion
+     WHERE suggestion.request_id = ANY($1::uuid[])
+     ORDER BY suggestion.request_id, suggestion.rank`,
+    [requestIds],
+  )).rows : [];
+  const suggestionsByRequest = new Map();
+  for (const suggestion of suggestionRows) {
+    const suggestions = suggestionsByRequest.get(suggestion.request_id) || [];
+    suggestions.push(suggestion);
+    suggestionsByRequest.set(suggestion.request_id, suggestions);
+  }
+  return {
+    items: items.map((item) => ({ ...item, suggestions: suggestionsByRequest.get(item.id) || [] })),
+    limit: filters.limit,
+    offset: filters.offset,
+    has_more: hasMore,
+    next_offset: hasMore ? filters.offset + items.length : null,
+  };
 }
 
 async function getPatientRequest(database, user, appointmentId) {

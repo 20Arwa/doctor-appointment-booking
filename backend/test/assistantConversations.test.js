@@ -19,11 +19,16 @@ function memoryDatabase(ownerId = user.id) {
     if (sql.includes("FROM assistant_messages") && sql.includes("FOR UPDATE")) return { rows: state.userMessage?.id === values[0] ? [{ id: values[0] }] : [] };
     if (sql.includes("FROM assistant_messages WHERE conversation_id = $1 AND role = 'user' AND request_id = $2")) return { rows: state.userMessage ? [state.userMessage] : [] };
     if (sql.includes("reply_to_message_id = $1")) return { rows: state.assistantMessage ? [state.assistantMessage] : [] };
+    if (sql.includes("tool_results @>")) {
+      const candidate = state.assistantMessage?.tool_results?.some((result) => result?.tool === "__internal_action_context")
+        ? state.assistantMessage : [...state.priorAssistantMessages].reverse().find((message) => message.tool_results?.some((result) => result?.tool === "__internal_action_context"));
+      return { rows: candidate ? [{ tool_results: candidate.tool_results }] : [] };
+    }
     if (sql.includes("INSERT INTO assistant_messages (conversation_id, role, content, request_id, request_status)")) {
       state.userMessage = { id: "44444444-4444-4444-8444-444444444444", role: "user", content: values[1], request_id: values[2], request_status: "processing", updated_at: new Date() };
       return { rows: [state.userMessage] };
     }
-    if (sql.includes("SELECT id, role, content, tool_results FROM assistant_messages")) return { rows: state.priorAssistantMessages };
+    if (sql.includes("SELECT id, role, content, tool_results, created_at FROM assistant_messages")) return { rows: state.priorAssistantMessages };
     if (sql.includes("INSERT INTO assistant_messages (conversation_id, role, content, reply_to_message_id, tool_results)")) {
       state.assistantInsertCount += 1;
       state.assistantMessage = { id: "55555555-5555-4555-8555-555555555555", role: "assistant", content: values[1], tool_results: JSON.parse(values[3]), created_at: new Date() };
@@ -185,7 +190,9 @@ describe("assistant conversation persistence", () => {
       actionService,
       engine: { respond: async ({ previousActionContext, previousProposal }) => {
         assert.deepEqual(previousActionContext, { action_type: "cancel", appointment_id: appointmentId });
-        assert.deepEqual(previousProposal, { assistant_message_id: assistantMessageId, action_type: "cancel" });
+        assert.equal(previousProposal.assistant_message_id, assistantMessageId);
+        assert.equal(previousProposal.action_type, "cancel");
+        assert.equal(previousProposal.status, "awaiting_preparation");
         return { answer: "Understood. I dismissed the cancellation proposal and won't prepare it again.", results: [], dismissProposal: previousProposal };
       } },
     });

@@ -134,6 +134,7 @@ async function getDoctorSlots(_request, response, next) {
               availability.date::text AS date,
               availability.start_time::text AS start_time, availability.end_time::text AS end_time,
               availability.mode, availability.capacity,
+              ($5::boolean AND availability.schedule_id IS NULL AND availability.booking_visibility = 'private') AS is_private_one_off,
               GREATEST(availability.capacity - COALESCE(occupancy.occupied, 0), 0)::int AS remaining_capacity,
               COALESCE(preserved.bookings, 0)::int AS preserved_reservation_count,
               availability.created_at, availability.updated_at,
@@ -197,6 +198,33 @@ async function getDoctorSlots(_request, response, next) {
               AND ((appointment.scheduled_date + appointment.scheduled_end_time) AT TIME ZONE $4) > NOW()
           ))
          AND (availability.mode IS NULL OR availability.capacity > COALESCE(occupancy.occupied, 0) OR $5::boolean)
+       AND (
+         availability.schedule_id IS NULL
+         OR EXISTS (
+           SELECT 1 FROM doctor_schedules source_schedule
+           WHERE source_schedule.id = availability.schedule_id
+             AND source_schedule.doctor_id = availability.doctor_id
+             AND source_schedule.active AND source_schedule.archived_at IS NULL
+             AND (source_schedule.starts_on IS NULL OR source_schedule.starts_on <= availability.date)
+             AND (source_schedule.ends_on IS NULL OR source_schedule.ends_on >= availability.date)
+             AND (
+               (source_schedule.recurrence_type = 'weekly' AND EXISTS (
+                 SELECT 1 FROM doctor_schedule_periods source_period
+                 WHERE source_period.schedule_id = source_schedule.id
+                   AND source_period.weekday = EXTRACT(DOW FROM availability.date)::int
+                   AND availability.start_time >= source_period.start_time
+                   AND availability.end_time <= source_period.end_time
+               ))
+               OR (source_schedule.recurrence_type = 'specific_dates' AND EXISTS (
+                 SELECT 1 FROM doctor_schedule_periods source_period
+                 WHERE source_period.schedule_id = source_schedule.id
+                   AND source_period.service_date = availability.date
+                   AND availability.start_time >= source_period.start_time
+                   AND availability.end_time <= source_period.end_time
+               ))
+             )
+         )
+       )
           ${holdFilter}
        ORDER BY date, start_time${pagination}`,
       values,
