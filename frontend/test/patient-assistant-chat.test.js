@@ -283,13 +283,17 @@ describe("patient assistant chat", () => {
         assistant_message: { id: "a", role: "assistant", content: "Here are available times.", results: [
           { tool: "search_doctors", data: { doctors: [{ name: "Dr. Ali Ahmed", specialty: "Cardiology" }] } },
           { tool: "get_available_slots", data: { slots: [{ date: "2027-01-06", start_time: "10:00:00", end_time: "10:30:00", doctor: { name: "Dr. Ali Ahmed" } }] } },
+          { tool: "get_doctor_schedules", data: { schedules: [{ mode: "wave" }], notice: "Point-in-time view." } },
+          { tool: "get_doctor_schedule_exceptions", data: { exceptions: [{ date: "2027-01-07" }], notice: "Point-in-time view." } },
+          { tool: "get_doctor_schedule_conflicts", data: { conflicts: [{ date: "2027-01-07", conflicts: ["payment_hold"] }], notice: "Point-in-time view." } },
+          { tool: "get_doctor_nearest_slots", data: { slots: [{ date: "2027-01-08", mode: "stream" }], notice: "Point-in-time view." } },
         ] },
         replayed: false,
       }; },
     });
     try {
       const response = await sendAssistantMessage("token", "conversation", "r", "Show availability for him");
-      assert.deepEqual(response.assistant_message.results.map(({ tool }) => tool), ["search_doctors", "get_available_slots"]);
+      assert.deepEqual(response.assistant_message.results.map(({ tool }) => tool), ["search_doctors", "get_available_slots", "get_doctor_schedules", "get_doctor_schedule_exceptions", "get_doctor_schedule_conflicts", "get_doctor_nearest_slots"]);
     } finally {
       global.fetch = previousFetch;
       if (previousUrl === undefined) delete process.env.NEXT_PUBLIC_API_URL;
@@ -359,6 +363,37 @@ describe("patient assistant chat", () => {
     assert.match(component, /in this window/);
     assert.match(component, /in this slot/);
     assert.match(component, /Legacy availability · mode unknown/);
+  });
+
+  it("renders doctor schedule, exception, conflict, and nearest-slot result shapes", () => {
+    const results = [
+      { tool: "get_doctor_schedules", data: { schedules: [{ mode: "wave", recurrence_type: "weekly", visibility: "public", periods: [{ weekday: 1, start_time: "09:00", end_time: "12:00" }] }], notice: "Point-in-time view." } },
+      { tool: "get_doctor_schedule_exceptions", data: { exceptions: [{ date: "2027-02-01", exception_type: "day_off", periods: [] }], notice: "Point-in-time view." } },
+      { tool: "get_doctor_schedule_conflicts", data: { conflicts: [{ date: "2027-02-01", start_time: "09:00", end_time: "09:30", mode: "wave", capacity: 2, occupied: 2, remaining_capacity: 0, conflicts: ["confirmed_appointment", "payment_hold"] }], notice: "Point-in-time view." } },
+      { tool: "get_doctor_nearest_slots", data: { slots: [{ date: "2027-02-02", start_time: "10:00", end_time: "10:30", mode: "wave", capacity: 3, remaining_capacity: 1 }], notice: "Point-in-time view." } },
+    ];
+    const component = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.deepEqual(results.map((result) => getAssistantResultRows(result).length), [1, 1, 1, 1]);
+    for (const label of ["Scheduling conflicts", "Schedule exceptions", "Available times", "Available slot · Wave", "No matching records were found", "result.data.notice"]) assert.ok(component.includes(label));
+    for (const tool of ["get_doctor_schedules", "get_doctor_schedule_exceptions", "get_doctor_schedule_conflicts", "get_doctor_nearest_slots"]) assert.ok(component.includes(tool));
+    assert.match(getAssistantDisplayContent("Schedule details", results.slice(0, 1)), /matching results/i);
+  });
+
+  it("wires doctor navigation and mode while keeping patient behavior and action cards isolated", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    const page = fs.readFileSync(path.join(projectRoot, "app/doctor/assistant/page.tsx"), "utf8");
+    const shell = fs.readFileSync(path.join(projectRoot, "components/role-application-shell.tsx"), "utf8");
+    const dashboard = fs.readFileSync(path.join(projectRoot, "components/dashboard-pages.tsx"), "utf8");
+    const launcher = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-launcher.tsx"), "utf8");
+    assert.match(page, /PatientAssistantChat audience="doctor"/);
+    assert.match(shell, /label: "AI Assistant", href: "\/doctor\/assistant"/);
+    assert.match(dashboard, /href="\/doctor\/assistant" title="Doctor AI Assistant"/);
+    assert.match(chat, /audience = "patient"/);
+    assert.match(chat, /audience === "doctor" \? "\/doctor\/assistant" : "\/patient\/assistant"/);
+    assert.match(chat, /!doctorMode && message\.role === "assistant"[\s\S]*proposalTypeForResult/);
+    assert.match(launcher, /PatientAssistantChat compact/);
+    assert.match(launcher, /pathname === "\/patient\/assistant" \|\| pathname\.startsWith\("\/patient\/assistant\/"\)/);
+    assert.match(shell, /requiredRole === "patient" \? <PatientAssistantLauncher/);
   });
 
   it("hides empty result cards and all cards attached to refusal responses", () => {

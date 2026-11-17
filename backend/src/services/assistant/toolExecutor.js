@@ -1,6 +1,7 @@
 const appointmentService = require("../appointmentService");
 const doctorService = require("../doctorService");
 const { getDoctorSlots } = require("../../controllers/availabilityController");
+const schedulingAssistant = require("../assistantSchedulingService");
 const { getTool } = require("./toolRegistry");
 
 function safeAppointment(row) {
@@ -83,20 +84,57 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
       `SELECT appointment.scheduled_date::text AS date,
               appointment.scheduled_start_time::text AS start_time,
               appointment.scheduled_end_time::text AS end_time,
-              appointment.status, patient_user.first_name AS patient_first_name,
-              patient_user.last_name AS patient_last_name
+              appointment.status, av.mode
        FROM appointments appointment
        JOIN availability av ON av.id = appointment.availability_id
        JOIN doctors doctor ON doctor.id = av.doctor_id
-       JOIN patients patient ON patient.id = appointment.patient_id
-       JOIN users patient_user ON patient_user.id = patient.user_id
        WHERE doctor.user_id = $1 AND appointment.scheduled_date BETWEEN $2::date AND $3::date${statusClause}
        ORDER BY appointment.scheduled_date, appointment.scheduled_start_time, appointment.id LIMIT $${values.length - 1} OFFSET $${values.length}`,
       values,
     );
     const hasMore = result.rows.length > limit;
-    const appointments = result.rows.slice(0, limit);
+    const appointments = result.rows.slice(0, limit).map(({ date, start_time, end_time, status, mode }) => ({
+      date, start_time, end_time, status, ...(mode ? { mode } : {}),
+    }));
     return { from, to, appointments, has_more: hasMore, next_offset: hasMore ? offset + appointments.length : null, limit, offset };
+  }
+
+  if (["get_doctor_schedules", "get_doctor_schedule_exceptions", "get_doctor_schedule_conflicts", "get_doctor_nearest_slots"].includes(name)) {
+    const doctorId = await schedulingAssistant.requireDoctorId(database, actor);
+    if (name === "get_doctor_schedules") {
+      const schedules = await schedulingAssistant.getSchedules(database, doctorId, input.from, input.to, input.limit + 1);
+      return { schedules: schedules.slice(0, input.limit).map(({ id, ...schedule }) => schedule), has_more: schedules.length > input.limit, notice: schedulingAssistant.POINT_IN_TIME_NOTICE };
+    }
+    if (name === "get_doctor_schedule_exceptions") {
+      const exceptions = await schedulingAssistant.getExceptions(database, doctorId, input.from, input.to, input.limit + 1);
+      return { exceptions: exceptions.slice(0, input.limit), has_more: exceptions.length > input.limit, notice: schedulingAssistant.POINT_IN_TIME_NOTICE };
+    }
+    if (name === "get_doctor_schedule_conflicts") return schedulingAssistant.getConflicts(database, doctorId, input.from, input.to, input.limit);
+    const timeZone = applicationTimezone || "Asia/Kolkata";
+    const today = dateInTimezone(now, timeZone);
+    const from = input.from || today;
+    const to = input.to || addCalendarDays(today, input.days_ahead ?? 14);
+    const pageSize = 100;
+    const scanLimit = 1000;
+    const slots = [];
+    let offset = 0;
+    let lastPageWasFull = false;
+    while (slots.length < 5 && offset < scanLimit) {
+      const limit = Math.min(pageSize, scanLimit - offset);
+      const response = controllerResponse({ database, applicationTimezone: timeZone, user: actor,
+        params: { id: doctorId }, query: { from, to, mode: input.mode, limit, offset } });
+      let controllerError;
+      await getDoctorSlots({}, response, (error) => { controllerError = error; });
+      if (controllerError) throw controllerError;
+      if ((response.statusCode || 200) >= 400) throw Object.assign(new Error("Availability could not be loaded"), { code: "TOOL_QUERY_FAILED" });
+      const rows = response.body || [];
+      offset += rows.length;
+      lastPageWasFull = rows.length === limit;
+      slots.push(...rows.filter((slot) => Number(slot.remaining_capacity) > 0).slice(0, 5 - slots.length)
+        .map(({ date, start_time, end_time, mode, capacity, remaining_capacity }) => ({ date, start_time, end_time, mode: mode || "legacy", capacity, remaining_capacity })));
+      if (rows.length < limit) break;
+    }
+    return { slots, scan_limit_reached: slots.length < 5 && offset >= scanLimit && lastPageWasFull, notice: schedulingAssistant.POINT_IN_TIME_NOTICE };
   }
 
   if (name === "get_cancellation_refund_preview") {

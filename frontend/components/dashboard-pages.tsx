@@ -1,7 +1,7 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
-import { CalendarCheck2, CalendarDays, CalendarRange, Clock3, ReceiptText, RefreshCw, UserRound, UsersRound } from "lucide-react";
+import { CalendarCheck2, CalendarDays, CalendarRange, Clock3, MessageCircle, ReceiptText, RefreshCw, UserRound, UsersRound } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useDashboardProfile } from "@/components/role-application-shell";
@@ -192,6 +192,7 @@ export function DoctorDashboardPage() {
       <section aria-label="Doctor workspace links" className="grid gap-3 sm:grid-cols-2">
         <ShortcutCard href="/doctor/appointments" title="Appointment management" description="Review, reschedule, or complete visits." icon={CalendarCheck2} />
         <ShortcutCard href="/doctor/availability" title="Manage availability" description="Set the times patients can book." icon={CalendarRange} />
+        <ShortcutCard href="/doctor/assistant" title="Doctor AI Assistant" description="Review schedules, exceptions, conflicts, and available times." icon={MessageCircle} />
       </section>
     </div>
   );

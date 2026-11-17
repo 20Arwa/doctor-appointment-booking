@@ -28,7 +28,7 @@ async function getDoctorSlots(_request, response, next) {
   const now = requireTimezone(response);
   if (!now) return;
   const { id } = response.locals.params;
-  const { from, to, specialty } = response.locals.query;
+  const { from, to, specialty, mode } = response.locals.query;
   let isOwnDoctorManagementView = false;
   if (response.locals.user.role === "doctor") {
     const ownership = await getOwnDoctorId(response);
@@ -99,7 +99,15 @@ async function getDoctorSlots(_request, response, next) {
     values.push(specialty);
     filters.push(`EXISTS (SELECT 1 FROM doctors specialty_doctor JOIN users specialty_user ON specialty_user.id = specialty_doctor.user_id WHERE specialty_doctor.id = availability.doctor_id AND specialty_user.is_active = TRUE AND specialty_doctor.specialty ILIKE '%' || $${values.length} || '%')`);
   }
-  const limit = response.locals.query.limit === undefined ? "" : ` LIMIT $${values.push(response.locals.query.limit)}`;
+  if (mode) {
+    values.push(mode);
+    filters.push(`availability.mode = $${values.length}`);
+  }
+  let pagination = "";
+  if (response.locals.query.limit !== undefined) pagination += ` LIMIT $${values.push(response.locals.query.limit)}`;
+  if (Number.isSafeInteger(response.locals.query.offset) && response.locals.query.offset >= 0) {
+    pagination += ` OFFSET $${values.push(response.locals.query.offset)}`;
+  }
 
   try {
     const holdFilter = isOwnDoctorManagementView ? "" : "AND (availability.mode IS NOT NULL OR payment_hold.id IS NULL)";
@@ -190,7 +198,7 @@ async function getDoctorSlots(_request, response, next) {
           ))
          AND (availability.mode IS NULL OR availability.capacity > COALESCE(occupancy.occupied, 0) OR $5::boolean)
           ${holdFilter}
-       ORDER BY date, start_time${limit}`,
+       ORDER BY date, start_time${pagination}`,
       values,
     );
     return response.json(result.rows);

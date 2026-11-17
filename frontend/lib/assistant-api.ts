@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-const resultSchema = z.object({ tool: z.enum(["get_patient_appointments", "search_doctors", "get_available_slots", "prepare_booking_action", "prepare_reschedule_action", "prepare_cancellation_action", "get_cancellation_refund_preview"]), data: z.record(z.string(), z.unknown()) });
+const resultSchema = z.object({ tool: z.enum(["get_patient_appointments", "search_doctors", "get_available_slots", "prepare_booking_action", "prepare_reschedule_action", "prepare_cancellation_action", "get_cancellation_refund_preview", "get_doctor_schedules", "get_doctor_schedule_exceptions", "get_doctor_schedule_conflicts", "get_doctor_nearest_slots"]), data: z.record(z.string(), z.unknown()) });
 const messageSchema = z.object({ id: z.string(), role: z.enum(["user", "assistant"]), content: z.string(), created_at: z.string().optional(), request_id: z.string().optional(), request_status: z.string().optional(), results: z.array(resultSchema).optional() });
 const conversationSchema = z.object({ id: z.string(), created_at: z.string(), updated_at: z.string(), preview: z.string().nullable().optional() });
 const listSchema = z.object({ items: z.array(conversationSchema) });
