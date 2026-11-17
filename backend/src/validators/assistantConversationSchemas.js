@@ -14,6 +14,12 @@ const sendConversationMessageSchema = z.object({
   request_id: z.uuid(),
   content: z.string().trim().min(1).max(1000),
 }).strict();
+const actionIntentParamsSchema = z.object({ conversationId: z.uuid(), intentId: z.uuid() }).strict();
+const prepareActionSchema = z.object({
+  assistant_message_id: z.uuid(),
+  action_type: z.enum(["book", "reschedule", "cancel"]),
+  action_args: z.record(z.string(), z.unknown()),
+}).strict();
 
 module.exports = {
   conversationIdParamsSchema,
@@ -21,4 +27,6 @@ module.exports = {
   listConversationsQuerySchema,
   openConversationQuerySchema,
   sendConversationMessageSchema,
+  actionIntentParamsSchema,
+  prepareActionSchema,
 };

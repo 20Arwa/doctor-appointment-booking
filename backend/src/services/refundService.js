@@ -19,7 +19,7 @@ function refundPolicyAmount(paymentAmount, appointment, now = Date.now()) {
   return 0;
 }
 
-function createRefundService({ database, stripe, logger = console, now = Date.now }) {
+function createRefundService({ database, stripe, logger = console, now = Date.now, reconcileAssistantAction = async () => {} }) {
   async function withTransaction(operation) {
     const client = await database.connect();
     let started = false;
@@ -78,6 +78,18 @@ function createRefundService({ database, stripe, logger = console, now = Date.no
       if (event) await client.query("UPDATE payment_provider_events SET processed_at = NOW() WHERE provider = 'stripe' AND provider_event_id = $1", [event.id]);
       await syncPaymentStatus(client, refund.payment_id);
       const latest = await client.query("SELECT id, amount::text AS amount, currency, status FROM refunds WHERE id = $1", [refundId]);
+      if (["processed", "failed", "cancelled"].includes(latest.rows[0]?.status)) {
+        await client.query(
+          `UPDATE assistant_action_intents intent
+           SET status = CASE WHEN $2 = 'processed' THEN 'completed' ELSE 'failed' END,
+               execution_lease_until = NULL, execution_lease_token = NULL
+           FROM refunds linked_refund
+           WHERE linked_refund.id = $1 AND intent.action_type = 'cancel'
+             AND (intent.status = 'refund_pending' OR ($2 = 'processed' AND intent.status = 'failed'))
+             AND linked_refund.idempotency_key = 'appointment-cancel:' || (intent.action_args->>'appointment_id')`,
+          [refundId, latest.rows[0].status],
+        );
+      }
       return latest.rows[0];
     });
   }
@@ -165,7 +177,10 @@ function createRefundService({ database, stripe, logger = console, now = Date.no
       });
       if (planned.status === "not_applicable" || planned.status === "not_eligible") return planned;
       const submitted = await submitRefund(planned);
-      return { status: submitted?.status || "pending", refund_id: submitted?.id || planned.id, amount: submitted?.amount || planned.amount, currency: submitted?.currency || planned.currency };
+      const aggregate = await database.query(
+        "SELECT status FROM payments WHERE id = $1", [planned.payment_id],
+      );
+      return { status: submitted?.status || "pending", refund_id: submitted?.id || planned.id, amount: submitted?.amount || planned.amount, currency: submitted?.currency || planned.currency, payment_status: aggregate.rows[0]?.status || null };
     } catch (error) {
       logger.error("Appointment cancellation refund could not be prepared", { appointmentId: appointment.id, message: error.message });
       return {
@@ -242,6 +257,8 @@ function createRefundService({ database, stripe, logger = console, now = Date.no
     return {
       original_payment: originalPayment,
       refund_percentage: refundPercentage,
+      processed_refund_amount: (processedRefundMinorUnits / 100).toFixed(2),
+      pending_refund_amount: (pendingRefundMinorUnits / 100).toFixed(2),
       estimated_refund_amount: (estimatedMinorUnits / 100).toFixed(2),
       currency: originalPayment?.currency || null,
       refund_expected: estimatedMinorUnits > 0,
@@ -265,7 +282,8 @@ function createRefundService({ database, stripe, logger = console, now = Date.no
         const refundStatus = refund.status === "succeeded" ? "processed"
           : refund.status === "failed" ? "failed"
             : refund.status === "canceled" ? "cancelled" : "pending";
-        await updateRefund(foundRefund.rows[0].id, refundStatus, refund.id, { id: `${event.id}:${refund.id}`, type: event.type });
+        const updated = await updateRefund(foundRefund.rows[0].id, refundStatus, refund.id, { id: `${event.id}:${refund.id}`, type: event.type });
+        if (updated && !updated.duplicate) await reconcileAssistantAction(updated.id, updated.status);
         processed += 1;
       }
       return { status: "processed", refunds: processed };
@@ -280,7 +298,9 @@ function createRefundService({ database, stripe, logger = console, now = Date.no
     const status = object.status === "succeeded" ? "processed"
       : object.status === "failed" ? "failed"
         : object.status === "canceled" ? "cancelled" : "pending";
-    return updateRefund(refundId, status, object.id, { id: event.id, type: event.type });
+    const updated = await updateRefund(refundId, status, object.id, { id: event.id, type: event.type });
+    if (updated && !updated.duplicate) await reconcileAssistantAction(updated.id, updated.status);
+    return updated;
   }
 
   return { previewCancellationRefund, processRefundWebhook, refundCancelledAppointment };

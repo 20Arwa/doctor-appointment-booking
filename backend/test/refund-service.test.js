@@ -6,7 +6,7 @@ const appointment = { id: "33333333-3333-4333-8333-333333333333", date: "2099-04
 const user = { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", role: "patient" };
 
 function refundDatabase(paymentStatus = "captured") {
-  const state = { refunds: new Map(), events: new Set(), paymentStatus, inTransaction: false, paymentState: paymentStatus };
+  const state = { refunds: new Map(), events: new Set(), paymentStatus, inTransaction: false, paymentState: paymentStatus, intentStatus: null };
   return {
     state,
     async query(sql, values = []) {
@@ -70,6 +70,12 @@ function refundDatabase(paymentStatus = "captured") {
             return { rows: [] };
           }
           if (sql.startsWith("UPDATE payments SET status")) { state.paymentState = values[1]; return { rows: [] }; }
+          if (sql.startsWith("UPDATE assistant_action_intents")) {
+            const mayReconcile = state.intentStatus === "refund_pending" || values[1] === "processed" && state.intentStatus === "failed";
+            if (mayReconcile) state.intentStatus = values[1] === "processed" ? "completed" : "failed";
+            return { rows: [], rowCount: mayReconcile ? 1 : 0 };
+          }
+          if (sql.startsWith("SELECT status FROM payments WHERE id = $1")) return { rows: [{ status: state.paymentState }] };
           if (sql.startsWith("SELECT id, amount::text AS amount, currency, status FROM refunds")) {
             const refund = [...state.refunds.values()].find((r) => r.id === values[0]);
             return { rows: [{ id: refund.id, amount: refund.amount, currency: refund.currency, status: refund.status }] };
@@ -204,5 +210,40 @@ describe("appointment cancellation refunds", () => {
     assert.equal((await service.processRefundWebhook(oldPendingEvent)).status, "processed");
     assert.equal([...database.state.refunds.values()][0].status, "processed");
     assert.equal(database.state.paymentState, "refunded");
+  });
+
+  it("reconciles a failed refund intent when a later success arrives and ignores duplicate or stale events", async () => {
+    const database = refundDatabase();
+    database.state.intentStatus = "refund_pending";
+    const service = createRefundService({
+      database,
+      stripe: { async createRefund() { return { id: "re_test_456", status: "pending" }; } },
+      logger: { error() {} },
+      now: () => new Date("2099-04-10T00:00:00+05:30").getTime(),
+    });
+    const appointment = { id: "appointment-1", status: "cancelled", patient_user_id: user.id, patient_id: "patient-1", payment_status: "captured", payment_amount: "500.00", payment_currency: "INR" };
+    await service.refundCancelledAppointment(user, appointment);
+    const event = (id, status) => ({
+      id,
+      type: "refund.updated",
+      data: { object: { id: "re_test_456", status, metadata: { local_refund_id: "99999999-9999-4999-8999-999999999999" } } },
+    });
+
+    const failedEvent = event("evt_refund_failed", "failed");
+    assert.equal((await service.processRefundWebhook(failedEvent)).status, "failed");
+    assert.equal(database.state.intentStatus, "failed");
+    assert.equal((await service.processRefundWebhook(failedEvent)).duplicate, true);
+    assert.equal(database.state.intentStatus, "failed");
+
+    const successEvent = event("evt_refund_late_success", "succeeded");
+    assert.equal((await service.processRefundWebhook(successEvent)).status, "processed");
+    assert.equal(database.state.intentStatus, "completed");
+    assert.equal(database.state.paymentState, "partially_refunded");
+    assert.equal((await service.processRefundWebhook(successEvent)).duplicate, true);
+    assert.equal(database.state.intentStatus, "completed");
+
+    assert.equal((await service.processRefundWebhook(event("evt_refund_old_pending", "pending"))).status, "processed");
+    assert.equal(database.state.intentStatus, "completed");
+    assert.equal(database.state.paymentState, "partially_refunded");
   });
 });

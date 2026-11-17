@@ -139,8 +139,13 @@ function stripeReceiptUrl(value) {
   }
 }
 
-function createPaymentService({ database, stripe, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now }) {
-  const refundService = createRefundService({ database, stripe, logger, now });
+function createPaymentService({ database, stripe, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now, reconcileAssistantAction = async () => {} }) {
+  const refundService = createRefundService({ database, stripe, logger, now, reconcileAssistantAction: (...args) => reconcileAssistantRefund(...args) });
+
+  async function reconcileAssistantRefund(refundId, refundStatus) {
+    if (!reconcileAssistantAction) return;
+    await reconcileAssistantAction(refundId, `refund:${refundStatus}`);
+  }
   async function closePaymentWithoutSession(reservation, status = "failed") {
     await withTransaction(database, async (client) => {
       const slot = await lockSlot(client, reservation.availability_id);
@@ -162,6 +167,9 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
 
   async function createCheckoutSession(user, input) {
     if (user.role !== "patient") fail(403, "FORBIDDEN", "Only patients can pay for appointments");
+    if (input.expected_fee_minor !== undefined && !Number.isSafeInteger(input.expected_fee_minor)) {
+      fail(400, "EXPECTED_FEE_INVALID", "The confirmed consultation fee is invalid");
+    }
     const reservation = await withTransaction(database, async (client) => {
       const patientResult = await client.query("SELECT id FROM patients WHERE user_id = $1", [user.id]);
       const patientId = patientResult.rows[0]?.id;
@@ -183,7 +191,9 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
         [input.idempotency_key, patientId],
       );
       if (prior.rows[0]) {
-        if (["failed", "cancelled", "expired", "captured", "partially_refunded", "refunded"].includes(prior.rows[0].status)) fail(409, "PAYMENT_ATTEMPT_CLOSED", "Start a new payment attempt for this appointment");
+        if (["failed", "cancelled", "expired", "captured", "partially_refunded", "refunded"].includes(prior.rows[0].status)) {
+          return { ...prior.rows[0], closed_attempt: true };
+        }
         if (prior.rows[0].availability_id !== input.availability_id) fail(409, "IDEMPOTENCY_KEY_REUSED", "This payment key belongs to a different slot");
         return { ...prior.rows[0], reused: true };
       }
@@ -209,6 +219,11 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
         fail(409, "DUPLICATE_BOOKING", "You already have an active booking or pending checkout for this time slot.");
       }
 
+      const amount = stripeMinorUnits(slot.fee);
+      if (input.expected_fee_minor !== undefined && amount !== input.expected_fee_minor) {
+        fail(409, "BOOKING_FEE_CHANGED", "The consultation fee changed after confirmation");
+      }
+
       const existing = await client.query(
         `SELECT p.id, p.status, p.provider_order_id, p.amount::text AS amount, p.currency,
                 h.expires_at, h.availability_id, h.id AS hold_id, av.doctor_id
@@ -224,7 +239,6 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
 
       const slotDateTime = new Date(`${slot.date}T${String(slot.start_time).slice(0, 8)}+05:30`);
       if (Number.isNaN(slotDateTime.getTime()) || slotDateTime <= new Date()) fail(409, "SLOT_UNAVAILABLE", "Availability slot is no longer bookable");
-      const amount = stripeMinorUnits(slot.fee);
       const occupied = await appointmentService.countOccupiedPlaces(client, input.availability_id);
       if (occupied >= Number(slot.capacity || 1)) fail(409, "SLOT_CAPACITY_REACHED", "The selected availability option has reached its booking capacity");
       if (!slot.mode && await scheduleConflict(client, slot.doctor_id, slot.date, slot.start_time, slot.end_time, "00000000-0000-0000-0000-000000000000")) {
@@ -246,13 +260,23 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
       return { ...payment.rows[0], hold_id: hold.rows[0].id, expires_at: hold.rows[0].expires_at, availability_id: input.availability_id, doctor_id: slot.doctor_id, reused: false };
     });
 
+    if (reservation.closed_attempt) {
+      if (["failed", "cancelled", "expired"].includes(reservation.status)) {
+        await reconcileAssistantAction(reservation.id, reservation.status);
+      }
+      fail(409, "PAYMENT_ATTEMPT_CLOSED", "Start a new payment attempt for this appointment");
+    }
+
     let session;
     try {
       if (reservation.provider_order_id) {
         session = await stripe.retrieveCheckoutSession(reservation.provider_order_id);
         validateSession(reservation, session);
         if (session.status !== "open") {
-          if (session.status === "expired") await processSession(reservation, session, null);
+          if (session.status === "expired") {
+            const outcome = await processSession(reservation, session, null);
+            if (outcome?.status) await reconcileAssistantAction(reservation.id, outcome.status);
+          }
           fail(409, "PAYMENT_SESSION_CLOSED", "This Checkout Session is no longer open");
         }
       } else {
@@ -355,7 +379,7 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
         if (!inserted.rows[0]) return { duplicate: true };
       }
       const result = await client.query(
-        `SELECT p.id, p.status, p.provider_order_id, p.provider_payment_id, p.amount::text AS amount,
+        `SELECT p.id, p.status, p.provider_order_id, p.provider_payment_id, p.idempotency_key, p.amount::text AS amount,
                 p.currency, p.appointment_id, p.slot_hold_id, h.patient_id,
                 h.availability_id, h.reason, h.status AS hold_status
          FROM payments p LEFT JOIN appointment_slot_holds h ON h.id = p.slot_hold_id
@@ -378,6 +402,12 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
         fail(409, "PAYMENT_INTENT_MISMATCH", "The Checkout Session PaymentIntent does not match this payment");
       }
       if (current.appointment_id) {
+        await client.query(
+          `UPDATE assistant_action_intents SET status = 'completed',
+             execution_lease_until = NULL, execution_lease_token = NULL
+           WHERE id::text = $1 AND action_type = 'book'
+             AND status IN ('executing', 'checkout_pending', 'failed')`, [current.idempotency_key],
+        );
         if (event) await client.query("UPDATE payment_provider_events SET processed_at = NOW() WHERE provider = 'stripe' AND provider_event_id = $1", [event.id]);
         const appointment = await appointmentService.readAppointmentDetails(client, current.appointment_id);
         return { status: "confirmed", appointment, created: false };
@@ -404,11 +434,23 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
         if (!(error instanceof appointmentService.AppointmentError) || !["SLOT_UNAVAILABLE", "SLOT_CAPACITY_REACHED"].includes(error.code)) throw error;
         await client.query("UPDATE appointment_slot_holds SET status = 'expired', updated_at = NOW() WHERE id = $1 AND status IN ('active', 'consumed')", [current.slot_hold_id]);
         const reconciliationId = await recordReconciliation(client, current, session, event?.id ?? null, "slot_unavailable");
+        await client.query(
+          `UPDATE assistant_action_intents SET status = 'failed',
+             execution_lease_until = NULL, execution_lease_token = NULL
+           WHERE id::text = $1 AND action_type = 'book'
+             AND status IN ('executing', 'checkout_pending')`, [current.idempotency_key],
+        );
         if (event) await client.query("UPDATE payment_provider_events SET processed_at = NOW() WHERE provider = 'stripe' AND provider_event_id = $1", [event.id]);
         return { status: "captured_slot_unavailable", reconciliation_id: reconciliationId };
       });
       if (appointment?.status === "captured_slot_unavailable") return appointment;
       await client.query("UPDATE payments SET appointment_id = $2, slot_hold_id = NULL, updated_at = NOW() WHERE id = $1", [current.id, appointment.id]);
+      await client.query(
+        `UPDATE assistant_action_intents SET status = 'completed',
+           execution_lease_until = NULL, execution_lease_token = NULL
+         WHERE id::text = $1 AND action_type = 'book'
+           AND status IN ('executing', 'checkout_pending', 'failed')`, [current.idempotency_key],
+      );
       if (event) await client.query("UPDATE payment_provider_events SET processed_at = NOW() WHERE provider = 'stripe' AND provider_event_id = $1", [event.id]);
       return { status: "confirmed", appointment, created: true };
     });
@@ -485,7 +527,7 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
 
   async function paymentBySession(database, sessionId) {
     const result = await database.query(
-      `SELECT p.id, p.status, p.provider_order_id, p.provider_payment_id,
+      `SELECT p.id, p.status, p.provider_order_id, p.provider_payment_id, p.idempotency_key,
               p.amount::text AS amount, p.currency, p.appointment_id, p.slot_hold_id,
               h.id AS hold_id, COALESCE(h.patient_id, a.patient_id) AS patient_id,
               COALESCE(h.availability_id, a.availability_id) AS availability_id,
@@ -520,6 +562,9 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
       fail(400, "PAYMENT_SESSION_MISMATCH", "The Stripe Checkout Session does not match this payment");
     }
     const result = await processSession(payment, session, { id: event.id, type: event.type });
+    if (!result.duplicate && payment.idempotency_key) {
+      await reconcileAssistantAction(payment.id, result.status);
+    }
     if (result.duplicate) return result;
     return { status: result.status, reconciliation_id: result.reconciliation_id };
   }
@@ -677,4 +722,4 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
   };
 }
 
-module.exports = { PaymentError, createPaymentService };
+module.exports = { PaymentError, createPaymentService, stripeMinorUnits };
