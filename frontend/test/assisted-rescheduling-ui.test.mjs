@@ -7,6 +7,17 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 describe("assisted rescheduling patient navigation", () => {
+  it("renders the suggested-change section only for a matching active patient request", () => {
+    const source = fs.readFileSync(path.join(root, "components/patient-appointments-page.tsx"), "utf8");
+    assert.match(source, /const hasActiveAssistedRequest = Boolean\(!assistedLoading && activeAssistedRequestTargetId && assistedRequest/);
+    assert.match(source, /assistedRequest\.status === "pending_patient"/);
+    assert.match(source, /assistedRequest\.suggestions\.length > 0/);
+    assert.match(source, /const activeAssistedRequest = hasActiveAssistedRequest \? assistedRequest : null/);
+    assert.match(source, /\{activeAssistedRequest \? <section ref=\{assistedSectionRef\}/);
+    assert.doesNotMatch(source, /\(appointmentFromNotification \|\| assistedTargetAppointmentId \|\| assistedRequest\) \? <section/);
+    assert.match(source, /getPatientAssistedRequest\(token, assistedTargetAppointmentId\)/);
+  });
+
   it("loads requests from the retained appointment target independently of URL cleanup", () => {
     const source = fs.readFileSync(path.join(root, "components/patient-appointments-page.tsx"), "utf8");
     const requestEffect = source.match(/useEffect\(\(\) => \{\s*if \(!assistedTargetAppointmentId\) return;[\s\S]*?\}, \[assistedTargetAppointmentId,[^\]]*assistedReload\]\);/);
@@ -38,7 +49,6 @@ describe("assisted rescheduling patient navigation", () => {
     assert.match(handler[0], /status: "superseded"/);
     assert.match(handler[0], /setAssistedSlots\(\[\]\)/);
     assert.match(handler[0], /setAssistedReload\(\(value\) => value \+ 1\)/);
-    assert.match(source, /assistedRequest\.status === "superseded" \? "This request was superseded because the appointment was rescheduled\./);
   });
 
   it("only keeps saved suggestions whose complete identity and current capacity still match", () => {

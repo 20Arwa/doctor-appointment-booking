@@ -35,6 +35,12 @@ describe("canonical patient assistant intent model", () => {
     assert.equal(recognizeCanonicalIntent("Can I get my money back?").category, "refund_preview");
   });
 
+  it("classifies payment history separately from appointment specific refund previews", () => {
+    assert.equal(recognizeCanonicalIntent("Show my payment history").category, "payment_history");
+    assert.equal(recognizeCanonicalIntent("List my payment and refund records").category, "payment_history");
+    assert.equal(recognizeCanonicalIntent("What refund applies to my appointment?").category, "refund_preview");
+  });
+
   it("uses deterministic precedence for mixed intents and carries history filters with the canonical route", () => {
     const cases = [
       ["Can you cancel my previous appointment and tell me the refund?", "refund_preview", { view: "past", scope: "last" }],

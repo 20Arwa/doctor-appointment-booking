@@ -41,7 +41,7 @@ export function shouldShowHistoryRecovery(errorCode: string | null | undefined):
 }
 
 export function getAssistantResultRows(result: AssistantResult): unknown[] {
-  const rows = result.data.appointments || result.data.doctors || result.data.slots
+  const rows = result.data.appointments || result.data.items || result.data.doctors || result.data.slots
     || result.data.schedules || result.data.exceptions || result.data.conflicts;
   return Array.isArray(rows) ? rows : [];
 }
@@ -57,6 +57,7 @@ export function isNearMessageListTop(scrollTop: number): boolean {
 export function getVisibleAssistantResults(content: string, results: AssistantResult[] = []): AssistantResult[] {
   if (/\b(?:I can(?:not|['’]t)|I['’]?m unable|I am unable|I will not|I won['’]?t)\b/i.test(content)) return [];
   const visible = results.filter((result) => getAssistantResultRows(result).some((row) => row !== null && typeof row === "object")
+    || result.tool === "get_patient_payment_history"
     || result.tool.startsWith("get_doctor_") && typeof result.data.notice === "string");
   if (visible.some((result) => result.tool === "get_available_slots")) return visible.filter((result) => result.tool !== "search_doctors");
   return visible;
@@ -65,6 +66,8 @@ export function getVisibleAssistantResults(content: string, results: AssistantRe
 export function getAssistantDisplayContent(content: string, results: AssistantResult[] = []): string {
   const visible = getVisibleAssistantResults(content, results);
   if (!visible.length) return content;
+  if (visible.some((result) => result.tool === "get_available_slots")
+      && /\b(?:exact\s+(?:requested\s+)?(?:date\s+and\s+)?time|requested\s+\d{1,2}(?::\d{2})?\s*(?:AM|PM)?\s+time)\s+(?:is|was)\s+not\s+available\b/i.test(content)) return content;
   if (visible.length === 1 && ["get_available_slots", "get_doctor_nearest_slots"].includes(visible[0].tool)) {
     const count = getAssistantResultRows(visible[0]).length;
     return `Here are the ${count} earliest available option${count === 1 ? "" : "s"}:`;
@@ -79,6 +82,10 @@ export function getAssistantDisplayContent(content: string, results: AssistantRe
 
 export function preserveScrollAfterPrepend(scrollHeight: number, previousHeight: number, previousTop: number): number {
   return previousTop + scrollHeight - previousHeight;
+}
+
+export function shouldForceScrollAfterAssistantAction(pending: boolean, lastMessageRole: string | undefined, preservingOlderMessages: boolean): boolean {
+  return pending && lastMessageRole === "assistant" && !preservingOlderMessages;
 }
 
 const ASSISTANT_TIME_ZONE = "Asia/Kolkata";

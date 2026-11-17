@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-const resultSchema = z.object({ tool: z.enum(["get_patient_appointments", "search_doctors", "get_available_slots", "prepare_booking_action", "prepare_reschedule_action", "prepare_cancellation_action", "get_cancellation_refund_preview", "get_doctor_schedules", "get_doctor_schedule_exceptions", "get_doctor_schedule_conflicts", "get_doctor_nearest_slots", "get_doctor_appointments", "get_doctor_appointment_statistics"]), data: z.record(z.string(), z.unknown()), ui_actions: z.array(z.record(z.string(), z.unknown())).optional() });
+const resultSchema = z.object({ tool: z.enum(["get_patient_appointments", "search_doctors", "get_available_slots", "prepare_booking_action", "prepare_reschedule_action", "prepare_cancellation_action", "get_cancellation_refund_preview", "get_patient_payment_history", "get_doctor_schedules", "get_doctor_schedule_exceptions", "get_doctor_schedule_conflicts", "get_doctor_nearest_slots", "get_doctor_appointments", "get_doctor_appointment_statistics"]), data: z.record(z.string(), z.unknown()), ui_actions: z.array(z.record(z.string(), z.unknown())).optional() });
 const messageSchema = z.object({ id: z.string(), role: z.enum(["user", "assistant"]), content: z.string(), created_at: z.string().optional(), request_id: z.string().optional(), request_status: z.string().optional(), results: z.array(resultSchema).optional() });
 const conversationSchema = z.object({ id: z.string(), created_at: z.string(), updated_at: z.string(), preview: z.string().nullable().optional() });
 const listSchema = z.object({ items: z.array(conversationSchema) });
@@ -9,7 +9,7 @@ const sentSchema = z.object({ user_message: messageSchema, assistant_message: me
 const actionTypeSchema = z.enum(["book", "reschedule", "cancel"]);
 const actionIntentSchema = z.object({ id: z.string().uuid(), status: z.enum(["pending", "executing", "checkout_pending", "refund_pending", "completed", "failed", "expired"]), expires_at: z.string(), action_type: actionTypeSchema, summary: z.record(z.string(), z.unknown()).optional() });
 const dismissedProposalSchema = z.object({ status: z.literal("dismissed") });
-const actionConfirmationSchema = z.object({ status: z.enum(["pending", "executing", "checkout_pending", "refund_pending", "completed", "failed", "expired"]), checkout_url: z.string().url().optional(), expires_at: z.string().optional(), appointment: z.record(z.string(), z.unknown()).optional(), cancellation_status: z.string().optional(), refund_status: z.string().optional(), amount: z.string().optional(), currency: z.string().optional(), payment_status: z.string().optional(), replayed: z.boolean().optional() });
+const actionConfirmationSchema = z.object({ status: z.enum(["pending", "executing", "checkout_pending", "refund_pending", "completed", "failed", "expired"]), reason: z.string().optional(), checkout_url: z.string().url().optional(), expires_at: z.string().optional(), appointment: z.record(z.string(), z.unknown()).optional(), cancellation_status: z.string().optional(), refund_status: z.string().optional(), amount: z.string().optional(), currency: z.string().optional(), payment_status: z.string().optional(), replayed: z.boolean().optional() });
 
 export type AssistantResult = z.infer<typeof resultSchema>;
 export type StoredAssistantMessage = z.infer<typeof messageSchema>;
@@ -23,12 +23,24 @@ async function request<T>(token: string, path: string, init: RequestInit, schema
   const base = process.env.NEXT_PUBLIC_API_URL?.trim().replace(/\/+$/, "");
   if (!base) throw new AssistantApiError(0, "The backend API URL is not configured.");
   let response: Response;
+  let timedOut = false;
+  const requestController = new AbortController();
+  const timeoutId = setTimeout(() => { timedOut = true; requestController.abort(); }, 20_000);
   try {
-    response = await fetch(`${base}/api/v1/assistant${path}`, { ...init, cache: "no-store", headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...init.headers } });
-  } catch { throw new AssistantApiError(0, "We couldn't reach Medrella. Check your connection and try again."); }
-  if (response.status === 204) return undefined as T;
+    response = await fetch(`${base}/api/v1/assistant${path}`, { ...init, signal: requestController.signal, cache: "no-store", headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...init.headers } });
+  } catch {
+    clearTimeout(timeoutId);
+    if (timedOut) throw new AssistantApiError(408, "This request took too long. Check the conversation status and try again.", "REQUEST_TIMEOUT");
+    throw new AssistantApiError(0, "We couldn't reach Medrella. Check your connection and try again.");
+  }
+  if (response.status === 204) { clearTimeout(timeoutId); return undefined as T; }
   let payload: unknown;
-  try { payload = await response.json(); } catch { throw new AssistantApiError(response.status, "The assistant returned an unexpected response. Please try again."); }
+  try { payload = await response.json(); } catch {
+    clearTimeout(timeoutId);
+    if (timedOut) throw new AssistantApiError(408, "This request took too long. Check the conversation status and try again.", "REQUEST_TIMEOUT");
+    throw new AssistantApiError(response.status, "The assistant returned an unexpected response. Please try again.");
+  }
+  clearTimeout(timeoutId);
   if (!response.ok) {
     const parsed = z.object({ error: z.object({ code: z.string().optional(), message: z.string().optional() }).optional() }).safeParse(payload);
     const code = parsed.success ? parsed.data.error?.code : undefined;
@@ -47,6 +59,7 @@ async function request<T>(token: string, path: string, init: RequestInit, schema
       SLOT_CAPACITY_REACHED: "That appointment time has just filled. Ask the assistant to find another time.",
       APPOINTMENT_STATE_CONFLICT: "This appointment has changed and can no longer be updated from this proposal.",
       BOOKING_CONFIRMATION_STALE: "The booking details changed. Ask the assistant to prepare the booking again.",
+      BOOKING_ALREADY_EXISTS: "You already have a confirmed appointment with this doctor at that time. No new booking was created.",
     };
     throw new AssistantApiError(response.status, (code && safeMessages[code]) || "The assistant couldn't respond. Please try again.", code);
   }

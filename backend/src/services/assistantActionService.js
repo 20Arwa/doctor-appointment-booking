@@ -58,7 +58,24 @@ async function transaction(database, operation) {
 }
 
 function createAssistantActionService({ database, paymentService, appointments = appointmentService, timeZone = "Asia/Kolkata" }) {
-  async function validateSlot(client, availabilityId) {
+  async function hasConfirmedBookingForSlot(client, user, availabilityId) {
+    const result = await client.query(
+      `SELECT 1
+       FROM appointments existing
+       JOIN patients patient ON patient.id = existing.patient_id
+       JOIN availability booked_slot ON booked_slot.id = existing.availability_id
+       JOIN availability selected_slot ON selected_slot.id = $2
+       WHERE patient.user_id = $1 AND existing.status = 'confirmed'
+         AND booked_slot.doctor_id = selected_slot.doctor_id
+         AND existing.scheduled_date = selected_slot.date
+         AND existing.scheduled_start_time = selected_slot.start_time
+       LIMIT 1`,
+      [user.id, availabilityId],
+    );
+    return Boolean(result.rows[0]);
+  }
+
+  async function validateSlot(client, availabilityId, patientUser = null) {
     const result = await client.query(
       `SELECT av.id, av.doctor_id, av.date::text AS date,
               av.start_time::text AS start_time, av.end_time::text AS end_time,
@@ -72,6 +89,9 @@ function createAssistantActionService({ database, paymentService, appointments =
     );
     const slot = result.rows[0];
     if (!slot || slot.deleted_at || slot.booking_visibility !== "public") fail("SLOT_UNAVAILABLE", 409, "This slot is no longer available");
+    if (patientUser && await hasConfirmedBookingForSlot(client, patientUser, availabilityId)) {
+      fail("BOOKING_ALREADY_EXISTS", 409, "You already have a confirmed appointment with this doctor at that time.");
+    }
     const occupied = await appointments.countOccupiedPlaces(client, availabilityId);
     if (occupied >= Number(slot.capacity || 1)) fail("SLOT_CAPACITY_REACHED", 409, "This slot has reached capacity");
     return { ...slot, remaining_capacity: Number(slot.capacity || 1) - occupied };
@@ -131,7 +151,7 @@ function createAssistantActionService({ database, paymentService, appointments =
     let summary;
     let storedArgs = args;
     if (actionType === "book") {
-      const slot = await validateSlot(database, args.availability_id);
+      const slot = await validateSlot(database, args.availability_id, user);
       const preparedFeeMinor = stripeMinorUnits(slot.consultation_fee);
       storedArgs = { ...args, prepared_fee_minor: preparedFeeMinor };
       summary = { date: slot.date, start_time: slot.start_time, end_time: slot.end_time, doctor: `Dr. ${slot.doctor_first_name} ${slot.doctor_last_name}`.trim(), specialty: slot.specialty, consultation_fee: (preparedFeeMinor / 100).toFixed(2), currency: "INR", mode: slot.mode || "legacy", capacity: Number(slot.capacity || 1), remaining_capacity: slot.remaining_capacity };
@@ -334,7 +354,21 @@ function createAssistantActionService({ database, paymentService, appointments =
       return { status: "completed", appointment: { id: appointment.id, date: appointment.date, start_time: appointment.start_time } };
     }
     if (current.action_type === "book") {
-      intent = await transaction(database, (client) => claim(client, user, conversationId, intentId, token));
+      intent = await transaction(database, async (client) => {
+        const row = await claim(client, user, conversationId, intentId, token);
+        if (row.status !== "pending" && row.status !== "executing") return row;
+        if (await hasConfirmedBookingForSlot(client, user, row.action_args.availability_id)) {
+          const failed = await client.query(
+            `UPDATE assistant_action_intents
+             SET status = 'failed', execution_lease_until = NULL, execution_lease_token = NULL
+             WHERE id = $1 AND execution_lease_token = $2 RETURNING id`, [intentId, token],
+          );
+          if (!failed.rows[0]) fail("ACTION_LEASE_LOST", 409, "The action lease changed; retry to retrieve its status");
+          return { ...row, status: "failed", reason: "duplicate_booking" };
+        }
+        return row;
+      });
+      if (intent.reason === "duplicate_booking") return { status: "failed", reason: "duplicate_booking" };
       if (intent.status === "expired") fail("ACTION_EXPIRED", 409, "This confirmation has expired");
       if (!["pending", "executing", "checkout_pending"].includes(intent.status)) return { status: intent.status };
       if (!Number.isSafeInteger(intent.action_args.prepared_fee_minor)) {

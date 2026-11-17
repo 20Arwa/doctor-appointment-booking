@@ -13,7 +13,7 @@ function loadTs(relativePath) {
   loadedModule._compile(ts.transpileModule(fs.readFileSync(filename, "utf8"), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, baseUrl: projectRoot, paths: { "@/*": ["./*"] } } }).outputText, filename);
   return loadedModule.exports;
 }
-const { assistantMessageDateKey, assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, classifyAssistantError, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery, retryOperation } = loadTs("lib/assistant-chat-state.ts");
+const { assistantMessageDateKey, assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, classifyAssistantError, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, shouldForceScrollAfterAssistantAction, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery, retryOperation } = loadTs("lib/assistant-chat-state.ts");
 const { dateNavigationTarget } = loadTs("lib/date-format.ts");
 const { AssistantApiError, confirmAssistantAction, dismissAssistantProposal, getAssistantActionStatus, getAssistantConversation, listAssistantConversations, prepareAssistantAction, sendAssistantMessage } = loadTs("lib/assistant-api.ts");
 const { confirmationStatus, isProposalExpired, preserveDismissalOnPrepare, proposalDescription, proposalStatusFromBackend, proposalTitle, proposalTypeForResult, reconcileActionStatus } = loadTs("lib/assistant-action-state.ts");
@@ -119,6 +119,7 @@ describe("patient assistant chat", () => {
     assert.equal(confirmationStatus("refund_pending"), "refund_pending");
     assert.equal(confirmationStatus("executing"), "failed");
     assert.equal(proposalStatusFromBackend("completed", "2099-01-01T00:00:00Z"), "completed");
+    assert.equal(proposalStatusFromBackend("executing", "2099-01-01T00:00:00Z"), "processing");
     assert.equal(proposalStatusFromBackend("checkout_pending", "2000-01-01T00:00:00Z"), "checkout_pending");
     assert.equal(proposalStatusFromBackend("expired", "2099-01-01T00:00:00Z"), "expired");
     assert.equal(isProposalExpired("2026-11-15T12:00:00Z", Date.parse("2026-11-15T12:00:01Z")), true);
@@ -130,6 +131,11 @@ describe("patient assistant chat", () => {
     assert.match(component, /Your appointment is not confirmed yet/);
     assert.match(component, /if \(!intent \|\| inFlight\.current/);
     assert.match(component, /status === "pending" && isProposalExpired\(intent\.expires_at\)/);
+    assert.match(component, /outcome\.reason === "duplicate_booking"/);
+    assert.match(component, /Your confirmation is still processing/);
+    assert.doesNotMatch(component, /status === "processing"[^\n]*animate-spin/);
+    const api = fs.readFileSync(path.join(projectRoot, "lib/assistant-api.ts"), "utf8");
+    assert.match(api, /setTimeout\(\(\) => \{ timedOut = true; requestController\.abort\(\); \}, 20_000\)/);
   });
 
   it("shows confirmation-specific copy and no proposal controls for a backend-completed booking", () => {
@@ -418,7 +424,8 @@ describe("patient assistant chat", () => {
     assert.match(availability, /schedule-slot-\$\{selectedDate\}/);
     assert.match(chat, /function AssistantResultsCta/);
     assert.match(chat, /function resultRowHref/);
-    assert.match(chat, /result\.tool === "get_available_slots"[\s\S]*action\.type === "slot"[\s\S]*\?slot=\$\{encodeURIComponent\(action\.availability_id\)\}&date=\$\{encodeURIComponent\(item\.date\)\}/);
+    assert.doesNotMatch(chat, /result\.tool === "get_available_slots"[\s\S]*\?slot=\$\{encodeURIComponent\(action\.availability_id\)\}/);
+    assert.match(chat, /Book slot \$\{index \+ 1\}/);
     assert.match(chat, /Choose this time/);
     assert.doesNotMatch(chat, /Choose an available time/);
     assert.match(chat, /result\.tool === "get_patient_appointments"[\s\S]*action\.type === "appointment"[\s\S]*\/patient\/appointments\?appointment=\$\{encodeURIComponent\(action\.appointment_id\)\}/);
@@ -473,12 +480,27 @@ describe("patient assistant chat", () => {
     assert.deepEqual(getVisibleAssistantResults("Here is the verified refund preview.", [refund]), []);
   });
 
+  it("renders payment history rows while keeping identifiers and receipt links out of assistant results", () => {
+    const payments = { tool: "get_patient_payment_history", data: { items: [{ amount: "500.00", currency: "INR", status: "partially_refunded", date: "2027-01-01", appointment: { date: "2027-01-02", doctor: { name: "Dr. Dee Doctor" } }, refunds: [{ amount: "100.00", currency: "INR", status: "processed" }] }] } };
+    assert.equal(getAssistantResultRows(payments).length, 1);
+    assert.deepEqual(getVisibleAssistantResults("Your recent payment was partially refunded.", [payments]), [payments]);
+    const api = fs.readFileSync(path.join(projectRoot, "lib/assistant-api.ts"), "utf8");
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(api, /"get_patient_payment_history"/);
+    assert.match(chat, /result\.tool === "get_patient_payment_history"/);
+    assert.match(chat, /paymentAppointment\.date/);
+    assert.match(chat, /paymentDoctor\?\.name/);
+    assert.match(chat, /href="\/patient\/payments">View full payment history/);
+  });
+
   it("replaces verbose result narration with one contextual sentence and suppresses duplicate doctor cards", () => {
     const appointments = { tool: "get_patient_appointments", data: { appointments: [{ date: "2026-11-13", start_time: "10:00", end_time: "13:00", doctor: { name: "Dr. Ali Ahmed" } }] } };
     const doctors = { tool: "search_doctors", data: { doctors: [{ name: "Dr. Ali Ahmed", specialty: "General Practice" }] } };
     const slots = { tool: "get_available_slots", data: { slots: Array.from({ length: 5 }, (_, index) => ({ date: `2026-11-${13 + index}`, start_time: "10:00", end_time: "13:00", mode: "stream" })) } };
     assert.equal(getAssistantDisplayContent("Your appointment with Dr. Ali Ahmed is November 13 from 10 AM to 1 PM.", [appointments]), "Here is your appointment:");
     assert.equal(getAssistantDisplayContent("I found five slots: ...details repeated...", [doctors, slots]), "Here are the 5 earliest available options:");
+    const exactUnavailable = "The requested 9:00 AM time is not available with Dr. James Wilson. Here are other available times on 2027-01-15. Choose one to prepare a booking proposal.";
+    assert.equal(getAssistantDisplayContent(exactUnavailable, [{ tool: "get_available_slots", data: { slots: [{ date: "2027-01-15", start_time: "11:30:00" }] } }]), exactUnavailable);
     assert.equal(getVisibleAssistantResults("Here are options.", [doctors, slots]).length, 1);
     assert.equal(getAssistantDisplayContent("Thanks for explaining how availability works.", []), "Thanks for explaining how availability works.");
   });
@@ -497,6 +519,9 @@ describe("patient assistant chat", () => {
     assert.equal(isNearMessageListTop(40), true);
     assert.equal(isNearMessageListTop(120), false);
     assert.equal(preserveScrollAfterPrepend(1600, 1200, 20), 420);
+    assert.equal(shouldForceScrollAfterAssistantAction(true, "assistant", false), true);
+    assert.equal(shouldForceScrollAfterAssistantAction(true, "user", false), false);
+    assert.equal(shouldForceScrollAfterAssistantAction(true, "assistant", true), false);
     const current = chatReducer(initialChatState, { type: "restore", messages: [
       { id: "user-id", requestId: "stable-request", role: "user", content: "Recent question" },
       { id: "assistant-id", role: "assistant", content: "Recent answer" },
@@ -701,6 +726,9 @@ describe("patient assistant chat", () => {
     assert.match(chat, /element\.scrollTo\(\{ top: element\.scrollHeight, behavior:/);
     assert.match(chat, /prefers-reduced-motion: reduce/);
     assert.match(chat, /prependAnchor\.current = \{ scrollHeight: container\.scrollHeight, scrollTop: container\.scrollTop \}/);
+    assert.match(chat, /if \(prependAnchor\.current\) \{[\s\S]*?prependAnchor\.current = null;\s*return;/);
+    assert.match(chat, /shouldForceScrollAfterAssistantAction\(scrollAfterAssistantAction\.current, state\.messages\.at\(-1\)\?\.role, false\)/);
+    assert.match(chat, /scrollAfterAssistantAction\.current = true/);
     assert.match(chat, /isNearMessageListBottom\(element\.scrollHeight, element\.clientHeight, element\.scrollTop\)/);
   });
 });

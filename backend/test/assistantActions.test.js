@@ -9,7 +9,7 @@ const intentId = "44444444-4444-4444-8444-444444444444";
 const availabilityId = "55555555-5555-4555-8555-555555555555";
 
 function mockDatabase({ expiry = new Date(Date.now() + 60_000) } = {}) {
-  const state = { intent: null, otherIntents: [], lease: Promise.resolve(), calls: [], slotAvailable: false, toolResults: [] };
+  const state = { intent: null, otherIntents: [], lease: Promise.resolve(), calls: [], slotAvailable: false, duplicateBooking: false, toolResults: [] };
   const execute = async (sql, values = []) => {
     state.calls.push({ sql, values });
     if (sql === "BEGIN") {
@@ -20,6 +20,7 @@ function mockDatabase({ expiry = new Date(Date.now() + 60_000) } = {}) {
       return { rows: [], release };
     }
     if (sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] };
+    if (sql.includes("FROM appointments existing")) return { rows: state.duplicateBooking ? [{ exists: 1 }] : [] };
     if (sql.includes("SELECT av.id, av.doctor_id")) return { rows: state.slotAvailable ? [{ id: availabilityId, doctor_id: "66666666-6666-4666-8666-666666666666", date: "2099-01-01", start_time: "09:00:00", end_time: "09:30:00", mode: "wave", capacity: 2, booking_visibility: "public", deleted_at: null, consultation_fee: "500.005", doctor_first_name: "Dee", doctor_last_name: "Doctor", specialty: "General Practice" }] : [] };
     if (sql.includes("COUNT(DISTINCT reservation.patient_id)")) return { rows: [{ occupied: 0 }] };
     if (sql.includes("UPDATE assistant_action_intents SET status = 'expired'") && sql.includes("expires_at <= NOW()")) {
@@ -57,6 +58,11 @@ function mockDatabase({ expiry = new Date(Date.now() + 60_000) } = {}) {
     if (sql.includes("SET status = 'completed', execution_lease_until = NULL")) {
       if (state.intent.execution_lease_token !== values[1]) return { rows: [], rowCount: 0 };
       Object.assign(state.intent, { status: "completed", execution_lease_until: null, execution_lease_token: null });
+      return { rows: [{ id: intentId }], rowCount: 1 };
+    }
+    if (sql.includes("SET status = 'failed', execution_lease_until = NULL")) {
+      if (state.intent.execution_lease_token !== values[1]) return { rows: [], rowCount: 0 };
+      Object.assign(state.intent, { status: "failed", execution_lease_until: null, execution_lease_token: null });
       return { rows: [{ id: intentId }], rowCount: 1 };
     }
     if (sql.includes("SET execution_lease_until = clock_timestamp()")) {
@@ -384,5 +390,25 @@ describe("patient assistant action intents", () => {
     assert.deepEqual(storedArgs.__assistant_summary, prepared.summary);
     const status = await service.intentView(user, conversationId, intentId);
     assert.deepEqual(status.summary, prepared.summary);
+  });
+
+  it("blocks duplicate booking during proposal preparation and rechecks before checkout", async () => {
+    const { database, state } = mockDatabase();
+    state.slotAvailable = true;
+    state.duplicateBooking = true;
+    state.toolResults = [proposalEvidence("book", { availability_id: availabilityId })];
+    const paymentCalls = [];
+    const service = createAssistantActionService({ database, paymentService: { createCheckoutSession: async (...args) => { paymentCalls.push(args); return { checkout_url: "https://checkout.example.test/session" }; } } });
+    await assert.rejects(service.prepare(user, conversationId, messageId, "book", { availability_id: availabilityId }), { code: "BOOKING_ALREADY_EXISTS" });
+    assert.equal(state.intent, null);
+
+    state.duplicateBooking = false;
+    state.intent = { id: intentId, user_id: user.id, conversation_id: conversationId, assistant_message_id: messageId, action_type: "book", action_args: { availability_id: availabilityId, prepared_fee_minor: 50000 }, status: "pending", expires_at: new Date(Date.now() + 60_000), execution_lease_until: null, execution_lease_token: null };
+    state.duplicateBooking = true;
+    const outcome = await service.confirm(user, conversationId, intentId);
+    assert.equal(outcome.status, "failed");
+    assert.equal(outcome.reason, "duplicate_booking");
+    assert.equal(state.intent.status, "failed");
+    assert.deepEqual(paymentCalls, []);
   });
 });

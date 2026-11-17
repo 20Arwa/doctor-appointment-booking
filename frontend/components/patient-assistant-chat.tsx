@@ -8,7 +8,7 @@ import { useRouter } from "next/navigation";
 import { getDoctorAppointmentPatientId } from "@/lib/profile-api";
 import { Button } from "@/components/ui/button";
 import { AssistantApiError, confirmAssistantAction, createAssistantConversation, dismissAssistantProposal, getAssistantActionStatus, getAssistantConversation, listAssistantConversations, prepareAssistantAction, sendAssistantMessage, type AssistantActionIntent, type AssistantActionType, type AssistantConversation, type AssistantResult } from "@/lib/assistant-api";
-import { assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, retryOperation, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery } from "@/lib/assistant-chat-state";
+import { assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, retryOperation, shouldForceScrollAfterAssistantAction, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery } from "@/lib/assistant-chat-state";
 import { isProposalExpired, proposalDescription, proposalStatusFromBackend, proposalTitle, proposalTypeForResult, reconcileActionStatus, type ProposalStatus } from "@/lib/assistant-action-state";
 
 function displayTime(value: unknown) {
@@ -44,10 +44,6 @@ function resultRowHref(result: AssistantResult, index: number, doctorMode: boole
     }
     return null;
   }
-  if (result.tool === "get_available_slots" && action.type === "slot"
-    && typeof action.doctor_id === "string" && typeof action.availability_id === "string" && typeof item.date === "string") {
-    return `/patient/doctors/${encodeURIComponent(action.doctor_id)}?slot=${encodeURIComponent(action.availability_id)}&date=${encodeURIComponent(item.date)}`;
-  }
   if (result.tool === "search_doctors" && action.type === "doctor" && typeof action.doctor_id === "string") {
     return `/patient/doctors/${encodeURIComponent(action.doctor_id)}`;
   }
@@ -65,16 +61,19 @@ function resultRowActionLabel(result: AssistantResult, doctorMode: boolean) {
   return "View appointment";
 }
 
-function ResultCards({ result, doctorMode }: { result: AssistantResult; doctorMode: boolean }) {
+function ResultCards({ result, doctorMode, onSelectSlot, onSelectAppointment }: { result: AssistantResult; doctorMode: boolean; onSelectSlot?: (index: number) => void; onSelectAppointment?: (index: number) => void }) {
   const { getToken } = useAuth();
   const router = useRouter();
   const rows = getAssistantResultRows(result);
   const doctorTool = result.tool.startsWith("get_doctor_");
-  if (!rows.length) return doctorTool ? <p className="mt-2 text-sm text-muted-foreground">No matching records were found for this range.{typeof result.data.notice === "string" ? ` ${result.data.notice}` : ""}</p> : null;
+  if (!rows.length) return result.tool === "get_patient_payment_history" ? <p className="mt-2 text-sm text-muted-foreground">No payment records were found.</p> : doctorTool ? <p className="mt-2 text-sm text-muted-foreground">No matching records were found for this range.{typeof result.data.notice === "string" ? ` ${result.data.notice}` : ""}</p> : null;
   return <div><ul className="mt-3 grid gap-2 sm:grid-cols-2">{rows.map((entry, index) => {
     if (!entry || typeof entry !== "object") return null;
     const item = entry as Record<string, unknown>; const doctor = item.doctor as Record<string, unknown> | undefined;
-    const title = result.tool === "get_doctor_schedules" ? `${String(item.mode || "Doctor")} schedule`
+    const paymentAppointment = item.appointment as Record<string, unknown> | undefined;
+    const paymentDoctor = paymentAppointment?.doctor as Record<string, unknown> | undefined;
+    const title = result.tool === "get_patient_payment_history" && typeof paymentDoctor?.name === "string" ? paymentDoctor.name
+      : result.tool === "get_doctor_schedules" ? `${String(item.mode || "Doctor")} schedule`
       : result.tool === "get_doctor_schedule_exceptions" ? String(item.exception_type || "Schedule exception").replaceAll("_", " ")
         : result.tool === "get_doctor_schedule_conflicts" ? "Scheduling conflict"
           : typeof doctor?.name === "string" ? doctor.name : typeof item.name === "string" ? item.name
@@ -93,6 +92,11 @@ function ResultCards({ result, doctorMode }: { result: AssistantResult; doctorMo
       {result.tool === "get_available_slots" && item.mode === "legacy" ? <p className="mt-1 font-medium text-foreground">Legacy availability</p> : null}
       {date ? <p className="mt-1 flex items-center gap-1 text-muted-foreground"><Clock3 aria-hidden="true" className="size-3.5" />{date} · {displayTime(item.start_time)}–{displayTime(item.end_time)}</p> : null}
       {typeof item.consultation_fee === "number" ? <p className="mt-1 text-xs text-muted-foreground">Consultation fee: ₹{item.consultation_fee.toLocaleString("en-IN")}</p> : null}
+      {result.tool === "get_patient_payment_history" ? <>
+        <p className="mt-1 text-sm text-muted-foreground">Payment: {String(item.status || "unknown")} · {String(item.currency || "INR")} {String(item.amount || "")}</p>
+        {paymentAppointment ? <p className="mt-1 text-xs text-muted-foreground">Appointment{typeof paymentAppointment.date === "string" ? ` · ${dateLabel(paymentAppointment.date)}` : ""}{typeof paymentAppointment.start_time === "string" ? ` at ${displayTime(paymentAppointment.start_time)}` : ""}{typeof paymentDoctor?.name === "string" && !title.includes(paymentDoctor.name) ? ` · ${paymentDoctor.name}` : ""}</p> : null}
+        {Array.isArray(item.refunds) ? (item.refunds as Record<string, unknown>[]).map((refund, refundIndex) => <p key={refundIndex} className="mt-1 text-xs text-muted-foreground">Refund: {String(refund.status || "unknown")} · {String(refund.currency || item.currency || "INR")} {String(refund.amount || "")}</p>) : null}
+      </> : null}
       {typeof item.remaining_capacity === "number" && typeof item.capacity === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.remaining_capacity} of {item.capacity} places remaining{item.mode === "stream" ? " in this window" : " in this slot"}</p> : null}
       {result.tool === "get_doctor_schedules" ? <>
         {typeof item.recurrence_type === "string" ? <p className="mt-1 text-xs capitalize text-muted-foreground">{item.recurrence_type.replaceAll("_", " ")} · {String(item.visibility || "private")} schedule</p> : null}
@@ -102,8 +106,10 @@ function ResultCards({ result, doctorMode }: { result: AssistantResult; doctorMo
       {result.tool === "get_doctor_schedule_exceptions" && Array.isArray(item.periods) ? <p className="mt-1 text-xs text-muted-foreground">{(item.periods as Record<string, unknown>[]).map((period) => `${displayTime(period.start_time)}–${displayTime(period.end_time)}`).join(", ") || "No hours"}</p> : null}
       {result.tool === "get_doctor_schedule_conflicts" && Array.isArray(item.conflicts) ? <p className="mt-1 text-xs text-muted-foreground">{(item.conflicts as unknown[]).map((conflict) => String(conflict).replaceAll("_", " ")).join(" · ")}</p> : null}
       {result.tool === "get_doctor_schedule_conflicts" && typeof item.occupied === "number" && typeof item.remaining_capacity === "number" && typeof item.capacity === "number" ? <p className="mt-1 text-xs text-muted-foreground">{item.occupied} occupied · {item.remaining_capacity} remaining of {item.capacity}</p> : null}
-      {rowHref || appointmentId ? <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border pt-3">
+      {rowHref || appointmentId || (result.tool === "get_available_slots" && onSelectSlot) || (result.tool === "get_patient_appointments" && onSelectAppointment) ? <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border pt-3">
         {rowHref ? <Link className="text-sm font-medium text-primary underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" href={rowHref}>{resultRowActionLabel(result, doctorMode)}</Link> : null}
+          {result.tool === "get_available_slots" && onSelectSlot ? <button type="button" className="text-sm font-medium text-primary underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" onClick={() => onSelectSlot(index)}>{resultRowActionLabel(result, doctorMode)}</button> : null}
+        {result.tool === "get_patient_appointments" && onSelectAppointment ? <button type="button" className="text-sm font-medium text-primary underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" onClick={() => onSelectAppointment(index)}>Select appointment</button> : null}
         {appointmentId ? <button type="button" className="text-sm font-medium text-primary underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring" onClick={async () => { try { const token = await getToken(); if (!token) return; const patientId = await getDoctorAppointmentPatientId(token, appointmentId); router.push(`/doctor/patients/${encodeURIComponent(patientId)}`); } catch { router.push(`/doctor/appointments?appointment=${encodeURIComponent(appointmentId)}`); } }}>View patient</button> : null}
       </div> : null}
     </li>;
@@ -124,7 +130,8 @@ function AssistantResultsCta({ results, doctorMode }: { results: AssistantResult
   if (appointments && !getAssistantResultRows(appointments).some((_row, index) => resultRowHref(appointments, index, false))) {
     return <Link className="mt-3 inline-block text-sm font-medium text-primary underline" href="/patient/appointments">Open My Appointments</Link>;
   }
-  return null;
+  const paymentHistory = results.find(({ tool }) => tool === "get_patient_payment_history");
+  return paymentHistory ? <Link className="mt-3 inline-block text-sm font-medium text-primary underline" href="/patient/payments">View full payment history</Link> : null;
 }
 function ResultIcon({ result }: { result: AssistantResult }) { return result.tool === "search_doctors" ? <Stethoscope aria-hidden="true" className="size-4" /> : <CalendarDays aria-hidden="true" className="size-4" />; }
 
@@ -191,10 +198,12 @@ function AssistantActionProposal({ result, assistantMessageId, conversationId, g
       const next = proposalStatusFromBackend(outcome.status, outcome.expires_at || intent.expires_at);
       setStatus(next);
       if (outcome.checkout_url) setCheckoutUrl(outcome.checkout_url);
-      if (next === "failed") setError("The action could not be completed. Refresh the proposal and try again.");
+      if (outcome.reason === "duplicate_booking") setError("You already have a confirmed appointment with this doctor at that time. No new booking was created.");
+      else if (next === "failed") setError("The action could not be completed. Refresh the proposal and try again.");
       if (next === "expired") setError("This proposal expired. Ask the assistant to prepare it again.");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "We couldn't complete this action. Please try again.");
+      setStatus("processing");
       const latest = await reconcileActionStatus(async () => {
         const token = await getToken();
         if (!token) throw new Error("Session unavailable");
@@ -245,6 +254,7 @@ function AssistantActionProposal({ result, assistantMessageId, conversationId, g
     {status === "pending" ? <div className="mt-4 flex flex-wrap gap-2"><Button type="button" size="sm" disabled={!intent} onClick={() => void confirm()}>Confirm</Button><Button type="button" size="sm" variant="outline" onClick={() => void dismiss()}>Dismiss</Button></div> : null}
     {status === "dismissing" ? <p role="status" className="mt-3 flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Saving dismissal…</p> : null}
     {status === "confirming" ? <p role="status" className="mt-3 flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Confirming with Medrella…</p> : null}
+    {status === "processing" ? <p role="status" className="mt-3 text-sm text-muted-foreground">Your confirmation is still processing. Refresh the conversation shortly to see its status.</p> : null}
     {status === "expired" ? <p className="mt-3 text-sm text-muted-foreground">This proposal expired. Ask the assistant to prepare it again.</p> : null}
     {status === "completed" && !completedBooking ? <p role="status" className="mt-3 flex items-center gap-2 text-sm font-medium text-foreground"><Check aria-hidden="true" className="size-4" />{actionType === "cancel" ? "Cancellation confirmed." : "Appointment rescheduled."}</p> : null}
     {status === "checkout_pending" ? <div role="status" className="mt-3"><p className="text-sm font-medium">Payment is required. Your appointment is not confirmed yet.</p>{checkoutUrl ? <Button asChild size="sm" className="mt-3"><a href={checkoutUrl}>Continue to secure checkout</a></Button> : <Button type="button" size="sm" className="mt-3" onClick={() => void confirm()}>Retrieve secure checkout</Button>}</div> : null}
@@ -272,6 +282,7 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
   const messageList = useRef<HTMLDivElement>(null);
   const nearBottom = useRef(true);
   const prependAnchor = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const scrollAfterAssistantAction = useRef(false);
 
   useLayoutEffect(() => {
     const container = messageList.current;
@@ -280,6 +291,13 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
       const anchor = prependAnchor.current;
       container.scrollTop = preserveScrollAfterPrepend(container.scrollHeight, anchor.scrollHeight, anchor.scrollTop);
       prependAnchor.current = null;
+      return;
+    }
+    if (shouldForceScrollAfterAssistantAction(scrollAfterAssistantAction.current, state.messages.at(-1)?.role, false)) {
+      scrollAfterAssistantAction.current = false;
+      container.scrollTop = container.scrollHeight;
+      nearBottom.current = true;
+      setNearLatest(true);
     } else if (nearBottom.current) {
       container.scrollTop = container.scrollHeight;
     }
@@ -344,7 +362,7 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
       const reply = await sendAssistantMessage(token, conversationId.current, requestId, content);
       setHistoryLoadFailed(false);
       dispatch({ type: "success", requestId, user: { id: reply.user_message.id, requestId, role: "user", content, createdAt: reply.user_message.created_at || new Date().toISOString() }, assistant: { id: reply.assistant_message.id, role: "assistant", content: reply.assistant_message.content, createdAt: reply.assistant_message.created_at || new Date().toISOString(), results: reply.assistant_message.results || [] } });
-    } catch (error) { setDraft((current) => restoreDraftAfterFailedSubmission(current, content)); dispatch({ type: "failure", requestId, message: error instanceof Error ? error.message : "We couldn't get a reply. Please try again.", code: error instanceof AssistantApiError ? error.code : undefined, source: "send" }); }
+    } catch (error) { scrollAfterAssistantAction.current = false; setDraft((current) => restoreDraftAfterFailedSubmission(current, content)); dispatch({ type: "failure", requestId, message: error instanceof Error ? error.message : "We couldn't get a reply. Please try again.", code: error instanceof AssistantApiError ? error.code : undefined, source: "send" }); }
     finally { requestInFlight.current = false; }
   }, [assistantPath, compact, getToken, historyLoadFailed]);
 
@@ -420,6 +438,25 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
     if (failed?.requestId) { setDraft(""); void deliver(failed.requestId, content); return; }
     const requestId = crypto.randomUUID(); dispatch({ type: "submit", message: { requestId, role: "user", content } }); setDraft((current) => current.trim() === content ? "" : current); void deliver(requestId, content);
   }
+  const selectSlot = (index: number, action: "book" | "reschedule") => {
+    const content = action === "reschedule" ? `Reschedule my appointment to slot ${index + 1}` : `Book slot ${index + 1}`;
+    if (state.loading || requestInFlight.current) return;
+    scrollAfterAssistantAction.current = true;
+    const requestId = crypto.randomUUID();
+    dispatch({ type: "submit", message: { requestId, role: "user", content } });
+    void deliver(requestId, content);
+  };
+  const selectAppointment = (index: number, action: "cancel" | "reschedule") => {
+    const ordinal = ["first", "second", "third", "fourth", "fifth"][index];
+    if (state.loading || requestInFlight.current) return;
+    const content = ordinal
+      ? action === "cancel" ? `Cancel the ${ordinal} appointment` : `Reschedule my ${ordinal} appointment`
+      : action === "cancel" ? `Cancel appointment number ${index + 1}` : `Reschedule appointment number ${index + 1}`;
+    scrollAfterAssistantAction.current = true;
+    const requestId = crypto.randomUUID();
+    dispatch({ type: "submit", message: { requestId, role: "user", content } });
+    void deliver(requestId, content);
+  };
   const retry = () => {
     const operation = retryOperation(state.errorSource);
     if (operation === "history" && recoveryTargetId.current) { void openSavedConversation(recoveryTargetId.current); return; }
@@ -451,7 +488,13 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
           {message.role === "assistant" ? <span aria-label="AI assistant" className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><Bot aria-hidden="true" className="size-4" /></span> : <span aria-label={doctorMode ? "Doctor" : "Patient"} className="mb-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-secondary text-secondary-foreground"><UserRound aria-hidden="true" className="size-4" /></span>}
           <div className={`min-w-0 rounded-2xl p-3 ${message.role === "user" ? "rounded-br-md bg-primary text-primary-foreground" : "rounded-bl-md border border-border bg-background text-foreground"}`}>
             {message.role === "assistant" ? <p className="mb-1 text-xs font-semibold opacity-75">Medrella Assistant</p> : null}<p className="whitespace-pre-wrap text-sm leading-6">{message.role === "assistant" ? assistantContentForResults(message.content, message.results || []) : message.content}</p>
-            {message.role === "assistant" ? <>{getVisibleAssistantResults(message.content, message.results).map((result, index) => <section key={`${result.tool}-${index}`} className="mt-3 rounded-xl border border-border bg-card p-3 text-card-foreground"><h3 className="flex items-center gap-2 text-xs font-semibold"><ResultIcon result={result} />{result.tool === "search_doctors" ? "Doctors" : result.tool === "get_available_slots" || result.tool === "get_doctor_nearest_slots" ? "Available times" : result.tool === "get_doctor_schedules" ? "Schedules" : result.tool === "get_doctor_schedule_exceptions" ? "Schedule exceptions" : result.tool === "get_doctor_schedule_conflicts" ? "Scheduling conflicts" : "Appointments"}</h3><ResultCards result={result} doctorMode={doctorMode} /></section>)}<AssistantResultsCta results={getVisibleAssistantResults(message.content, message.results)} doctorMode={doctorMode} /></> : null}
+          {message.role === "assistant" ? <>{getVisibleAssistantResults(message.content, message.results).map((result, index) => {
+            const cancellationSelection = /choose the appointment you want to cancel/i.test(message.content);
+            const rescheduleSelection = /choose which appointment you want to reschedule/i.test(message.content);
+            const pendingAction = cancellationSelection ? "cancel" : rescheduleSelection ? "reschedule" : null;
+            const slotAction = /reschedul/i.test(message.content) ? "reschedule" : "book";
+            return <section key={`${result.tool}-${index}`} className="mt-3 rounded-xl border border-border bg-card p-3 text-card-foreground"><h3 className="flex items-center gap-2 text-xs font-semibold"><ResultIcon result={result} />{result.tool === "search_doctors" ? "Doctors" : result.tool === "get_available_slots" || result.tool === "get_doctor_nearest_slots" ? "Available times" : result.tool === "get_doctor_schedules" ? "Schedules" : result.tool === "get_doctor_schedule_exceptions" ? "Schedule exceptions" : result.tool === "get_doctor_schedule_conflicts" ? "Scheduling conflicts" : result.tool === "get_patient_payment_history" ? "Payment history" : "Appointments"}</h3><ResultCards result={result} doctorMode={doctorMode} onSelectSlot={!doctorMode && result.tool === "get_available_slots" ? (rowIndex) => selectSlot(rowIndex, slotAction) : undefined} onSelectAppointment={!doctorMode && pendingAction && result.tool === "get_patient_appointments" ? (rowIndex) => selectAppointment(rowIndex, pendingAction) : undefined} /></section>;
+          })}<AssistantResultsCta results={getVisibleAssistantResults(message.content, message.results)} doctorMode={doctorMode} /></> : null}
           </div>
           </div>
           <time className={`mt-1 px-10 text-xs text-muted-foreground ${message.role === "user" ? "text-right" : "text-left"}`} dateTime={message.createdAt}>{assistantMessageTimeLabel(message.createdAt)}</time>
