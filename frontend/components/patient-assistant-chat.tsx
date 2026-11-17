@@ -25,9 +25,9 @@ function rememberActiveConversation(audience: "patient" | "doctor", userId: stri
 }
 
 function displayTime(value: unknown) {
-  if (typeof value !== "string") return "";
+  if (typeof value !== "string" || !/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(value)) return "";
   const [hourText, minute] = value.split(":"); const hour = Number(hourText);
-  return Number.isFinite(hour) ? `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}` : value;
+  return `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
 }
 function dateLabel(value: unknown) {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return "";
@@ -74,7 +74,7 @@ function resultRowActionLabel(result: AssistantResult, doctorMode: boolean) {
   return "View appointment";
 }
 
-function ResultCards({ result, doctorMode, onSelectSlot, onSelectAppointment }: { result: AssistantResult; doctorMode: boolean; onSelectSlot?: (index: number) => void; onSelectAppointment?: (index: number) => void }) {
+function ResultCards({ result, doctorMode, compact = false, onSelectSlot, onSelectAppointment }: { result: AssistantResult; doctorMode: boolean; compact?: boolean; onSelectSlot?: (index: number) => void; onSelectAppointment?: (index: number) => void }) {
   const { getToken } = useAuth();
   const router = useRouter();
   const rows = getAssistantResultRows(result);
@@ -89,7 +89,9 @@ function ResultCards({ result, doctorMode, onSelectSlot, onSelectAppointment }: 
     const assistedAppointment = result.tool === "get_doctor_assisted_reschedule_requests" ? item.appointment as Record<string, unknown> | undefined : undefined;
     const currentAppointment = result.tool === "get_doctor_assisted_reschedule_requests" ? item.current_appointment as Record<string, unknown> | undefined : undefined;
     const paymentDoctor = paymentAppointment?.doctor as Record<string, unknown> | undefined;
-    const title = result.tool === "get_patient_payment_history" && typeof paymentDoctor?.name === "string" ? paymentDoctor.name
+    const paymentAppointmentTime = displayTime(paymentAppointment?.start_time);
+    const title = result.tool === "get_doctor_assisted_reschedule_requests" && typeof item.patient_name === "string" ? item.patient_name
+      : result.tool === "get_patient_payment_history" && typeof paymentDoctor?.name === "string" ? paymentDoctor.name
       : result.tool === "get_doctor_schedules" ? `${String(item.mode || "Doctor")} schedule`
       : result.tool === "get_doctor_schedule_exceptions" ? String(item.exception_type || "Schedule exception").replaceAll("_", " ")
         : result.tool === "get_doctor_schedule_conflicts" ? "Scheduling conflict"
@@ -101,7 +103,7 @@ function ResultCards({ result, doctorMode, onSelectSlot, onSelectAppointment }: 
     const rowHref = resultRowHref(result, index, doctorMode);
     const actionAppointmentId = uiAction?.type === "appointment" && typeof uiAction.appointment_id === "string" ? uiAction.appointment_id : null;
     const rowKey = actionAppointmentId ? `appointment-${actionAppointmentId}` : `${String(item.id || item.date || item.name)}-${index}`;
-    return <li key={rowKey} className="rounded-xl border border-border bg-background p-3 text-sm">
+    return <li key={rowKey} className="w-full min-w-0 rounded-xl border border-border bg-background p-3 text-sm">
       <p className="font-semibold text-foreground">{title}</p>
       {typeof item.specialty === "string" ? <p className="mt-1 text-muted-foreground">{item.specialty}</p> : null}
       {["get_available_slots", "get_doctor_nearest_slots"].includes(result.tool) && item.mode === "wave" ? <p className="mt-1 font-medium text-foreground">Available slot · Wave</p> : null}
@@ -112,7 +114,7 @@ function ResultCards({ result, doctorMode, onSelectSlot, onSelectAppointment }: 
       {typeof item.consultation_fee === "number" ? <p className="mt-1 text-xs text-muted-foreground">Consultation fee: ₹{item.consultation_fee.toLocaleString("en-IN")}</p> : null}
       {result.tool === "get_patient_payment_history" ? <>
         <p className="mt-1 text-sm text-muted-foreground">Payment: {String(item.status || "unknown")} · {String(item.currency || "INR")} {String(item.amount || "")}</p>
-        {paymentAppointment ? <p className="mt-1 text-xs text-muted-foreground">Appointment{typeof paymentAppointment.date === "string" ? ` · ${dateLabel(paymentAppointment.date)}` : ""}{typeof paymentAppointment.start_time === "string" ? ` at ${displayTime(paymentAppointment.start_time)}` : ""}{typeof paymentDoctor?.name === "string" && !title.includes(paymentDoctor.name) ? ` · ${paymentDoctor.name}` : ""}</p> : null}
+        {paymentAppointment ? <p className="mt-1 text-xs text-muted-foreground">Appointment{typeof paymentAppointment.date === "string" ? ` · ${dateLabel(paymentAppointment.date)}` : ""}{paymentAppointmentTime ? ` at ${paymentAppointmentTime}` : ""}{typeof paymentDoctor?.name === "string" && !title.includes(paymentDoctor.name) ? ` · ${paymentDoctor.name}` : ""}</p> : null}
         {Array.isArray(item.refunds) ? (item.refunds as Record<string, unknown>[]).map((refund, refundIndex) => <p key={refundIndex} className="mt-1 text-xs text-muted-foreground">Refund: {String(refund.status || "unknown")} · {String(refund.currency || item.currency || "INR")} {String(refund.amount || "")}</p>) : null}
       </> : null}
       {result.tool === "get_doctor_assisted_reschedule_requests" && assistedAppointment ? <>
@@ -645,8 +647,16 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
   voiceSubmitRef.current = (transcript) => { if (!requestInFlight.current && !state.loading) submitContent(transcript); };
   function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); submitContent(draft); }
   const toggleVoice = () => {
-    if (!voice.sessionActive) { voiceEnabledRef.current = true; voice.start(); return; }
-    if (voice.status === "listening") { voice.stop(); voiceEnabledRef.current = false; return; }
+    if (!voice.sessionActive) {
+      voiceEnabledRef.current = true;
+      voice.start();
+      return;
+    }
+    if (voice.status === "listening") {
+      voice.stop();
+      voiceEnabledRef.current = false;
+      return;
+    }
     if (voice.status !== "speaking") voice.resumeAfterResponse();
   };
   const selectSlot = (index: number, action: "book" | "reschedule") => {
