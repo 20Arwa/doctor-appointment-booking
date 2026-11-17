@@ -81,7 +81,7 @@ function createDatabase({
           : slot?.doctor_id === doctorId && ownerId === currentUser.id;
         return { rows: allowed ? [details(appointment)] : [] };
       }
-      if (sql.includes("FROM appointments a") && sql.includes("ORDER BY a.scheduled_date")) {
+      if (sql.includes("FROM appointments a") && (sql.includes("ORDER BY a.scheduled_date") || sql.includes("ORDER BY a.cancelled_at"))) {
         const ownerId = values[0];
         const statusIndex = Number(sql.match(/a\.status = \$(\d+)/)?.[1] || 0) - 1;
         const fromIndex = Number(sql.match(/a\.scheduled_date >= \$(\d+)/)?.[1] || 0) - 1;
@@ -100,7 +100,7 @@ function createDatabase({
             && (!cancelledView || appointment.status === "cancelled")
             && (!from || slot.date >= from) && (!to || slot.date <= to);
         }).map(details);
-        if (sql.includes("ORDER BY a.scheduled_date DESC")) rows = rows.reverse();
+        if (sql.includes("ORDER BY a.scheduled_date DESC") || sql.includes("ORDER BY a.cancelled_at DESC")) rows = rows.reverse();
         if (sql.includes(" LIMIT ")) rows = rows.slice(values[values.length - 1], values[values.length - 2] + values[values.length - 1]);
         return { rows };
       }

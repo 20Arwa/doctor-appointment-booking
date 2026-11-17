@@ -299,9 +299,11 @@ async function listAppointments(database, user, filters, timeZone = "Asia/Kolkat
     values.push(filters.to);
     where.push(`a.scheduled_date <= $${values.length}::date`);
   }
-  const order = filters.order === "furthest"
+  const order = filters.view === "cancelled"
+    ? "a.cancelled_at DESC NULLS LAST, a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC"
+    : filters.order === "furthest"
     ? "a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC"
-    : filters.view === "past" || filters.view === "cancelled"
+    : filters.view === "past"
     ? "a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC"
     : "a.scheduled_date, a.scheduled_start_time, a.id";
   let pagination = "";
@@ -395,7 +397,9 @@ async function listDoctorPatientAppointments(database, user, patientId, filters,
      JOIN patients p ON p.id = a.patient_id
      JOIN users pu ON pu.id = p.user_id
      WHERE ${where.join(" AND ")}
-     ORDER BY a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC
+     ORDER BY ${filters.view === "cancelled"
+       ? "a.cancelled_at DESC NULLS LAST, a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC"
+       : "a.scheduled_date DESC, a.scheduled_start_time DESC, a.id DESC"}
      LIMIT $${values.length - 1} OFFSET $${values.length}`,
     values,
   );

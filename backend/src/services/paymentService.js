@@ -607,6 +607,7 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
       `SELECT p.id, p.amount::text AS amount, p.currency, p.status, p.provider,
               p.provider_payment_id, p.created_at, p.captured_at,
               COALESCE(p.captured_at, p.created_at) AS payment_date,
+              refund_activity.latest_processed_at,
               a.id AS appointment_id, a.status AS appointment_status,
               COALESCE(a.scheduled_date::text, av.date::text) AS appointment_date,
               COALESCE(a.scheduled_start_time::text, av.start_time::text) AS appointment_start_time,
@@ -621,7 +622,12 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
        LEFT JOIN availability av ON av.id = COALESCE(a.availability_id, h.availability_id)
        LEFT JOIN doctors d ON d.id = av.doctor_id
        LEFT JOIN users du ON du.id = d.user_id
-       ORDER BY COALESCE(p.captured_at, p.created_at) DESC, p.id${pageSql}`, queryValues,
+       LEFT JOIN LATERAL (
+         SELECT MAX(r.processed_at) AS latest_processed_at
+         FROM refunds r
+         WHERE r.payment_id = p.id AND r.status = 'processed' AND r.processed_at IS NOT NULL
+       ) refund_activity ON TRUE
+       ORDER BY COALESCE(refund_activity.latest_processed_at, p.captured_at, p.created_at) DESC, p.id DESC${pageSql}`, queryValues,
     );
     const hasMore = limit !== undefined && result.rows.length > limit;
     const pageRows = limit === undefined ? result.rows : result.rows.slice(0, limit);
