@@ -691,6 +691,70 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
     return { items, has_more: hasMore, next_offset: offset + items.length };
   }
 
+  async function getPaymentHistoryForAppointment(user, appointmentId) {
+    if (user.role !== "patient") fail(403, "FORBIDDEN", "Only patients can view payment history");
+    const result = await database.query(
+      `SELECT a.id AS appointment_id, a.status AS appointment_status,
+              a.scheduled_date::text AS appointment_date,
+              a.scheduled_start_time::text AS appointment_start_time,
+              d.id AS doctor_id, du.first_name AS doctor_first_name,
+              du.last_name AS doctor_last_name,
+              p.id AS payment_id, p.amount::text AS payment_amount,
+              p.currency AS payment_currency, p.status AS payment_status,
+              r.id AS refund_id, r.amount::text AS refund_amount,
+              r.currency AS refund_currency, r.status AS refund_status,
+              r.reason AS refund_reason, r.created_at AS refund_created_at,
+              r.processed_at AS refund_processed_at
+       FROM appointments a
+       JOIN patients patient_owner ON patient_owner.id = a.patient_id
+         AND patient_owner.user_id = $1
+       JOIN availability av ON av.id = a.availability_id
+       JOIN doctors d ON d.id = av.doctor_id
+       JOIN users du ON du.id = d.user_id
+       LEFT JOIN payments p ON p.appointment_id = a.id
+       LEFT JOIN refunds r ON r.payment_id = p.id
+       WHERE a.id = $2
+       ORDER BY p.created_at DESC NULLS LAST, r.created_at DESC NULLS LAST, r.id`,
+      [user.id, appointmentId],
+    );
+    if (!result.rows.length) return null;
+    const first = result.rows[0];
+    const payments = new Map();
+    for (const row of result.rows) {
+      if (!row.payment_id) continue;
+      let payment = payments.get(row.payment_id);
+      if (!payment) {
+        payment = {
+          id: row.payment_id,
+          amount: row.payment_amount,
+          currency: row.payment_currency.trim(),
+          status: row.payment_status,
+          refunds: [],
+        };
+        payments.set(row.payment_id, payment);
+      }
+      if (row.refund_id) payment.refunds.push({
+        id: row.refund_id,
+        amount: row.refund_amount,
+        currency: row.refund_currency.trim(),
+        status: row.refund_status,
+        reason: row.refund_reason,
+        created_at: row.refund_created_at,
+        processed_at: row.refund_processed_at,
+      });
+    }
+    return {
+      appointment: {
+        id: first.appointment_id,
+        status: first.appointment_status,
+        date: first.appointment_date,
+        start_time: first.appointment_start_time,
+        doctor: { id: first.doctor_id, first_name: first.doctor_first_name, last_name: first.doctor_last_name },
+      },
+      payments: [...payments.values()],
+    };
+  }
+
   async function cancelCheckoutSession(user, paymentId) {
     if (user.role !== "patient") fail(403, "FORBIDDEN", "Only patients can cancel appointment payments");
     const payment = await findOwnedPayment(database, paymentId, user.id);
@@ -715,6 +779,7 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
     cancelCheckoutSession,
     createCheckoutSession,
     getPaymentHistory,
+    getPaymentHistoryForAppointment,
     getPaymentStatus,
     previewCancellationRefund: refundService.previewCancellationRefund,
     processWebhook,

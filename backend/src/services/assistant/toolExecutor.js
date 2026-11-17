@@ -270,6 +270,48 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
     };
   }
 
+  if (name === "get_patient_refund_history") {
+    if (actor?.role !== "patient" || !paymentService?.getPaymentHistoryForAppointment) throw Object.assign(new Error("Payment history is unavailable"), { code: "TOOL_UNAVAILABLE" });
+    const nameWords = (value) => String(value || "").toLowerCase().replace(/^dr\.?\s*/, "").match(/[\p{L}\p{N}]+/gu) || [];
+    const requestedName = nameWords(input.doctor_name);
+    const appointments = await appointmentService.listAppointments(database, actor, {
+      from: input.date,
+      to: input.date,
+    }, applicationTimezone || "Asia/Kolkata");
+    const matches = appointments.filter((appointment) => {
+      const actualName = nameWords(`Dr. ${appointment.doctor_first_name} ${appointment.doctor_last_name}`);
+      const sameDoctor = requestedName.length === actualName.length
+        && requestedName.every((word, index) => actualName[index] === word);
+      return sameDoctor && appointment.date === input.date
+        && String(appointment.start_time || "").slice(0, 5) === input.start_time;
+    });
+    if (matches.length !== 1) return { matches: matches.length, payments: [] };
+    const appointment = matches[0];
+    const ledger = await paymentService.getPaymentHistoryForAppointment(actor, appointment.id);
+    if (!ledger) return { matches: 0, payments: [] };
+    return {
+      matches: 1,
+      appointment: {
+        date: ledger.appointment.date,
+        start_time: ledger.appointment.start_time,
+        doctor: { name: `Dr. ${ledger.appointment.doctor.first_name} ${ledger.appointment.doctor.last_name}`.trim() },
+      },
+      payments: ledger.payments.map(({ amount, currency, status, refunds }) => ({
+        amount,
+        currency,
+        status,
+        refunds: refunds.map(({ amount: refundAmount, currency: refundCurrency, status: refundStatus, reason, created_at, processed_at }) => ({
+          amount: refundAmount,
+          currency: refundCurrency,
+          status: refundStatus,
+          reason,
+          created_at,
+          processed_at,
+        })),
+      })),
+    };
+  }
+
   const proposalTypes = {
     prepare_booking_action: "book",
     prepare_reschedule_action: "reschedule",
@@ -286,18 +328,19 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
     const timeZone = applicationTimezone || "Asia/Kolkata";
     const appointmentQuery = appointmentScopeOverride === "all" ? { ...input, view: input.view === "date" ? "date" : "upcoming", scope: "all", offset: input.offset } : input;
     const range = appointmentQuery.scope === "next_days" ? nextDaysRange(appointmentQuery.days_ahead, timeZone, now) : null;
-    const limit = ["nearest", "last", "last_completed"].includes(appointmentQuery.scope) ? 1 : 20;
+    const limit = ["nearest", "furthest", "last", "last_completed"].includes(appointmentQuery.scope) ? 1 : 20;
     const dateScoped = appointmentQuery.view === "date" && appointmentQuery.from && appointmentQuery.to;
     const page = await appointmentService.listAppointments(database, actor, {
       ...(!dateScoped ? { view: appointmentQuery.view } : {}),
       ...(appointmentQuery.scope === "last_completed" ? { status: "completed" } : {}),
+      ...(appointmentQuery.scope === "furthest" ? { order: "furthest" } : {}),
       ...(range ? { from: range.from, to: range.to } : {}),
       ...(!range && appointmentQuery.from && appointmentQuery.to ? { from: appointmentQuery.from, to: appointmentQuery.to } : {}),
       ...(!dateScoped ? { limit, offset: appointmentQuery.offset || 0 } : {}),
     }, timeZone);
     let rows = dateScoped ? page : page.items;
     if (range) rows = rows.filter((row) => row.date >= range.from && row.date <= range.to);
-    if (["nearest", "last", "last_completed"].includes(appointmentQuery.scope)) rows = rows.slice(0, 1);
+    if (["nearest", "furthest", "last", "last_completed"].includes(appointmentQuery.scope)) rows = rows.slice(0, 1);
     return { appointments: rows.map(safeAppointment), has_more: dateScoped ? false : page.has_more, next_offset: dateScoped ? null : page.next_offset };
   }
 
@@ -315,7 +358,7 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
     const queryLimit = input.exact_start_time ? 100 : slotLimit;
     const response = controllerResponse({
       database, applicationTimezone: applicationTimezone || "Asia/Kolkata", user: actor,
-      params: { id: input.doctor_id }, query: { from: input.from, to: input.to, specialty: input.specialty, limit: queryLimit },
+      params: { id: input.doctor_id }, query: { from: input.from, to: input.to, specialty: input.specialty, mode: input.mode, limit: queryLimit },
     });
     let controllerError;
     await getDoctorSlots({}, response, (error) => { controllerError = error; });
