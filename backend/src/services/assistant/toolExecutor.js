@@ -227,21 +227,21 @@ async function executeTool({ name, args, actor, database, applicationTimezone, p
 
   if (name === "get_patient_appointments") {
     const timeZone = applicationTimezone || "Asia/Kolkata";
-    const appointmentQuery = appointmentScopeOverride === "all" ? { view: "upcoming", scope: "all", offset: input.offset } : input;
+    const appointmentQuery = appointmentScopeOverride === "all" ? { ...input, view: input.view === "date" ? "date" : "upcoming", scope: "all", offset: input.offset } : input;
     const range = appointmentQuery.scope === "next_days" ? nextDaysRange(appointmentQuery.days_ahead, timeZone, now) : null;
     const limit = ["nearest", "last", "last_completed"].includes(appointmentQuery.scope) ? 1 : 20;
+    const dateScoped = appointmentQuery.view === "date" && appointmentQuery.from && appointmentQuery.to;
     const page = await appointmentService.listAppointments(database, actor, {
-      view: appointmentQuery.view,
+      ...(!dateScoped ? { view: appointmentQuery.view } : {}),
       ...(appointmentQuery.scope === "last_completed" ? { status: "completed" } : {}),
       ...(range ? { from: range.from, to: range.to } : {}),
       ...(!range && appointmentQuery.from && appointmentQuery.to ? { from: appointmentQuery.from, to: appointmentQuery.to } : {}),
-      limit,
-      offset: appointmentQuery.offset || 0,
+      ...(!dateScoped ? { limit, offset: appointmentQuery.offset || 0 } : {}),
     }, timeZone);
-    let rows = page.items;
+    let rows = dateScoped ? page : page.items;
     if (range) rows = rows.filter((row) => row.date >= range.from && row.date <= range.to);
     if (["nearest", "last", "last_completed"].includes(appointmentQuery.scope)) rows = rows.slice(0, 1);
-    return { appointments: rows.map(safeAppointment), has_more: page.has_more, next_offset: page.next_offset };
+    return { appointments: rows.map(safeAppointment), has_more: dateScoped ? false : page.has_more, next_offset: dateScoped ? null : page.next_offset };
   }
 
   if (name === "search_doctors") {
