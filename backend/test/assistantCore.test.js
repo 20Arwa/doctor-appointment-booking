@@ -95,11 +95,11 @@ describe("patient assistant tools", () => {
     assert.deepEqual(output, { appointments: [], has_more: false, next_offset: 0 });
   });
 
-  it("registers tools only for patients and validates bounded date ranges", () => {
+  it("registers role-specific assistant tools and validates bounded patient date ranges", () => {
     assert.equal(getToolsForActor(user).length, 7);
     assert.match(getPolicyForActor(user), /Never guess or invent records/);
-    assert.equal(getToolsForActor({ ...user, role: "doctor" }).length, 0);
-    assert.equal(getPolicyForActor({ ...user, role: "doctor" }), null);
+    assert.equal(getToolsForActor({ ...user, role: "doctor" }).length, 2);
+    assert.match(getPolicyForActor({ ...user, role: "doctor" }), /Never book, cancel, reschedule/);
   });
 
   it("returns preparation-only proposals and rejects unexpected action fields", async () => {

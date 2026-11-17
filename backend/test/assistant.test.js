@@ -33,13 +33,17 @@ function testApp({ actor = user, authenticated = true, engine = { respond: async
   });
 }
 
-describe("patient assistant API security", () => {
-  it("requires Clerk identity, onboarding, and the patient role", async () => {
+describe("assistant API security", () => {
+  it("requires Clerk identity and onboarding, allows doctor conversations, and denies unsupported roles", async () => {
     await withServer(testApp({ authenticated: false }), async (url) => {
       const response = await fetch(`${url}/api/v1/assistant/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: conversationId }) });
       assert.equal(response.status, 401);
     });
     await withServer(testApp({ actor: { ...user, role: "doctor" } }), async (url) => {
+      const response = await fetch(`${url}/api/v1/assistant/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: conversationId }) });
+      assert.equal(response.status, 201);
+    });
+    await withServer(testApp({ actor: { ...user, role: "admin" } }), async (url) => {
       const response = await fetch(`${url}/api/v1/assistant/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: conversationId }) });
       assert.equal(response.status, 403);
     });
