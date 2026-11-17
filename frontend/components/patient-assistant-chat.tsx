@@ -1,7 +1,7 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
-import { ArrowDown, ArrowUp, Bot, CalendarDays, Check, Clock3, LoaderCircle, MessageCircle, MessageSquarePlus, RefreshCw, Search, Send, Sparkles, Stethoscope, UserRound, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Bot, CalendarDays, Check, Clock3, Info, LoaderCircle, MessageCircle, MessageSquarePlus, Mic, MicOff, Play, RefreshCw, Search, Send, Settings2, Sparkles, Stethoscope, UserRound, VolumeX, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -10,6 +10,10 @@ import { Button } from "@/components/ui/button";
 import { AssistantApiError, confirmAssistantAction, createAssistantConversation, dismissAssistantProposal, getAssistantActionStatus, getAssistantConversation, listAssistantConversations, prepareAssistantAction, sendAssistantMessage, type AssistantActionIntent, type AssistantActionType, type AssistantConversation, type AssistantResult } from "@/lib/assistant-api";
 import { assistantMessageDateLabel, assistantMessageTimeLabel, canSendAssistantMessage, chatReducer, getAssistantDisplayContent, getAssistantResultRows, getVisibleAssistantResults, initialChatState, isNearMessageListBottom, isNearMessageListTop, preserveScrollAfterPrepend, restoreDraftAfterFailedSubmission, retryOperation, shouldForceScrollAfterAssistantAction, shouldShowAssistantDateSeparator, shouldShowHistoryRecovery } from "@/lib/assistant-chat-state";
 import { isProposalExpired, proposalDescription, proposalStatusFromBackend, proposalTitle, proposalTypeForResult, reconcileActionStatus, type ProposalStatus } from "@/lib/assistant-action-state";
+import { useVoiceAssistant } from "@/lib/use-voice-assistant";
+import { assistantResponseSpeechText } from "@/lib/assistant-speech";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 function displayTime(value: unknown) {
   if (typeof value !== "string") return "";
@@ -263,7 +267,7 @@ function AssistantActionProposal({ result, assistantMessageId, conversationId, g
   </section>;
 }
 
-export function PatientAssistantChat({ compact = false, onClose, audience = "patient" }: { compact?: boolean; onClose?: () => void; audience?: "patient" | "doctor" }) {
+export function PatientAssistantChat({ compact = false, onClose, audience = "patient", speechLocale = "en-IN", speechVoiceName }: { compact?: boolean; onClose?: () => void; audience?: "patient" | "doctor"; speechLocale?: string; speechVoiceName?: string }) {
   const assistantPath = audience === "doctor" ? "/doctor/assistant" : "/patient/assistant";
   const doctorMode = audience === "doctor";
   const { getToken } = useAuth();
@@ -275,6 +279,23 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
   const [history, setHistory] = useState({ hasMore: false, nextBefore: null as string | null, loadingOlder: false, olderError: null as string | null, reachedStart: false });
   const [nearTop, setNearTop] = useState(false);
   const [nearLatest, setNearLatest] = useState(true);
+  const voiceEnabledRef = useRef(false);
+  const [voiceSettingsOpen, setVoiceSettingsOpen] = useState(false);
+  const [privacyNoticeOpen, setPrivacyNoticeOpen] = useState(false);
+  const voiceSubmitRef = useRef<(transcript: string) => void>(() => {});
+  const voice = useVoiceAssistant((transcript) => voiceSubmitRef.current(transcript), speechLocale, speechVoiceName);
+  useEffect(() => { voiceEnabledRef.current = voice.sessionActive; }, [voice.sessionActive]);
+  const pauseVoiceForResponse = voice.pauseForResponse;
+  const resumeVoiceAfterResponse = voice.resumeAfterResponse;
+  const speakVoiceResponse = voice.speak;
+  const stopVoiceSpeaking = voice.stopSpeaking;
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setPrivacyNoticeOpen(false); setVoiceSettingsOpen(false); }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
   const conversationId = useRef<string | null>(null);
   const recoveryTargetId = useRef<string | null>(null);
   const requestInFlight = useRef(false);
@@ -351,6 +372,8 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
   const deliver = useCallback(async (requestId: string, content: string) => {
     if (requestInFlight.current) return;
     requestInFlight.current = true;
+    const voiceSessionForReply = voiceEnabledRef.current;
+    if (voiceSessionForReply) pauseVoiceForResponse();
     dispatch({ type: "loading", value: true });
     try {
       const token = await getToken();
@@ -362,9 +385,14 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
       const reply = await sendAssistantMessage(token, conversationId.current, requestId, content);
       setHistoryLoadFailed(false);
       dispatch({ type: "success", requestId, user: { id: reply.user_message.id, requestId, role: "user", content, createdAt: reply.user_message.created_at || new Date().toISOString() }, assistant: { id: reply.assistant_message.id, role: "assistant", content: reply.assistant_message.content, createdAt: reply.assistant_message.created_at || new Date().toISOString(), results: reply.assistant_message.results || [] } });
-    } catch (error) { scrollAfterAssistantAction.current = false; setDraft((current) => restoreDraftAfterFailedSubmission(current, content)); dispatch({ type: "failure", requestId, message: error instanceof Error ? error.message : "We couldn't get a reply. Please try again.", code: error instanceof AssistantApiError ? error.code : undefined, source: "send" }); }
+      if (voiceSessionForReply && voiceEnabledRef.current) {
+        const visibleResults = getVisibleAssistantResults(reply.assistant_message.content, reply.assistant_message.results || []);
+        const visibleText = assistantContentForResults(reply.assistant_message.content, reply.assistant_message.results || []);
+        speakVoiceResponse(assistantResponseSpeechText(visibleText, visibleResults));
+      }
+    } catch (error) { scrollAfterAssistantAction.current = false; setDraft((current) => restoreDraftAfterFailedSubmission(current, content)); dispatch({ type: "failure", requestId, message: error instanceof Error ? error.message : "We couldn't get a reply. Please try again.", code: error instanceof AssistantApiError ? error.code : undefined, source: "send" }); if (voiceSessionForReply && voiceEnabledRef.current) resumeVoiceAfterResponse(); }
     finally { requestInFlight.current = false; }
-  }, [assistantPath, compact, getToken, historyLoadFailed]);
+  }, [assistantPath, compact, getToken, historyLoadFailed, pauseVoiceForResponse, resumeVoiceAfterResponse, speakVoiceResponse]);
 
   const startNewConversation = useCallback(async () => {
     if (requestInFlight.current) return;
@@ -432,12 +460,19 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
     }
   }, [assistantPath, compact, getToken]);
 
-  function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); const content = draft.trim(); if (!canSendAssistantMessage({ ready, loading: state.loading || requestInFlight.current, draft: content, historyLoadFailed, hasConversation: Boolean(conversationId.current) })) return;
+  function submitContent(value: string) {
+    const content = value.trim(); if (!canSendAssistantMessage({ ready, loading: state.loading || requestInFlight.current, draft: content, historyLoadFailed, hasConversation: Boolean(conversationId.current) })) return;
     const failed = [...state.messages].reverse().find((item) => item.role === "user" && item.failed && item.content === content && item.requestId);
     if (failed?.requestId) { setDraft(""); void deliver(failed.requestId, content); return; }
     const requestId = crypto.randomUUID(); dispatch({ type: "submit", message: { requestId, role: "user", content } }); setDraft((current) => current.trim() === content ? "" : current); void deliver(requestId, content);
   }
+  voiceSubmitRef.current = (transcript) => { if (!requestInFlight.current && !state.loading) submitContent(transcript); };
+  function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); submitContent(draft); }
+  const toggleVoice = () => {
+    if (!voice.sessionActive) { voiceEnabledRef.current = true; voice.start(); return; }
+    if (voice.status === "listening") { voice.stop(); voiceEnabledRef.current = false; return; }
+    if (voice.status !== "speaking") voice.resumeAfterResponse();
+  };
   const selectSlot = (index: number, action: "book" | "reschedule") => {
     const content = action === "reschedule" ? `Reschedule my appointment to slot ${index + 1}` : `Book slot ${index + 1}`;
     if (state.loading || requestInFlight.current) return;
@@ -471,7 +506,23 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
       <span className="flex size-10 items-center justify-center rounded-2xl bg-secondary text-secondary-foreground"><MessageCircle aria-hidden="true" className="size-5" /></span>
       <div className="min-w-0 flex-1"><p className="text-sm font-medium text-primary">Medrella Assistant</p><h1 className="text-xl font-semibold tracking-tight text-foreground">{doctorMode ? "Doctor AI Assistant" : "How can I help?"}</h1></div>
       <Button type="button" variant="outline" size="sm" className="shrink-0 gap-2" disabled={state.loading || requestInFlight.current} onClick={() => void startNewConversation()}><MessageSquarePlus aria-hidden="true" className="size-4" />New Chat</Button>
-      {compact ? <><Link href={assistantPath} className="text-xs font-medium text-primary hover:underline">Full assistant</Link><Button type="button" variant="ghost" size="sm" onClick={onClose} aria-label="Close assistant">Close</Button></> : null}
+      <Popover open={voiceSettingsOpen} onOpenChange={setVoiceSettingsOpen}>
+        <PopoverTrigger asChild><Button type="button" variant="ghost" size="icon" aria-label="Voice settings" title="Voice settings" aria-expanded={voiceSettingsOpen}><Settings2 aria-hidden="true" /></Button></PopoverTrigger>
+        <PopoverContent align="end" side="bottom" className="max-h-[min(70dvh,32rem)] w-[min(18rem,calc(100vw-1.5rem))] overflow-y-auto p-3">
+          <label htmlFor={`${compact ? "assistant-panel" : "assistant"}-voice-select`} className="text-xs font-medium">English speaking voice</label>
+          <Select value={voice.selectedVoiceName || "default"} onValueChange={(value) => voice.selectVoice(value === "default" ? "" : value)}>
+            <SelectTrigger id={`${compact ? "assistant-panel" : "assistant"}-voice-select`} size="sm" className="mt-1"><SelectValue /></SelectTrigger>
+            <SelectContent className="max-h-[min(18rem,50dvh)] w-[var(--radix-select-trigger-width)] max-w-[calc(100vw-2rem)]"><SelectItem value="default">Default browser voice</SelectItem>{voice.availableVoices.map((availableVoice) => <SelectItem key={`${availableVoice.name}-${availableVoice.lang}`} value={availableVoice.name}>{availableVoice.name} ({availableVoice.lang})</SelectItem>)}</SelectContent>
+          </Select>
+          <Button type="button" variant="outline" size="sm" className="mt-2 w-full gap-2" disabled={voice.synthesisSupported === false} onClick={voice.preview}><Play aria-hidden="true" className="size-3.5" />Preview voice</Button>
+          <p className="mt-2 text-xs text-muted-foreground">Your voice choice is saved on this device. If no voices are listed, the browser default is used.</p>
+        </PopoverContent>
+      </Popover>
+      <Popover open={privacyNoticeOpen} onOpenChange={setPrivacyNoticeOpen}>
+        <PopoverTrigger asChild><Button type="button" variant="ghost" size="icon" aria-label="Voice privacy information" title="Voice privacy information" aria-expanded={privacyNoticeOpen}><Info aria-hidden="true" /></Button></PopoverTrigger>
+        <PopoverContent align="end" side="bottom" className="max-h-[min(70dvh,32rem)] w-[min(20rem,calc(100vw-1.5rem))] overflow-y-auto p-3"><p className="text-xs leading-5">Your browser's speech recognition converts microphone speech into text. Medrella receives the transcript when it is submitted as a chat message, and saves it with the conversation.</p></PopoverContent>
+      </Popover>
+      {compact ? <><Link href={assistantPath} className="text-xs font-medium text-primary hover:underline">Full assistant</Link><Button type="button" variant="ghost" size="sm" onClick={() => { voice.stop(); voiceEnabledRef.current = false; onClose?.(); }} aria-label="Close assistant">Close</Button></> : null}
     </header>
     <section aria-label="Assistant conversation" aria-live="polite" className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
       <div className="relative min-h-0 flex-1">
@@ -515,10 +566,12 @@ export function PatientAssistantChat({ compact = false, onClose, audience = "pat
       {state.error ? <div role="alert" className="mx-3 mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-foreground"><span className="min-w-0 flex-1">{state.error}</span><div className="flex shrink-0 gap-2"><Button type="button" variant="default" size="sm" disabled={state.loading} onClick={retry}>Retry</Button>{shouldShowHistoryRecovery(state.errorCode) ? <><Button type="button" variant="outline" size="sm" disabled={state.loading} onClick={() => void findSavedConversations()}>Find saved conversations</Button><Button type="button" variant="outline" size="sm" disabled={state.loading} onClick={() => void startNewConversation()}>Start new conversation</Button></> : null}</div></div> : null}
       {recoveryConversations.length ? <ul aria-label="Saved conversations" className="mx-3 mb-2 flex max-h-40 flex-col gap-1 overflow-y-auto rounded-lg border border-border bg-background p-2">{recoveryConversations.map((conversation) => <li key={conversation.id}><Button type="button" variant="ghost" size="sm" className="h-auto w-full justify-start whitespace-normal text-left" disabled={state.loading} onClick={() => void openSavedConversation(conversation.id)}>{conversation.preview || "Conversation without messages"}</Button></li>)}</ul> : null}
       {state.loading && !state.messages.length ? <div className="flex items-center gap-2 px-4 pb-2 text-xs text-muted-foreground" role="status"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />Loading your conversation…</div> : null}
+      {voice.status !== "stopped" ? <p className="mx-auto mb-2 w-full max-w-3xl text-xs text-muted-foreground" role="status" aria-live="polite">{voice.status === "listening" ? voice.statusMessage || "Listening" : voice.status === "processing" ? "Waiting for the assistant" : voice.status === "speaking" ? "Speaking response" : voice.statusMessage || (voice.status === "unsupported" ? "Speech recognition is unavailable; text chat is available." : "Voice is unavailable; continue by typing.")}</p> : null}
       <form onSubmit={submit} className="sticky bottom-0 z-10 shrink-0 border-t border-border bg-card p-3">
         <label htmlFor={compact ? "assistant-panel-message" : "assistant-message"} className="sr-only">Message Medrella Assistant</label>
         <div className="mx-auto flex w-full items-end gap-2 rounded-2xl border border-input bg-background p-2 focus-within:ring-2 focus-within:ring-ring">
           <textarea id={compact ? "assistant-panel-message" : "assistant-message"} value={draft} onChange={(event) => setDraft(event.target.value.slice(0, 1000))} maxLength={1000} rows={1} placeholder={doctorMode ? "Ask about your schedule, exceptions, or availability…" : "Ask about appointments, doctors, or available times…"} className="max-h-28 min-h-10 flex-1 resize-y bg-transparent px-2 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
+          <span className="flex shrink-0 items-center gap-1">{voice.status === "speaking" ? <Button type="button" variant="ghost" size="icon" aria-label="Stop speaking" title="Stop speaking" onClick={stopVoiceSpeaking}><VolumeX aria-hidden="true" /></Button> : null}<Button type="button" variant={voice.status === "listening" ? "default" : "ghost"} size="icon" aria-label={!voice.sessionActive ? "Start voice input" : voice.status === "listening" ? "Stop listening" : voice.status === "speaking" ? "Voice input paused while Medrella is speaking" : "Resume voice input"} title={!voice.sessionActive ? "Start voice input" : voice.status === "listening" ? "Stop listening" : voice.status === "speaking" ? "Voice input pauses while Medrella is speaking" : "Resume voice input"} aria-pressed={voice.status === "listening"} disabled={voice.status === "speaking"} onClick={toggleVoice}>{voice.status === "listening" ? <MicOff aria-hidden="true" className="size-4" /> : <Mic aria-hidden="true" className="size-4" />}</Button></span>
           <Button type="submit" size="icon" aria-label="Send message" disabled={!canSendAssistantMessage({ ready, loading: state.loading, draft, historyLoadFailed, hasConversation: Boolean(conversationId.current) })}><Send aria-hidden="true" /></Button>
         </div>
       </form>

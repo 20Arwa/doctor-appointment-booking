@@ -27,7 +27,7 @@ function readRetryAfterMs(headers, now = Date.now) {
   return Number.isFinite(date) ? Math.max(0, date - now()) : undefined;
 }
 
-function createGeminiProvider({ apiKey, model = "gemini-3.8-flash", client } = {}) {
+function createGeminiProvider({ apiKey, model = "gemini-3.5-flash-lite", client } = {}) {
   return {
     requestTimeoutMs: GEMINI_REQUEST_TIMEOUT_MS,
     async generate({ messages, tools, systemInstruction, signal }) {

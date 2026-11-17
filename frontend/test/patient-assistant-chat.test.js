@@ -731,4 +731,49 @@ describe("patient assistant chat", () => {
     assert.match(chat, /scrollAfterAssistantAction\.current = true/);
     assert.match(chat, /isNearMessageListBottom\(element\.scrollHeight, element\.clientHeight, element\.scrollTop\)/);
   });
+
+
+  it("uses collision-aware portaled voice menus and compact listening controls", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(chat, /import \{ Popover, PopoverContent, PopoverTrigger \}/);
+    assert.equal((chat.match(/<PopoverContent align="end" side="bottom"/g) || []).length, 2);
+    const popover = fs.readFileSync(path.join(projectRoot, "components/ui/popover.tsx"), "utf8");
+    assert.match(popover, /collisionPadding = 12/);
+    assert.match(popover, /PopoverPrimitive\.Portal/);
+    assert.match(chat, /aria-label=\{!voice\.sessionActive \? "Start voice input" : voice\.status === "listening" \? "Stop listening"/);
+    assert.match(chat, /aria-pressed=\{voice\.status === "listening"\}/);
+    assert.match(chat, /voice\.status === "listening" \? <MicOff/);
+    assert.doesNotMatch(chat, /Stop Listening/);
+    assert.doesNotMatch(chat, /Finish current voice message|>Enable voice<|>Resume voice</);
+    assert.match(chat, /if \(voice\.status === "listening"\) \{\s*voice\.stop\(\)/);
+    assert.match(chat, /if \(voice\.status !== "speaking"\) voice\.resumeAfterResponse\(\)/);
+  });
+
+  it("adds voice controls beside the existing composer", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    const composer = chat.slice(chat.indexOf('<form onSubmit={submit}'), chat.indexOf("</form>"));
+    assert.match(composer, /aria-label=\{!voice\.sessionActive[\s\S]*voice\.status === "listening" \? <MicOff[\s\S]*aria-label="Send message"/);
+    assert.match(composer, /aria-label="Stop speaking"/);
+  });
+
+  it("keeps one accessible floating panel dismissal control", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(chat, /onClick=\{\(\) => \{ voice\.stop\(\); voiceEnabledRef\.current = false; onClose\?\.\(\); \}\} aria-label="Close assistant"/);
+    const voiceHook = fs.readFileSync(path.join(projectRoot, "lib/use-voice-assistant.ts"), "utf8");
+    assert.match(voiceHook, /useEffect\(\(\) => \(\) => controllerRef\.current\?\.dispose\(\), \[\]\)/);
+  });
+
+  it("uses the shared Select and independent voice popovers with shared asynchronous browser voices", () => {
+    const chat = fs.readFileSync(path.join(projectRoot, "components/patient-assistant-chat.tsx"), "utf8");
+    assert.match(chat, /import \{ Select, SelectContent, SelectItem, SelectTrigger, SelectValue \} from "@\/components\/ui\/select"/);
+    assert.match(chat, /voice\.selectedVoiceName \|\| "default"/);
+    assert.match(chat, /onValueChange=\{\(value\) => voice\.selectVoice/);
+    assert.doesNotMatch(chat, /<select\b/);
+    const voiceHook = fs.readFileSync(path.join(projectRoot, "lib/use-voice-assistant.ts"), "utf8");
+    assert.match(voiceHook, /useSyncExternalStore\(subscribeToEnglishVoices, getEnglishVoicesSnapshot/);
+    assert.match(voiceHook, /synthesis\.addEventListener\("voiceschanged", refresh\)/);
+    assert.match(voiceHook, /retries < 20/);
+    assert.match(voiceHook, /voiceSelectionEvent/);
+    assert.match(voiceHook, /window\.localStorage\.setItem\(voiceStorageKey, name\)/);
+  });
 });
