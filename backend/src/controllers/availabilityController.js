@@ -67,7 +67,7 @@ async function getDoctorSlots(_request, response, next) {
              OR (
                allocation.status = 'confirmed'
                AND (
-                 EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed')
+                 EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed'))
                  OR NOT EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id)
                )
              )
@@ -121,7 +121,7 @@ async function getDoctorSlots(_request, response, next) {
               EXISTS (SELECT 1 FROM appointment_allocations allocation WHERE allocation.availability_id = availability.id
                 AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
                   OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
-                    WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                    WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed')) OR NOT EXISTS
                     (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))) AS has_active_allocation,
               EXISTS (SELECT 1 FROM appointment_allocations allocation WHERE allocation.availability_id = availability.id
                 AND allocation.status = 'held' AND allocation.expires_at > NOW()) AS has_active_held_allocation,
@@ -129,7 +129,7 @@ async function getDoctorSlots(_request, response, next) {
                WHERE allocation.availability_id = availability.id
                  AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
                    OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
-                     WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                     WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed')) OR NOT EXISTS
                      (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))) AS active_allocation_count,
               availability.date::text AS date,
               availability.start_time::text AS start_time, availability.end_time::text AS end_time,
@@ -149,12 +149,12 @@ async function getDoctorSlots(_request, response, next) {
            WHERE allocation.availability_id = availability.id
              AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
                OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
-                 WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                    WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed')) OR NOT EXISTS
                  (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
              AND allocation.id IS DISTINCT FROM $7::uuid
            UNION
            SELECT appointment.patient_id FROM appointments appointment
-           WHERE appointment.availability_id = availability.id AND appointment.status = 'confirmed'
+           WHERE appointment.availability_id = availability.id AND appointment.status IN ('confirmed', 'completed')
              AND appointment.id IS DISTINCT FROM $6::uuid
              AND NOT EXISTS (
                SELECT 1 FROM appointment_allocations allocation
@@ -162,7 +162,7 @@ async function getDoctorSlots(_request, response, next) {
                  AND allocation.availability_id = availability.id
                  AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
                    OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
-                     WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                   WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed')) OR NOT EXISTS
                      (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
                  AND allocation.id IS DISTINCT FROM $7::uuid
              )
@@ -174,11 +174,11 @@ async function getDoctorSlots(_request, response, next) {
        LEFT JOIN LATERAL (
          SELECT COUNT(DISTINCT reservation.patient_id)::int AS bookings FROM (
            SELECT appointment.patient_id FROM appointments appointment
-           WHERE appointment.availability_id = availability.id AND appointment.status = 'confirmed'
+           WHERE appointment.availability_id = availability.id AND appointment.status IN ('confirmed', 'completed')
            UNION
            SELECT allocation.patient_id FROM appointment_allocations allocation
            WHERE allocation.availability_id = availability.id AND allocation.status = 'confirmed'
-             AND (EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed')
+             AND (EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed'))
                OR NOT EXISTS (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))
          ) reservation
        ) preserved ON TRUE

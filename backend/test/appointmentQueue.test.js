@@ -41,22 +41,32 @@ test("duplicate check-in is rejected when the guarded update affects no queue en
   );
 });
 
-test("No-show accepts only not_checked_in after grace; checked-in and in-progress entries are rejected", async () => {
+test("No-show becomes eligible after the appointment starts and rejects checked-in entries", async () => {
   const mocked = databaseFor([{ rows: [{ appointment_id: "appt", status: "no_show" }] }]);
-  await queue.markNoShow(mocked.database, { id: "reception", role: "receptionist" }, "appt", 20, "Asia/Kolkata");
+  await queue.markNoShow(mocked.database, { id: "reception", role: "receptionist" }, "appt", "Asia/Kolkata");
   assert.match(mocked.statements[1].sql, /q\.status = 'not_checked_in'/);
-  assert.match(mocked.statements[1].sql, /\$4::int \* INTERVAL '1 minute'/);
-  assert.deepEqual(mocked.statements[1].values, ["appt", "reception", "Asia/Kolkata", 20]);
+  assert.match(mocked.statements[1].sql, /a\.scheduled_start_time/);
+  assert.doesNotMatch(mocked.statements[1].sql, /a\.scheduled_end_time|INTERVAL '1 minute'/);
+  assert.deepEqual(mocked.statements[1].values, ["appt", "reception", "Asia/Kolkata"]);
 
   for (const status of ["waiting", "in_progress"]) {
     const rejected = databaseFor([{ rows: [] }]);
     await assert.rejects(
-      queue.markNoShow(rejected.database, { id: "reception", role: "receptionist" }, "appt", 20, "Asia/Kolkata"),
+      queue.markNoShow(rejected.database, { id: "reception", role: "receptionist" }, "appt", "Asia/Kolkata"),
       (error) => error.code === "QUEUE_STATE_CONFLICT",
     );
     assert.match(rejected.statements[1].sql, /q\.status = 'not_checked_in'/);
     assert.doesNotMatch(rejected.statements[1].sql, new RegExp(`q\\.status.*${status}`));
   }
+});
+
+test("reception no-show eligibility uses scheduled start and application timezone", async () => {
+  const mocked = databaseFor([], [], [{ rows: [] }]);
+  await queue.appointmentQueue(mocked.database, { id: "reception", role: "receptionist" }, null, "2026-11-18", "Asia/Kolkata");
+  assert.match(mocked.statements[0].sql, /a\.scheduled_start_time/);
+  assert.match(mocked.statements[0].sql, /AT TIME ZONE \$2/);
+  assert.doesNotMatch(mocked.statements[0].sql, /INTERVAL '1 minute'/);
+  assert.deepEqual(mocked.statements[0].values, ["2026-11-18", "Asia/Kolkata"]);
 });
 
 test("migration resets every lifecycle field on re-confirmation and protects daily tokens", () => {
@@ -92,7 +102,7 @@ test("Call Next serializes per doctor/day and refuses a second active consultati
   assert.match(mocked.statements[2].sql, /pg_advisory_xact_lock/);
 });
 
-test("doctor queue separates the active consultation and orders waiting patients by check-in time", async () => {
+test("doctor queue separates active and waiting entries, with scheduled appointment list order", async () => {
   const mocked = databaseFor([], [{ rows: [{ id: "doctor-id" }] }], [{ rows: [
     { appointment_id: "late", token_number: 2, status: "waiting", checked_in_at: "2026-11-18T10:30:00Z" },
     { appointment_id: "current", token_number: 3, status: "in_progress", checked_in_at: "2026-11-18T09:00:00Z" },
@@ -100,8 +110,8 @@ test("doctor queue separates the active consultation and orders waiting patients
   ] }]);
   const result = await queue.appointmentQueue(mocked.database, { id: "doctor-user", role: "doctor" }, null, "2026-11-18");
   assert.equal(result.current.appointment_id, "current");
-  assert.deepEqual(result.entries.map((entry) => entry.appointment_id), ["early", "late"]);
-  assert.match(mocked.statements[1].sql, /q\.checked_in_at ASC NULLS LAST, q\.token_number ASC/);
+  assert.deepEqual(result.waiting.map((entry) => entry.appointment_id), ["early", "late"]);
+  assert.match(mocked.statements[1].sql, /ORDER BY a\.scheduled_date ASC, a\.scheduled_start_time ASC, a\.id ASC/);
 });
 
 test("Call Next chooses the earliest check-in, with token number as tie-breaker", async () => {

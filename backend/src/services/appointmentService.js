@@ -128,19 +128,19 @@ async function countOccupiedPlaces(client, availabilityId, { excludedAppointment
        WHERE allocation.availability_id = $1
          AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
            OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
-             WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+             WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed')) OR NOT EXISTS
              (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
          AND allocation.id IS DISTINCT FROM $2::uuid
        UNION
        SELECT appointment.patient_id FROM appointments appointment
-       WHERE appointment.availability_id = $1 AND appointment.status = 'confirmed'
+       WHERE appointment.availability_id = $1 AND appointment.status IN ('confirmed', 'completed')
          AND appointment.id IS DISTINCT FROM $3::uuid
          AND NOT EXISTS (
            SELECT 1 FROM appointment_allocations allocation
            WHERE allocation.id = appointment.allocation_id AND allocation.availability_id = $1
              AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
                OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
-                 WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                 WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed')) OR NOT EXISTS
                  (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
              AND allocation.id IS DISTINCT FROM $2::uuid
          )
@@ -165,19 +165,19 @@ async function countOccupiedPlacesForSlots(client, availabilityIds) {
        WHERE allocation.availability_id = ANY($1::uuid[])
          AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
            OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
-             WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+             WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed')) OR NOT EXISTS
              (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
        UNION
        SELECT appointment.availability_id, appointment.patient_id
        FROM appointments appointment
-       WHERE appointment.availability_id = ANY($1::uuid[]) AND appointment.status = 'confirmed'
+       WHERE appointment.availability_id = ANY($1::uuid[]) AND appointment.status IN ('confirmed', 'completed')
          AND NOT EXISTS (
            SELECT 1 FROM appointment_allocations allocation
            WHERE allocation.id = appointment.allocation_id
              AND allocation.availability_id = appointment.availability_id
              AND ((allocation.status = 'held' AND allocation.expires_at > NOW())
                OR (allocation.status = 'confirmed' AND (EXISTS (SELECT 1 FROM appointments linked
-                 WHERE linked.allocation_id = allocation.id AND linked.status = 'confirmed') OR NOT EXISTS
+                 WHERE linked.allocation_id = allocation.id AND linked.status IN ('confirmed', 'completed')) OR NOT EXISTS
                  (SELECT 1 FROM appointments linked WHERE linked.allocation_id = allocation.id))))
          )
        UNION
@@ -773,7 +773,9 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
       const queueState = await client.query(
         "SELECT status FROM appointment_queue_entries WHERE appointment_id = $1 FOR UPDATE", [appointmentId],
       );
-      if (queueState.rows[0]?.status === "in_progress") fail(409, "QUEUE_STATE_CONFLICT", "An active consultation cannot be rescheduled");
+      if (queueState.rows[0] && queueState.rows[0].status !== "not_checked_in") {
+        fail(409, "QUEUE_STATE_CONFLICT", "An appointment can be rescheduled only before check-in");
+      }
     }
     if (!input.availability_id && original.date === input.date && original.start_time.slice(0, 5) === input.start_time) {
       fail(409, "APPOINTMENT_TIME_UNCHANGED", "Choose a different appointment date or time");

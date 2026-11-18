@@ -4,7 +4,8 @@ import { useAuth } from "@clerk/nextjs";
 import { CalendarCheck2, CalendarClock, CalendarDays, CalendarPlus, Clock3, History, RefreshCw, XCircle } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { getAppointments, type PatientAppointment } from "@/lib/profile-api";
+import { getAppointments, getPatientQueue, type PatientAppointment, type PatientQueue } from "@/lib/profile-api";
+import { QueueStatusBadge } from "@/components/queue-status-badge";
 import { formatInstantDate } from "@/lib/date-format";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
@@ -59,27 +60,30 @@ export function PatientDashboardContent() {
   const [error, setError] = useState<string | null>(null);
   const [retryKey, setRetryKey] = useState(0);
   const [now, setNow] = useState<number | null>(null);
+  const [queues, setQueues] = useState<Record<string, PatientQueue>>({});
 
   useEffect(() => {
     let active = true;
-    void getToken()
-      .then((token) => {
+    let inFlight = false;
+    let timer: number | undefined;
+    const refresh = async () => {
+      if (inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      try {
+        const token = await getToken();
         if (!token) throw new Error("Your session could not be verified. Please try again.");
-        return getAppointments(token);
-      })
-      .then((result) => {
-        if (active) {
-          setAppointments(result);
-          setNow(Date.now());
-        }
-      })
-      .catch((cause: unknown) => {
+        const result = await getAppointments(token);
+        if (active) { setAppointments(result); setNow(Date.now()); setError(null); }
+      } catch (cause) {
         if (active) setError(cause instanceof Error ? cause.message : "We couldn't load your appointments. Please try again.");
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => { active = false; };
+      } finally { inFlight = false; if (active) setLoading(false); }
+    };
+    void refresh();
+    timer = window.setInterval(() => { if (document.visibilityState === "visible") void refresh(); }, 15_000);
+    const handleRefresh = () => { if (document.visibilityState === "visible") void refresh(); };
+    window.addEventListener("focus", handleRefresh);
+    document.addEventListener("visibilitychange", handleRefresh);
+    return () => { active = false; if (timer !== undefined) window.clearInterval(timer); window.removeEventListener("focus", handleRefresh); document.removeEventListener("visibilitychange", handleRefresh); };
   }, [getToken, retryKey]);
 
   const upcoming = useMemo(() => now === null ? [] : appointments
@@ -88,7 +92,43 @@ export function PatientDashboardContent() {
     .filter((entry): entry is { appointment: PatientAppointment; instant: Date; end: Date } => entry.instant !== null && entry.end !== null && entry.end.getTime() > now && entry.instant.getTime() > now)
     .sort((first, second) => first.instant.getTime() - second.instant.getTime()), [appointments, now]);
   const next = upcoming[0] ?? null;
+  const queueAppointments = useMemo(() => now === null ? [] : appointments
+    .filter((appointment) => appointment.status === "confirmed")
+    .filter((appointment) => {
+      const status = queues[appointment.id]?.status;
+      return status === "not_checked_in" || status === "waiting" || status === "in_progress";
+    })
+    .sort((first, second) => (appointmentStart(first)?.getTime() ?? 0) - (appointmentStart(second)?.getTime() ?? 0)), [appointments, now, queues]);
   const counts = now === null ? null : getCounts(appointments, now);
+
+  useEffect(() => {
+    const applicable = appointments.filter((appointment) => appointment.status === "confirmed");
+    if (!applicable.length) { setQueues({}); return; }
+    let active = true;
+    let timer: number | undefined;
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      try {
+        const token = await getToken();
+        if (!token) return;
+        const results = await Promise.all(applicable.map(async (appointment) => {
+          try { return [appointment.id, await getPatientQueue(token, appointment.id)] as const; }
+          catch { return null; }
+        }));
+        if (active) setQueues(Object.fromEntries(results.filter((entry): entry is readonly [string, PatientQueue] => entry !== null)));
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refresh();
+    timer = window.setInterval(() => { if (document.visibilityState === "visible") void refresh(); }, 15_000);
+    const handleRefresh = () => { if (document.visibilityState === "visible") void refresh(); };
+    window.addEventListener("focus", handleRefresh);
+    document.addEventListener("visibilitychange", handleRefresh);
+    return () => { active = false; if (timer !== undefined) window.clearInterval(timer); window.removeEventListener("focus", handleRefresh); document.removeEventListener("visibilitychange", handleRefresh); };
+  }, [appointments, getToken]);
 
   return (
     <div className="space-y-6">
@@ -105,6 +145,21 @@ export function PatientDashboardContent() {
           <OverviewCard label="Past" count={counts?.past} loading={loading} error={Boolean(error)} icon={History} tone="completed" />
           <OverviewCard label="Cancelled" count={counts?.cancelled} loading={loading} error={Boolean(error)} icon={XCircle} tone="cancelled" />
         </div>
+      </section>
+
+      <section aria-labelledby="patient-queue-title" className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4"><div><p className="text-xs font-semibold uppercase tracking-wide text-primary">Appointment queue</p><h2 id="patient-queue-title" className="mt-1 text-lg font-semibold text-card-foreground">Your tokens and check-in status</h2></div><span className="text-sm text-muted-foreground">Refreshes automatically while waiting</span></div>
+        {loading ? <p className="mt-4 text-sm text-muted-foreground" role="status">Loading queue details…</p> : null}
+        {!loading && queueAppointments.length === 0 ? <p className="mt-4 text-sm text-muted-foreground">No active appointment tokens.</p> : null}
+        {queueAppointments.length ? <ul className="mt-2 divide-y divide-border">{queueAppointments.map((appointment) => {
+          const queue = queues[appointment.id];
+          const queueSummary = queue?.status === "in_progress"
+            ? <aside aria-label="Consultation status" className="min-w-56 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3 text-sm text-foreground"><p className="font-semibold text-primary">You're being seen</p><p className="mt-1">Your consultation is in progress.</p></aside>
+            : queue?.status === "waiting"
+              ? <aside aria-label="Queue position" className="min-w-56 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3 text-sm text-foreground">{queue.current_token ? <><p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Now serving</p><p className="mt-0.5 text-lg font-semibold text-primary">Token {queue.current_token}</p><p className="mt-2 font-medium">Your position: {queue.position ?? "—"}</p><p className="text-muted-foreground">{queue.people_ahead ?? 0} people ahead</p></> : queue.position === 1 ? <><p className="text-lg font-semibold text-primary">You're next</p><p className="mt-1">No patients ahead</p></> : <><p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Your queue position</p><p className="mt-0.5 text-lg font-semibold text-primary">Position {queue.position ?? "—"}</p><p className="text-muted-foreground">{queue.people_ahead ?? 0} people ahead</p></>}</aside>
+              : null;
+          return <li key={appointment.id} className="py-4"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-semibold text-card-foreground">Dr. {appointment.doctor_first_name} {appointment.doctor_last_name}</p><p className="mt-1 text-sm text-muted-foreground">{formatAppointmentDate(appointmentStart(appointment)!)} · {formatAppointmentTime(appointmentStart(appointment)!)} IST</p><p className="mt-2 text-sm"><span className="font-medium text-foreground">Token Number:</span> {queue!.token_number}</p><QueueStatusBadge className="mt-2" status={queue!.status} /></div>{queueSummary}</div></li>;
+        })}</ul> : null}
       </section>
 
       <section aria-labelledby="next-appointment-title" aria-live="polite" className="overflow-hidden rounded-3xl border border-primary/20 bg-card shadow-md shadow-primary/5">

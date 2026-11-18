@@ -20,11 +20,19 @@ const localProfileSchema = z.discriminatedUnion("role", [
 const receptionistQueueEntrySchema = z.object({
   appointment_id: z.string().uuid(), doctor_id: z.string().uuid(), date: z.string(), token_number: z.number().int(),
   status: z.enum(["not_checked_in", "waiting", "in_progress", "completed", "no_show", "cancelled"]),
+  no_show_eligible: z.boolean().default(false),
   checked_in_at: z.string().nullable(), called_at: z.string().nullable(), completed_at: z.string().nullable(),
   start_time: z.string(), end_time: z.string(), patient_id: z.string().uuid(), patient_first_name: z.string(),
   patient_last_name: z.string(), doctor_first_name: z.string(), doctor_last_name: z.string(),
 });
 export type ReceptionQueueEntry = z.infer<typeof receptionistQueueEntrySchema>;
+const doctorQueueSchema = z.object({
+  date: z.string(), current_token: z.number().int().nullable(),
+  current: receptionistQueueEntrySchema.nullable(), waiting: z.array(receptionistQueueEntrySchema), entries: z.array(receptionistQueueEntrySchema),
+});
+const patientQueueSchema = z.object({ token_number: z.number().int(), position: z.number().int().nullable(), people_ahead: z.number().int().nullable(), current_token: z.number().int().nullable(), status: receptionistQueueEntrySchema.shape.status, date: z.string() });
+export type DoctorQueue = z.infer<typeof doctorQueueSchema>;
+export type PatientQueue = z.infer<typeof patientQueueSchema>;
 
 const doctorSchema = z.object({
   id: z.string().uuid(),
@@ -356,10 +364,32 @@ export async function getReceptionQueue(token: string, date: string, doctorId?: 
   const payload = await request<unknown>(token, `/queue/reception?${query.toString()}`);
   const parsed = z.object({
     date: z.string(), current_token: z.number().int().nullable(),
-    current: receptionistQueueEntrySchema.nullable(), entries: z.array(receptionistQueueEntrySchema),
+    current: receptionistQueueEntrySchema.nullable(), waiting: z.array(receptionistQueueEntrySchema), entries: z.array(receptionistQueueEntrySchema),
   }).safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete reception queue.");
   return parsed.data.entries;
+}
+
+export async function getDoctorQueue(token: string, date: string): Promise<DoctorQueue> {
+  const payload = await request<unknown>(token, `/queue/doctor?date=${encodeURIComponent(date)}`);
+  const parsed = doctorQueueSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete doctor queue.");
+  return parsed.data;
+}
+
+export async function callNextQueuePatient(token: string, date: string) {
+  return request<unknown>(token, `/queue/call-next?date=${encodeURIComponent(date)}`, { method: "POST" });
+}
+
+export async function completeQueueConsultation(token: string, appointmentId: string) {
+  return request<unknown>(token, `/queue/appointments/${encodeURIComponent(appointmentId)}/complete`, { method: "POST" });
+}
+
+export async function getPatientQueue(token: string, appointmentId: string): Promise<PatientQueue> {
+  const payload = await request<unknown>(token, `/queue/patient/appointments/${encodeURIComponent(appointmentId)}`);
+  const parsed = patientQueueSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete patient queue position.");
+  return parsed.data;
 }
 
 export async function checkInReceptionAppointment(token: string, appointmentId: string) {
@@ -599,6 +629,14 @@ export async function getAppointment(token: string, appointmentId: string): Prom
 
 export async function getAppointmentsView(token: string, view: "upcoming"): Promise<PatientAppointment[]> {
   const query = new URLSearchParams({ view });
+  const payload = await request<unknown>(token, `/appointments?${query.toString()}`);
+  const parsed = z.array(appointmentSchema).safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete appointment list.");
+  return parsed.data;
+}
+
+export async function getAppointmentsForDate(token: string, date: string): Promise<PatientAppointment[]> {
+  const query = new URLSearchParams({ from: date, to: date });
   const payload = await request<unknown>(token, `/appointments?${query.toString()}`);
   const parsed = z.array(appointmentSchema).safeParse(payload);
   if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete appointment list.");

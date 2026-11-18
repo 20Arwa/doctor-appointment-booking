@@ -37,7 +37,6 @@ const envSchema = z.object({
     (value) => value === "" ? undefined : value,
     z.string().min(1).refine(isValidTimeZone, "APPLICATION_TIMEZONE must be a valid IANA timezone").optional(),
   ),
-  QUEUE_NO_SHOW_GRACE_MINUTES: z.coerce.number().int().min(0).max(1440).default(0),
   DATABASE_URL: z.string().url().refine((value) => value.startsWith("postgres://") || value.startsWith("postgresql://"), {
     message: "DATABASE_URL must use PostgreSQL",
   }),

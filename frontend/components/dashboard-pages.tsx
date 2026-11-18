@@ -1,13 +1,14 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
-import { CalendarCheck2, CalendarDays, CalendarRange, Clock3, MessageCircle, ReceiptText, RefreshCw, UserRound, UsersRound } from "lucide-react";
+import { CalendarCheck2, CalendarDays, CalendarRange, Clock3, MessageCircle, ReceiptText, RefreshCw, UserRound, UsersRound, PhoneCall } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useDashboardProfile } from "@/components/role-application-shell";
 import { PatientDashboardContent } from "@/components/patient-dashboard-content";
+import { QueueStatusBadge } from "@/components/queue-status-badge";
 import { AssistantConversationHistory } from "@/components/assistant-conversation-history";
-import { getAppointments, type PatientAppointment } from "@/lib/profile-api";
+import { callNextQueuePatient, completeQueueConsultation, getAppointments, getDoctorQueue, type DoctorQueue, type PatientAppointment } from "@/lib/profile-api";
 import { formatInstantDate } from "@/lib/date-format";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
@@ -84,25 +85,79 @@ export function DoctorDashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retryKey, setRetryKey] = useState(0);
+  const [queue, setQueue] = useState<DoctorQueue | null>(null);
+  const [queueError, setQueueError] = useState<string | null>(null);
+  const [queueAction, setQueueAction] = useState(false);
+  const today = currentTime === null ? null : applicationDate(new Date(currentTime));
   const name = `${profile.first_name} ${profile.last_name}`.trim();
 
   useEffect(() => {
     let active = true;
-    void getToken().then((token) => {
-      if (!token) throw new Error("Your session could not be verified. Please try again.");
-      return getAppointments(token);
-    }).then((result) => {
-      if (active) {
-        setAppointments(result);
-        setCurrentTime(Date.now());
+    let inFlight = false;
+    let timer: number | undefined;
+    const refresh = async () => {
+      if (inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      try {
+        const token = await getToken();
+        if (!token) throw new Error("Your session could not be verified. Please try again.");
+        const result = await getAppointments(token);
+        if (active) { setAppointments(result); setCurrentTime(Date.now()); setError(null); }
+      } catch (cause) {
+        if (active) setError(cause instanceof Error ? cause.message : "We couldn't load your appointments.");
+      } finally {
+        inFlight = false;
+        if (active) setLoading(false);
       }
-    }).catch((cause: unknown) => {
-      if (active) setError(cause instanceof Error ? cause.message : "We couldn't load your appointments.");
-    }).finally(() => {
-      if (active) setLoading(false);
-    });
-    return () => { active = false; };
+    };
+    void refresh();
+    timer = window.setInterval(() => { if (document.visibilityState === "visible") void refresh(); }, 15_000);
+    const handleFocus = () => { if (document.visibilityState === "visible") void refresh(); };
+    window.addEventListener("focus", handleFocus);
+    const handleVisibility = () => { if (document.visibilityState === "visible") void refresh(); };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => { active = false; if (timer !== undefined) window.clearInterval(timer); window.removeEventListener("focus", handleFocus); document.removeEventListener("visibilitychange", handleVisibility); };
   }, [getToken, retryKey]);
+
+  useEffect(() => {
+    if (today === null) return;
+    let active = true;
+    let timer: number | undefined;
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      try {
+        const token = await getToken();
+        if (!token) throw new Error("Your session could not be verified.");
+        const result = await getDoctorQueue(token, today);
+        if (active) { setQueue(result); setQueueError(null); }
+      } catch (cause) {
+        if (active) setQueueError(cause instanceof Error ? cause.message : "We couldn't load the live queue.");
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refresh();
+    timer = window.setInterval(() => { if (document.visibilityState === "visible") void refresh(); }, 15_000);
+    const handleVisibility = () => { if (document.visibilityState === "visible") void refresh(); };
+    window.addEventListener("focus", handleVisibility);
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => { active = false; if (timer !== undefined) window.clearInterval(timer); window.removeEventListener("focus", handleVisibility); document.removeEventListener("visibilitychange", handleVisibility); };
+  }, [getToken, today, retryKey]);
+
+  async function runQueueAction(action: (token: string) => Promise<unknown>) {
+    setQueueAction(true); setQueueError(null);
+    try {
+      const token = await getToken();
+      if (!token || !today) throw new Error("Your session could not be verified.");
+      await action(token);
+      setQueue(await getDoctorQueue(token, today));
+      setAppointments(await getAppointments(token));
+      setCurrentTime(Date.now());
+    } catch (cause) { setQueueError(cause instanceof Error ? cause.message : "The queue action could not be completed."); }
+    finally { setQueueAction(false); }
+  }
 
   useEffect(() => {
     const initialTime = window.setTimeout(() => setCurrentTime(Date.now()), 0);
@@ -111,7 +166,6 @@ export function DoctorDashboardPage() {
   }, []);
 
   const now = currentTime ?? 0;
-  const today = currentTime === null ? null : applicationDate(new Date(currentTime));
   const currentDateLabel = currentTime === null ? "Today" : `${formatDate(new Date(currentTime))}`;
   const upcoming = useMemo(() => appointments.filter((appointment) => {
     const instant = appointmentStart(appointment);
@@ -145,6 +199,17 @@ export function DoctorDashboardPage() {
       </header>
 
       {error ? <div className="flex flex-col gap-3 rounded-xl border border-destructive/40 bg-destructive/5 p-4 sm:flex-row sm:items-center sm:justify-between" role="alert"><p className="text-sm text-foreground">{error}</p><button type="button" onClick={retry} className="inline-flex min-h-10 w-fit items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"><RefreshCw aria-hidden="true" className="size-4" />Try again</button></div> : null}
+
+      <section aria-labelledby="doctor-live-queue-title" className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4"><div><p className="text-xs font-semibold uppercase tracking-wide text-primary">Live queue</p><h2 id="doctor-live-queue-title" className="mt-1 text-lg font-semibold text-card-foreground">Today’s patients</h2></div><span className="text-sm text-muted-foreground" aria-live="polite">Updates automatically</span></div>
+        {queueError ? <p className="mt-4 text-sm text-destructive" role="alert">{queueError}</p> : null}
+        {!queue && !queueError ? <p className="mt-4 text-sm text-muted-foreground" role="status">Loading the queue…</p> : null}
+        {queue ? <>
+          <div className="mt-4 rounded-xl border border-primary/20 bg-primary/5 p-4"><p className="text-xs font-semibold uppercase tracking-wide text-primary">Currently in consultation</p>{queue.current ? <div className="mt-2 flex flex-wrap items-center justify-between gap-3"><div><p className="font-semibold text-card-foreground">Token {queue.current.token_number} · {queue.current.patient_first_name} {queue.current.patient_last_name}</p><p className="mt-1 text-sm text-muted-foreground">{formatTime(new Date(`${queue.current.date}T${queue.current.start_time}+05:30`))} IST</p><QueueStatusBadge className="mt-2" status={queue.current.status} /></div><button type="button" disabled={queueAction} onClick={() => void runQueueAction((token) => completeQueueConsultation(token, queue.current!.appointment_id))} className="min-h-10 rounded-lg bg-primary px-4 text-sm font-semibold text-primary-foreground disabled:opacity-50">Complete Consultation</button></div> : <p className="mt-2 text-sm text-muted-foreground">No patient is being seen right now.</p>}</div>
+          <div className="mt-4 flex items-center justify-between gap-3"><h3 className="font-semibold text-card-foreground">Waiting patients</h3><button type="button" disabled={queueAction || Boolean(queue.current) || !queue.waiting.length} onClick={() => void runQueueAction((token) => callNextQueuePatient(token, queue.date))} className="inline-flex min-h-10 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-semibold text-primary-foreground disabled:opacity-50"><PhoneCall aria-hidden="true" className="size-4" />Call Next</button></div>
+          {queue.waiting.length ? <ol className="mt-2 divide-y divide-border">{queue.waiting.map((entry) => <li key={entry.appointment_id} className="flex flex-wrap items-center justify-between gap-3 py-3"><div><p className="font-semibold text-card-foreground">{entry.patient_first_name} {entry.patient_last_name} <span className="ml-1 rounded-full bg-secondary px-2 py-1 text-xs font-semibold text-secondary-foreground">Token {entry.token_number}</span></p><p className="mt-1 text-sm text-muted-foreground">Appointment {formatTime(new Date(`${entry.date}T${entry.start_time}+05:30`))} IST</p><p className="mt-1 text-sm text-muted-foreground">Checked in {entry.checked_in_at ? new Intl.DateTimeFormat("en-IN", { dateStyle: "medium", timeStyle: "short", timeZone: APPLICATION_TIME_ZONE }).format(new Date(entry.checked_in_at)) + " IST" : "time unavailable"}</p></div><QueueStatusBadge status={entry.status} /></li>)}</ol> : <p className="mt-2 text-sm text-muted-foreground">No patients are waiting.</p>}
+        </> : null}
+      </section>
 
       <section aria-labelledby="doctor-next-title" className="overflow-hidden rounded-3xl border border-primary/25 bg-card shadow-md shadow-primary/5">
         <div className="flex items-center gap-3 border-b border-border bg-secondary/35 px-5 py-4 sm:px-7">

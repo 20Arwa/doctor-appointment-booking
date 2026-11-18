@@ -20,7 +20,7 @@ import { Button } from "@/components/ui/button";
 import { notifyInAppNotificationsChanged, notifySuccess } from "@/lib/notifications";
 import { AppShellLoading } from "@/components/app-shell-loading";
 import { CheckoutReturnNotice, type CheckoutReturnState } from "@/components/checkout-return-notice";
-import { cancelAppointmentPaymentOrder, createAppointmentPaymentOrder, getAppointmentPaymentStatus, getDoctor, getDoctorSlots, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
+import { cancelAppointmentPaymentOrder, createAppointmentPaymentOrder, getAppointmentPaymentStatus, getDoctor, getDoctorSlots, getPatientQueue, ProfileApiError, type AvailabilitySlot, type DirectoryDoctor, type PatientAppointment } from "@/lib/profile-api";
 import { dateNavigationTarget, formatDateOnly } from "@/lib/date-format";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
@@ -124,6 +124,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
   const [bookingError, setBookingError] = useState<string | null>(null);
   const [bookingDialogOpen, setBookingDialogOpen] = useState(false);
   const [confirmation, setConfirmation] = useState<PatientAppointment | null>(null);
+  const [confirmationToken, setConfirmationToken] = useState<number | null>(null);
   const [paymentPendingId, setPaymentPendingId] = useState<string | null>(null);
   const [checkoutReturn, setCheckoutReturn] = useState<CheckoutReturnState>(null);
   const [checkingPayment, setCheckingPayment] = useState(false);
@@ -147,6 +148,15 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
     notifyInAppNotificationsChanged();
     notifySuccess("Appointment booked successfully!", `appointment-booked-${confirmation.id}`);
   }, [confirmation]);
+
+  useEffect(() => {
+    if (!confirmation) { setConfirmationToken(null); return; }
+    let active = true;
+    void getToken().then((token) => token ? getPatientQueue(token, confirmation.id) : null)
+      .then((queue) => { if (active && queue) setConfirmationToken(queue.token_number); })
+      .catch(() => { if (active) setConfirmationToken(null); });
+    return () => { active = false; };
+  }, [confirmation, getToken]);
 
   useEffect(() => {
     const handleRefreshAvailability = () => {
@@ -397,6 +407,7 @@ export function DoctorBookingPage({ doctorId }: { doctorId: string }) {
               </div>
               <p className="mt-4 text-foreground">Dr. {confirmation.doctor_first_name} {confirmation.doctor_last_name} · {confirmation.specialty}</p>
               <p className="mt-1 text-sm text-muted-foreground">{formatSlotDate(confirmation.date)} at {formatSlotTime(confirmation.start_time)} IST</p>
+              <p className="mt-3 font-semibold text-foreground">Token Number: {confirmationToken ?? "Loading…"}</p>
               <p className="mt-3 text-sm text-muted-foreground">Confirmation ID: {confirmation.id}</p>
             </section>
           ) : null}
