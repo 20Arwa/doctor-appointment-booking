@@ -88,6 +88,7 @@ async function send(request, response) {
   };
   try {
     const result = await getService(response).send({ database: response.locals.database, user: response.locals.user, conversationId: response.locals.params.conversationId, requestId: response.locals.body.request_id, diagnosticRequestId: requestId, content: response.locals.body.content, applicationTimezone: response.locals.applicationTimezone, paymentService: response.locals.paymentService, logger });
+    response.locals.triggerAppointmentOutbox?.();
     const userMessage = result?.user_message;
     const assistantMessage = result?.assistant_message;
     logger.info("api_response_ready", {
@@ -133,7 +134,9 @@ async function confirmAction(_request, response) {
   if (!patientOnly(response)) return response.status(403).json({ error: { code: "FORBIDDEN", message: "Only patients can confirm appointment actions" } });
   try {
     const { conversationId, intentId } = response.locals.params;
-    return response.json(await getActionService(response).confirm(response.locals.user, conversationId, intentId));
+    const result = await getActionService(response).confirm(response.locals.user, conversationId, intentId);
+    response.locals.triggerAppointmentOutbox?.();
+    return response.json(result);
   } catch (error) { return errorResponse(response, error); }
 }
 

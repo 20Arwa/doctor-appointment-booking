@@ -21,16 +21,46 @@ function databaseFor(responses, profileRows = [], queryRows = []) {
   } }, statements };
 }
 
-test("check-in requires receptionist role and atomically changes only a not-checked-in booking", async () => {
-  const mocked = databaseFor([{ rows: [{ appointment_id: "appt", status: "waiting", token_number: 4 }] }]);
+test("check-in requires receptionist role and atomically records its confirmation email", async () => {
+  const mocked = databaseFor([
+    { rows: [{ appointment_id: "appt", status: "waiting", token_number: 4 }] },
+    { rows: [{ id: "appt", patient_user_id: "patient-user", patient_email: "patient@example.test", token_number: 4 }] },
+    { rows: [] },
+  ]);
   const result = await queue.checkIn(mocked.database, { id: "reception", role: "receptionist" }, "appt");
   assert.equal(result.status, "waiting");
   assert.match(mocked.statements[1].sql, /q\.status = 'not_checked_in'/);
   assert.match(mocked.statements[1].sql, /checked_in_by_user_id = \$2/);
+  assert.match(mocked.statements[2].sql, /JOIN patients p ON p.id = a.patient_id/);
+  assert.match(mocked.statements[3].sql, /INSERT INTO appointment_notification_outbox/);
+  assert.equal(mocked.statements[3].values[1], "appointment.queue_checked_in");
+  assert.equal(mocked.statements[3].values[0], "appointment.queue_checked_in:appt");
+  assert.match(mocked.statements[3].sql, /ON CONFLICT \(event_key\) DO NOTHING/);
+  assert.match(mocked.statements[1].sql, /q\.service_date = \(NOW\(\) AT TIME ZONE \$3\)::date/);
   await assert.rejects(
     queue.checkIn(mocked.database, { id: "doctor", role: "doctor" }, "appt"),
     (error) => error instanceof AppointmentError && error.status === 403,
   );
+});
+
+test("failed check-in notification enqueue rolls the complete check-in transaction back", async () => {
+  const statements = [];
+  const client = {
+    async query(sql) {
+      statements.push(sql);
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] };
+      if (sql.startsWith("UPDATE appointment_queue_entries")) return { rows: [{ appointment_id: "appt", status: "waiting" }] };
+      if (sql.startsWith("SELECT a.id, q.token_number")) return { rows: [{ id: "appt" }] };
+      if (sql.startsWith("INSERT INTO appointment_notification_outbox")) throw new Error("event type constraint violation");
+      throw new Error(`Unexpected transaction query: ${sql}`);
+    },
+    release() {},
+  };
+  const database = { async connect() { return client; } };
+  await assert.rejects(queue.checkIn(database, { id: "reception", role: "receptionist" }, "appt"), /constraint violation/);
+  assert.match(statements[statements.length - 2], /INSERT INTO appointment_notification_outbox/);
+  assert.equal(statements.at(-1), "ROLLBACK");
+  assert.equal(statements.includes("COMMIT"), false);
 });
 
 test("duplicate check-in is rejected when the guarded update affects no queue entry", async () => {
@@ -93,6 +123,31 @@ test("migration resets every lifecycle field on re-confirmation and protects dai
   assert.doesNotMatch(migration, /scheduled_start_time\) AT TIME ZONE 'Asia\/Kolkata' > NOW\(\)/);
 });
 
+test("queue email event types are allowed through the existing delivery and outbox records", () => {
+  const migration = fs.readFileSync(path.join(__dirname, "../migrations/032_queue_email_events.sql"), "utf8");
+  const deliveryConstraint = migration.match(/ADD CONSTRAINT notification_deliveries_event_type_check CHECK \(event_type IN \(([\s\S]*?)\)\)/)?.[1] || "";
+  const outboxConstraint = migration.match(/ADD CONSTRAINT appointment_notification_outbox_event_type_check CHECK \(event_type IN \(([\s\S]*?)\)\)/)?.[1] || "";
+  const values = (constraint) => [...constraint.matchAll(/'([^']+)'/g)].map((match) => match[1]);
+  assert.deepEqual(values(deliveryConstraint), [
+    "appointment.booked", "appointment.cancelled", "appointment.rescheduled",
+    "appointment.reminder_24h", "appointment.reminder_1h",
+    "appointment.assisted_reschedule_requested", "appointment.queue_checked_in", "appointment.doctor_ready",
+  ]);
+  assert.deepEqual(values(outboxConstraint), [
+    "appointment.booked", "appointment.cancelled", "appointment.rescheduled",
+    "appointment.queue_checked_in", "appointment.doctor_ready",
+  ]);
+  assert.match(migration, /DROP CONSTRAINT notification_deliveries_event_type_check/);
+  assert.match(migration, /DROP CONSTRAINT appointment_notification_outbox_event_type_check/);
+  const migrationFiles = fs.readdirSync(path.join(__dirname, "../migrations")).filter((file) => file.endsWith(".sql")).sort();
+  assert.equal(migrationFiles.at(-2), "032_queue_email_events.sql");
+  assert.equal(migrationFiles.at(-1), "033_scheduled_reminder_outbox_events.sql");
+  const reminderMigration = fs.readFileSync(path.join(__dirname, "../migrations/033_scheduled_reminder_outbox_events.sql"), "utf8");
+  assert.match(reminderMigration, /'appointment\.reminder_24h', 'appointment\.reminder_1h'/);
+  assert.match(reminderMigration, /ON CONFLICT \(event_key\) DO NOTHING/);
+  assert.match(reminderMigration, /WHERE due_at > NOW\(\)/);
+});
+
 test("Call Next serializes per doctor/day and refuses a second active consultation", async () => {
   const mocked = databaseFor([{ rows: [] }, { rows: [{ appointment_id: "current" }] }], [{ rows: [{ id: "doctor-id" }] }]);
   await assert.rejects(
@@ -117,12 +172,15 @@ test("doctor queue separates active and waiting entries, with scheduled appointm
 test("Call Next chooses the earliest check-in, with token number as tie-breaker", async () => {
   let nextQuery = "";
   let calledUpdate = "";
+  let eventInsert;
   const client = {
-    async query(sql) {
+    async query(sql, values) {
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("pg_advisory_xact_lock")) return { rows: [] };
       if (sql.includes("status = 'in_progress' FOR UPDATE")) return { rows: [] };
       if (sql.includes("status = 'waiting'")) { nextQuery = sql; return { rows: [{ appointment_id: "earlier-checkin" }] }; }
       if (sql.startsWith("UPDATE appointment_queue_entries SET status = 'in_progress'")) { calledUpdate = sql; return { rows: [{ appointment_id: "earlier-checkin", token_number: 11, status: "in_progress" }] }; }
+      if (sql.startsWith("SELECT a.id, q.token_number")) return { rows: [{ id: "earlier-checkin", token_number: 11, patient_user_id: "patient-user", patient_email: "patient@example.test" }] };
+      if (sql.startsWith("INSERT INTO appointment_notification_outbox")) { eventInsert = { sql, values }; return { rows: [] }; }
       throw new Error(`Unexpected transaction query: ${sql}`);
     },
     release() {},
@@ -135,6 +193,9 @@ test("Call Next chooses the earliest check-in, with token number as tie-breaker"
   assert.equal(result.appointment_id, "earlier-checkin");
   assert.match(nextQuery, /ORDER BY q\.checked_in_at ASC, q\.token_number ASC LIMIT 1 FOR UPDATE OF q/);
   assert.match(calledUpdate, /called_at = NOW\(\), called_by_user_id = \$2/);
+  assert.equal(eventInsert.values[0], "appointment.doctor_ready:earlier-checkin");
+  assert.equal(eventInsert.values[1], "appointment.doctor_ready");
+  assert.match(eventInsert.sql, /ON CONFLICT \(event_key\) DO NOTHING/);
 });
 
 test("concurrent Call Next requests serialize and only one patient becomes active", async () => {
@@ -163,6 +224,8 @@ test("concurrent Call Next requests serialize and only one patient becomes activ
             active = true; called = true;
             return { rows: [{ appointment_id: "appt-1", status: "in_progress" }] };
           }
+          if (sql.startsWith("SELECT a.id, q.token_number")) return { rows: [{ id: "appt-1", token_number: 5, patient_user_id: "patient-user", patient_email: "patient@example.test" }] };
+          if (sql.startsWith("INSERT INTO appointment_notification_outbox")) return { rows: [] };
           if (sql === "COMMIT" || sql === "ROLLBACK") { releaseLock?.(); return { rows: [] }; }
           throw new Error(`Unexpected transaction query: ${sql}`);
         },

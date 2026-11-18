@@ -70,6 +70,10 @@ function createAssistedRescheduleNotificationService({
       `SELECT request.id, request.appointment_id, request.patient_id, request.doctor_id,
               request.previous_date::text AS previous_date,
               request.previous_start_time::text AS previous_start_time,
+              appointment.scheduled_date::text AS date,
+              appointment.scheduled_start_time::text AS start_time,
+              appointment.scheduled_end_time::text AS end_time,
+              availability.mode, queue.token_number,
               appointment.updated_at = request.appointment_updated_at AS snapshot_matches,
               appointment.status AS appointment_status,
               request.expires_at,
@@ -79,6 +83,8 @@ function createAssistedRescheduleNotificationService({
                WHERE suggestion.request_id = request.id) AS suggestion_count
        FROM assisted_reschedule_requests request
        JOIN appointments appointment ON appointment.id = request.appointment_id
+       JOIN availability ON availability.id = appointment.availability_id
+       LEFT JOIN appointment_queue_entries queue ON queue.appointment_id = appointment.id
        JOIN patients patient ON patient.id = request.patient_id
        JOIN users patient_user ON patient_user.id = patient.user_id
        JOIN doctors doctor ON doctor.id = request.doctor_id
@@ -132,6 +138,11 @@ function createAssistedRescheduleNotificationService({
       patient_user_id: request.patient_user_id,
       doctor_first_name: request.doctor_first_name,
       doctor_last_name: request.doctor_last_name,
+      date: request.date,
+      start_time: request.start_time,
+      end_time: request.end_time,
+      mode: request.mode,
+      token_number: request.token_number,
       previous_date: request.previous_date,
       previous_start_time: request.previous_start_time,
       suggestion_count: request.suggestion_count,

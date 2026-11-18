@@ -20,6 +20,33 @@ async function withTransaction(database, callback) {
   } finally { client.release(); }
 }
 
+async function enqueueQueueEmail(client, eventType, queueEntry) {
+  const result = await client.query(
+    `SELECT a.id, q.token_number, q.service_date::text AS date,
+            a.scheduled_start_time::text AS start_time, a.scheduled_end_time::text AS end_time, av.mode,
+            p.user_id AS patient_user_id, pu.email AS patient_email,
+            pu.first_name AS patient_first_name, pu.last_name AS patient_last_name,
+            d.user_id AS doctor_user_id, du.email AS doctor_email,
+            du.first_name AS doctor_first_name, du.last_name AS doctor_last_name
+       FROM appointment_queue_entries q
+       JOIN appointments a ON a.id = q.appointment_id
+       JOIN availability av ON av.id = a.availability_id
+       JOIN patients p ON p.id = a.patient_id
+       JOIN users pu ON pu.id = p.user_id
+       JOIN doctors d ON d.id = q.doctor_id
+       JOIN users du ON du.id = d.user_id
+      WHERE q.appointment_id = $1`, [queueEntry.appointment_id],
+  );
+  if (!result.rows[0]) fail(409, "QUEUE_STATE_CONFLICT", "The queue changed before its notification could be recorded");
+  const appointment = result.rows[0];
+  const eventKey = `${eventType}:${appointment.id}`;
+  await client.query(
+    `INSERT INTO appointment_notification_outbox (event_key, event_type, appointment_id, actor_role, payload)
+     VALUES ($1, $2, $3, 'system', $4::jsonb) ON CONFLICT (event_key) DO NOTHING`,
+    [eventKey, eventType, appointment.id, JSON.stringify(appointment)],
+  );
+}
+
 async function doctorIdForUser(database, user) {
   if (user.role !== "doctor") fail(403, "FORBIDDEN", "Only doctors may access this queue");
   const result = await database.query("SELECT id FROM doctors WHERE user_id = $1", [user.id]);
@@ -97,6 +124,7 @@ async function checkIn(database, user, appointmentId, timeZone = "Asia/Kolkata")
       [appointmentId, user.id, timeZone],
     );
     if (!result.rows[0]) fail(409, "QUEUE_STATE_CONFLICT", "This appointment cannot be checked in or has already been checked in");
+    await enqueueQueueEmail(client, "appointment.queue_checked_in", result.rows[0]);
     return result.rows[0];
   });
 }
@@ -138,6 +166,7 @@ async function callNext(database, user, requestedDate, timeZone = "Asia/Kolkata"
         WHERE appointment_id = $1 RETURNING appointment_id, doctor_id, service_date::text AS date, token_number, status, called_at`,
       [next.rows[0].appointment_id, user.id],
     );
+    await enqueueQueueEmail(client, "appointment.doctor_ready", called.rows[0]);
     return called.rows[0];
   });
 }

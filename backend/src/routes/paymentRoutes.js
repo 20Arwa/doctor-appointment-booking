@@ -4,9 +4,9 @@ const { requireClerkIdentity, requireLocalUser } = require("../middleware/auth")
 const { validate } = require("../middleware/validate");
 const { createPaymentOrderSchema, paymentHistoryQuerySchema, paymentIdParamsSchema } = require("../validators/paymentSchemas");
 
-function createPaymentRoutes({ service, webhook = false }) {
+function createPaymentRoutes({ service, webhook = false, onWebhookCommitted }) {
   const router = express.Router();
-  const controller = createPaymentController({ service });
+  const controller = createPaymentController({ service, onWebhookCommitted });
   if (webhook) {
     router.post("/", express.raw({ type: "application/json", limit: "1mb" }), controller.webhook);
     return router;

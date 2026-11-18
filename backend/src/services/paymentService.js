@@ -139,7 +139,7 @@ function stripeReceiptUrl(value) {
   }
 }
 
-function createPaymentService({ database, stripe, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now, reconcileAssistantAction = async () => {} }) {
+function createPaymentService({ database, stripe, frontendOrigin, timeZone = "Asia/Kolkata", logger = console, now = Date.now, reconcileAssistantAction = async () => {}, onPaidBookingCommitted = () => {} }) {
   const refundService = createRefundService({ database, stripe, logger, now, reconcileAssistantAction: (...args) => reconcileAssistantRefund(...args) });
 
   async function reconcileAssistantRefund(refundId, refundStatus) {
@@ -517,7 +517,14 @@ function createPaymentService({ database, stripe, frontendOrigin, timeZone = "As
   async function processSession(payment, session, event) {
     validateSession(payment, session);
     if (session.payment_status === "paid") {
-      return confirmPaidSession(payment, session, event);
+      const result = await confirmPaidSession(payment, session, event);
+      // Payment-status polling can confirm a paid Checkout before Stripe's webhook arrives.
+      // The transaction has committed when confirmPaidSession resolves; wake the durable outbox then.
+      if (!event && result.status === "confirmed" && result.created) {
+        try { onPaidBookingCommitted(); }
+        catch (_error) { logger.error("Could not schedule paid-booking notification dispatch", { reason: "dispatch_unavailable" }); }
+      }
+      return result;
     }
     if (session.status === "expired") return markSessionFailure(payment, session, event, "expired");
     if (event?.type === "checkout.session.expired") return markSessionFailure(payment, session, event, "expired");

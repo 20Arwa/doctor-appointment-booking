@@ -1,7 +1,7 @@
 const { PaymentError } = require("../services/paymentService");
 const { StripePaymentError } = require("../services/stripeService");
 
-function createPaymentController({ service }) {
+function createPaymentController({ service, onWebhookCommitted = () => {} }) {
   async function handle(operation, request, response, next) {
     try { return await operation(request, response); }
     catch (error) {
@@ -28,6 +28,7 @@ function createPaymentController({ service }) {
     webhook(request, response, next) {
       return handle(async () => {
         const result = await service.processWebhook(request.body, request.get("stripe-signature"));
+        if (result?.status === "confirmed" && result.duplicate !== true) onWebhookCommitted();
         return response.status(200).json(result);
       }, request, response, next);
     },

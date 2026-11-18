@@ -630,6 +630,7 @@ async function updateSchedule(_request, response, next) {
     };
     await client.query("UPDATE assisted_reschedule_batches SET result = $2::jsonb WHERE id = $1", [batchId, JSON.stringify(result)]);
     await client.query("COMMIT");
+    if (assistedRequests.length) response.locals.triggerAssistedRescheduleNotifications?.();
     return response.json(result);
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
