@@ -72,6 +72,7 @@ function createDatabase({
       if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [currentUser] };
       if (sql === "SELECT id FROM patients WHERE user_id = $1") return { rows: currentUser.id === patientUserId ? [{ id: patientId }] : [] };
       if (sql === "SELECT id FROM doctors WHERE user_id = $1") return { rows: currentUser.id === doctorUserId ? [{ id: doctorId }] : [] };
+      if (sql === "SELECT status FROM appointment_queue_entries WHERE appointment_id = $1 FOR UPDATE") return { rows: [{ status: "in_progress" }] };
       if (sql.includes("FROM appointments a") && sql.includes("WHERE a.id = $1 AND")) {
         const [id, ownerId] = values;
         const appointment = state.appointments.find((row) => row.id === id);
@@ -281,6 +282,7 @@ function createDatabase({
             if (appointment) Object.assign(appointment, { status: "completed", updated_at: "2099-02-01T00:00:00.000Z" });
             return { rows: [] };
           }
+          if (sql === "SELECT status FROM appointment_queue_entries WHERE appointment_id = $1 FOR UPDATE") return { rows: [{ status: "in_progress" }] };
           if (sql.includes("FROM appointments a") && sql.includes("WHERE a.id = $1")) {
             const appointment = txAppointments.find((row) => row.id === values[0]);
             return { rows: appointment ? [details(appointment)] : [] };

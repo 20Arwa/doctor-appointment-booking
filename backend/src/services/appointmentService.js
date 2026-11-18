@@ -730,7 +730,16 @@ async function declineAssistedReschedule(database, user, requestId) {
 }
 
 async function doctorRescheduleAppointment(database, user, timeZone, appointmentId, input) {
-  const doctorId = await requireOwnDoctorId(database, user);
+  let doctorId;
+  if (user.role === "doctor") doctorId = await requireOwnDoctorId(database, user);
+  else if (user.role === "receptionist") {
+    const result = await database.query(
+      `SELECT d.id FROM appointments a JOIN availability av ON av.id = a.availability_id
+       JOIN doctors d ON d.id = av.doctor_id WHERE a.id = $1`, [appointmentId],
+    );
+    if (!result.rows[0]) fail(404, "APPOINTMENT_NOT_FOUND", "Appointment not found");
+    doctorId = result.rows[0].id;
+  } else fail(403, "FORBIDDEN", "Only doctors or receptionists may reschedule this appointment");
   const now = timeContext(timeZone);
   if (!input.availability_id && !slotStartsInFuture({ date: input.date, start_time: input.start_time }, now)) {
     fail(409, "APPOINTMENT_TIME_NOT_FUTURE", "The new appointment time must be in the future");
@@ -760,6 +769,12 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
     if (!original) fail(404, "APPOINTMENT_NOT_FOUND", "Appointment not found");
     if (original.availability_id !== initial.rows[0].availability_id) fail(409, "APPOINTMENT_CHANGED", "The appointment changed; retry rescheduling");
     if (original.status !== "confirmed") fail(409, "APPOINTMENT_STATE_CONFLICT", "Only confirmed appointments can be rescheduled");
+    if (user.role === "receptionist") {
+      const queueState = await client.query(
+        "SELECT status FROM appointment_queue_entries WHERE appointment_id = $1 FOR UPDATE", [appointmentId],
+      );
+      if (queueState.rows[0]?.status === "in_progress") fail(409, "QUEUE_STATE_CONFLICT", "An active consultation cannot be rescheduled");
+    }
     if (!input.availability_id && original.date === input.date && original.start_time.slice(0, 5) === input.start_time) {
       fail(409, "APPOINTMENT_TIME_UNCHANGED", "Choose a different appointment date or time");
     }
@@ -818,7 +833,7 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
       previous_start_time: original.start_time,
       reschedule_version: updated.rows[0].reschedule_version,
     };
-    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role);
+    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role === "receptionist" ? "system" : user.role);
     return result;
   });
 }
@@ -841,6 +856,12 @@ async function completeAppointment(database, user, appointmentId) {
     );
     if (!owned.rows[0]) fail(404, "APPOINTMENT_NOT_FOUND", "Appointment not found");
     if (owned.rows[0].status !== "confirmed") fail(409, "APPOINTMENT_STATE_CONFLICT", "Only confirmed appointments can be completed");
+    const queueEntry = await client.query(
+      "SELECT status FROM appointment_queue_entries WHERE appointment_id = $1 FOR UPDATE", [appointmentId],
+    );
+    if (queueEntry.rows[0]?.status !== "in_progress") {
+      fail(409, "QUEUE_STATE_CONFLICT", "Call this patient from the queue before completing the consultation");
+    }
     await client.query("UPDATE appointments SET status = 'completed', updated_at = NOW() WHERE id = $1", [appointmentId]);
     await supersedeOpenAssistedRescheduleRequests(client, appointmentId);
     return readDetails(client, appointmentId);

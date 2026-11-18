@@ -7,6 +7,7 @@ const userRoutes = require("./routes/userRoutes");
 const patientRoutes = require("./routes/patientRoutes");
 const doctorRoutes = require("./routes/doctorRoutes");
 const appointmentRoutes = require("./routes/appointmentRoutes");
+const appointmentQueueRoutes = require("./routes/appointmentQueueRoutes");
 const { getClerkProfile } = require("./middleware/auth");
 const env = require("./config/env");
 const { createEmailNotificationService } = require("./services/emailNotificationService");
@@ -93,6 +94,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
   app.use("/api/v1/patients", patientRoutes);
   app.use("/api/v1/doctors", doctorRoutes);
   app.use("/api/v1/appointments", appointmentRoutes);
+  app.use("/api/v1/queue", appointmentQueueRoutes);
   app.use("/api/v1/notifications", inAppNotificationRoutes);
   app.use("/api/v1/assistant", assistantRoutes);
   app.use(notFoundHandler);
