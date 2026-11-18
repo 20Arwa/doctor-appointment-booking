@@ -3,6 +3,7 @@ const pool = require("./config/database");
 const { createApp } = require("./app");
 
 const app = createApp({ database: pool, frontendOrigin: env.FRONTEND_ORIGIN, applicationTimezone: env.APPLICATION_TIMEZONE });
+app.locals.startNotificationDispatch?.();
 const server = app.listen(env.PORT, () => {
   console.log(`Express API listening on port ${env.PORT}`);
 });

@@ -33,7 +33,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
 
   const app = express();
   const stripe = stripeService || createStripeService({ config: paymentConfig });
-  const notificationDeliveries = notificationDeliveryService || createNotificationDeliveryService({ database, emailNotificationService, smsNotificationService });
+  const notificationDeliveries = notificationDeliveryService || createNotificationDeliveryService({ database, emailNotificationService, smsNotificationService, timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata" });
   const inAppNotifications = inAppNotificationService || createInAppNotificationService({ database });
   const appointmentNotificationOutbox = createAppointmentNotificationOutboxService({
     database,
@@ -46,6 +46,12 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     inAppNotificationService: inAppNotifications,
     frontendOrigin: frontendOrigin || env.FRONTEND_ORIGIN,
   });
+  const triggerAppointmentOutbox = () => appointmentNotificationOutbox.trigger();
+  const triggerAssistedRescheduleNotifications = () => {
+    setImmediate(() => {
+      assistedRescheduleNotifications.run().catch((_error) => console.error("Immediate assisted reschedule notification dispatch failed", { reason: "recovery_error" }));
+    });
+  };
   let assistantActions;
   const payments = paymentService || createPaymentService({
     database,
@@ -55,6 +61,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     inAppNotificationService: inAppNotifications,
     frontendOrigin: frontendOrigin || env.FRONTEND_ORIGIN,
     timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata",
+    onPaidBookingCommitted: triggerAppointmentOutbox,
     reconcileAssistantAction: (id, outcome) => outcome.startsWith("refund:")
       ? assistantActions?.reconcileRefund(id, outcome.slice(7))
       : assistantActions?.reconcileCheckout(id, outcome),
@@ -62,7 +69,7 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
   assistantActions = createAssistantActionService({ database, paymentService: payments, timeZone: applicationTimezone || env.APPLICATION_TIMEZONE || "Asia/Kolkata" });
 
   app.use(cors({ origin: frontendOrigin, credentials: true }));
-  app.use("/api/v1/payments/webhook", paymentRoutes({ service: payments, webhook: true }));
+  app.use("/api/v1/payments/webhook", paymentRoutes({ service: payments, webhook: true, onWebhookCommitted: triggerAppointmentOutbox }));
   app.use(clerkAuthMiddleware);
   app.use(express.json());
   app.use((_request, response, next) => {
@@ -75,6 +82,8 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
     response.locals.emailNotificationService = emailNotificationService;
     response.locals.notificationDeliveryService = notificationDeliveries;
     response.locals.inAppNotificationService = inAppNotifications;
+    response.locals.triggerAppointmentOutbox = triggerAppointmentOutbox;
+    response.locals.triggerAssistedRescheduleNotifications = triggerAssistedRescheduleNotifications;
     next();
   });
   app.use("/api/v1", healthRoutes);
@@ -99,6 +108,12 @@ function createApp({ database, frontendOrigin, applicationTimezone, emailNotific
   app.use("/api/v1/assistant", assistantRoutes);
   app.use(notFoundHandler);
   app.use(errorHandler);
+
+  app.locals.startNotificationDispatch = () => {
+    void appointmentNotificationOutbox.start();
+    triggerAppointmentOutbox();
+    triggerAssistedRescheduleNotifications();
+  };
 
   return app;
 }

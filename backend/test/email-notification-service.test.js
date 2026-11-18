@@ -11,6 +11,72 @@ const appointment = {
 const ok = { ok: true, status: 201 };
 
 describe("Brevo email notification service", () => {
+  it("includes the stable queue token in the booking confirmation payload", () => {
+    const service = createEmailNotificationService({ config });
+    const payload = service.createNotificationPayload("booked", { ...appointment, token_number: 12 });
+    assert.match(payload.textContent, /Queue token: 12/);
+    assert.match(payload.htmlContent, /Queue token/);
+    const doctorPayload = service.createNotificationPayload("booked", { ...appointment, token_number: 12 }, "doctor");
+    assert.match(doctorPayload.textContent, /Queue token: 12/);
+    assert.match(doctorPayload.htmlContent, /Queue token/);
+  });
+
+  it("formats check-in and doctor-ready queue emails with token details", () => {
+    const service = createEmailNotificationService({ config });
+    const details = { ...appointment, token_number: 12 };
+    const checkedIn = service.createQueueNotificationPayload("appointment.queue_checked_in", details);
+    const ready = service.createQueueNotificationPayload("appointment.doctor_ready", details);
+    assert.equal(checkedIn.subject, "Check-in confirmed");
+    assert.match(checkedIn.textContent, /Queue token: 12/);
+    assert.match(checkedIn.htmlContent, /Queue token/);
+    assert.equal(ready.subject, "Your doctor is ready");
+    assert.match(ready.textContent, /Dr\. Dara Doctor is ready to see you/);
+    assert.deepEqual(ready.sender, { email: config.BREVO_SENDER_EMAIL, name: config.BREVO_SENDER_NAME });
+  });
+
+  it("renders recipient-specific names and the same stable token in booking, rescheduling, and cancellation emails", () => {
+    const service = createEmailNotificationService({ config });
+    const details = { ...appointment, patient_first_name: "Pia", patient_last_name: "Patient", token_number: 7 };
+    for (const action of ["booked", "rescheduled", "cancelled"]) {
+      const patient = service.createNotificationPayload(action, details, "patient");
+      const doctor = service.createNotificationPayload(action, details, "doctor");
+      assert.match(patient.textContent, /Doctor: Dr\. Dara Doctor/);
+      assert.match(patient.htmlContent, /<td[^>]*>Doctor<\/td>/);
+      assert.match(doctor.textContent, /Patient: Pia Patient/);
+      assert.doesNotMatch(doctor.textContent, /Doctor: Dr\. Dara Doctor/);
+      assert.match(doctor.htmlContent, /<td[^>]*>Patient<\/td>/);
+      const tokenLabel = action === "cancelled" ? "Previous queue token (cancelled): 7" : "Queue token: 7";
+      assert.ok(patient.textContent.includes(tokenLabel));
+      assert.ok(doctor.textContent.includes(tokenLabel));
+      assert.match(patient.htmlContent, /<table[^>]*border:1px solid/);
+      assert.ok(doctor.htmlContent.includes(action === "cancelled" ? "Previous queue token (cancelled)" : "Queue token"));
+    }
+    const legacy = service.createNotificationPayload("booked", { ...details, token_number: null });
+    assert.doesNotMatch(legacy.textContent, /Queue token/);
+    assert.doesNotMatch(legacy.htmlContent, /Queue token/);
+  });
+
+  it("uses the shared appointment detail layout for reminders and both queue emails", () => {
+    const service = createEmailNotificationService({ config });
+    const details = { ...appointment, token_number: 7 };
+    const payloads = [
+      service.createReminderPayload("24h", details),
+      service.createReminderPayload("1h", details),
+      service.createQueueNotificationPayload("appointment.queue_checked_in", details),
+      service.createQueueNotificationPayload("appointment.doctor_ready", details),
+    ];
+    for (const payload of payloads) {
+      assert.match(payload.textContent, /Queue token: 7/);
+      assert.match(payload.htmlContent, /<table[^>]*border:1px solid/);
+      assert.match(payload.htmlContent, /Queue token/);
+      assert.match(payload.htmlContent, /<td[^>]*>Doctor<\/td>/);
+    }
+    const assisted = service.createAssistedReschedulePayload(details, "https://example.test/reschedule");
+    assert.match(assisted.textContent, /Queue token: 7/);
+    assert.match(assisted.htmlContent, /<table[^>]*border:1px solid/);
+    assert.match(assisted.htmlContent, /Queue token/);
+  });
+
   it("sends appointment notifications with the configured sender and existing template", async () => {
     let request;
     const service = createEmailNotificationService({ config, fetchImpl: async (url, options) => { request = { url, options }; return { ...ok, async json() { return { messageId: "<brevo-message-id>" }; } }; } });

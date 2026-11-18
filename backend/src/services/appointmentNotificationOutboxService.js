@@ -1,8 +1,17 @@
 const BATCH_SIZE = 25;
 const LEASE_MS = 2 * 60_000;
 const RETRY_MS = 30_000;
+const QUEUE_EMAIL_EVENTS = new Set(["appointment.queue_checked_in", "appointment.doctor_ready"]);
+const REMINDER_EMAIL_EVENTS = new Set(["appointment.reminder_24h", "appointment.reminder_1h"]);
+const MAX_TIMER_DELAY_MS = 2_147_000_000;
 
 function createAppointmentNotificationOutboxService({ database, notificationDeliveryService, inAppNotificationService, logger = console }) {
+  let immediateScheduled = false;
+  let immediateRunning = null;
+  let immediatePromise = null;
+  let triggerWhileRunning = false;
+  let wakeTimer = null;
+
   async function claimBatch() {
     const result = await database.query(
       `WITH candidates AS (
@@ -43,20 +52,29 @@ function createAppointmentNotificationOutboxService({ database, notificationDeli
 
   async function dispatch(event) {
     const appointment = event.payload;
+    const queueEmailEvent = QUEUE_EMAIL_EVENTS.has(event.event_type);
     let succeeded = true;
     try {
-      const email = await notificationDeliveryService.sendAppointmentNotification({
-        eventKey: event.event_key,
-        eventType: event.event_type,
-        appointment,
-        actorRole: event.actor_role,
-      });
-      if (email.outcomes?.some((outcome) => outcome.reason === "tracking_unavailable")) succeeded = false;
+      const email = queueEmailEvent
+        ? await notificationDeliveryService.sendQueueEventEmail({ eventKey: event.event_key, eventType: event.event_type, appointment })
+        : REMINDER_EMAIL_EVENTS.has(event.event_type)
+          ? await notificationDeliveryService.sendReminderEmail({ eventKey: event.event_key, eventType: event.event_type, appointment })
+        : await notificationDeliveryService.sendAppointmentNotification({
+          eventKey: event.event_key,
+          eventType: event.event_type,
+          appointment,
+          actorRole: event.actor_role,
+        });
+      if (email.retryable || email.outcomes?.some((outcome) => outcome.reason === "tracking_unavailable")) succeeded = false;
     } catch (_error) {
       succeeded = false;
       logger.error("Appointment notification outbox Email dispatch failed", { eventId: event.id });
     }
     try {
+      if (queueEmailEvent || REMINDER_EMAIL_EVENTS.has(event.event_type)) {
+        await finish(event, succeeded);
+        return succeeded;
+      }
       const inApp = await inAppNotificationService.sendAppointmentNotification({
         eventKey: event.event_key,
         eventType: event.event_type,
@@ -72,7 +90,7 @@ function createAppointmentNotificationOutboxService({ database, notificationDeli
     return succeeded;
   }
 
-  return {
+  const service = {
     async runRecovery() {
       const events = await claimBatch();
       let processed = 0;
@@ -87,9 +105,57 @@ function createAppointmentNotificationOutboxService({ database, notificationDeli
           await finish(event, false).catch(() => {});
         }
       }
-      return { claimed: events.length, processed, pending };
+      const summary = { claimed: events.length, processed, pending };
+      await scheduleNextWake();
+      return summary;
     },
+    trigger() {
+      if (immediateRunning) { triggerWhileRunning = true; return immediateRunning; }
+      if (immediateScheduled) return immediatePromise;
+      immediateScheduled = true;
+      immediatePromise = new Promise((resolve) => {
+        setImmediate(() => {
+          immediateScheduled = false;
+          immediateRunning = this.runRecovery()
+            .catch((_error) => {
+              logger.error("Immediate appointment notification dispatch failed", { reason: "recovery_error" });
+              return null;
+            })
+            .then((result) => {
+              resolve(result);
+              return result;
+            })
+            .finally(() => {
+              immediateRunning = null;
+              if (triggerWhileRunning) { triggerWhileRunning = false; this.trigger(); }
+            });
+        });
+      });
+      return immediatePromise;
+    },
+    async start() { await scheduleNextWake(); },
   };
+  return service;
+
+  async function scheduleNextWake() {
+    try {
+      const result = await database.query(
+        "SELECT MIN(next_attempt_at) AS next_attempt_at FROM appointment_notification_outbox WHERE status = 'pending'",
+      );
+      const dueAt = result.rows[0]?.next_attempt_at ? new Date(result.rows[0].next_attempt_at).getTime() : null;
+      if (wakeTimer) clearTimeout(wakeTimer);
+      wakeTimer = null;
+      if (dueAt === null || Number.isNaN(dueAt)) return;
+      const delay = Math.max(0, Math.min(dueAt - Date.now(), MAX_TIMER_DELAY_MS));
+      wakeTimer = setTimeout(() => {
+        wakeTimer = null;
+        service.trigger();
+      }, delay);
+      wakeTimer.unref?.();
+    } catch (_error) {
+      logger.error("Could not schedule the next notification outbox wake", { reason: "database_error" });
+    }
+  }
 }
 
 module.exports = { createAppointmentNotificationOutboxService };
