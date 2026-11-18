@@ -75,6 +75,12 @@
   --status-no-show: #596579;
   --status-no-show-bg: #E8ECF2;
 
+  /* Availability modes */
+  --mode-wave: #851B49;
+  --mode-wave-bg: #F2A6C1;
+  --mode-stream: #79572D;
+  --mode-stream-bg: #F5EBDD;
+
   /* Shape */
   --radius: 0.75rem;
 }
@@ -149,6 +155,12 @@
 
   --status-no-show: #C0CAD8;
   --status-no-show-bg: #343D4A;
+
+  /* Availability modes */
+  --mode-wave: #FFC2D4;
+  --mode-wave-bg: #61233D;
+  --mode-stream: #E8C18D;
+  --mode-stream-bg: #413323;
 }
 
 @theme inline {
@@ -203,6 +215,10 @@
   --color-status-rescheduled-bg: var(--status-rescheduled-bg);
   --color-status-no-show: var(--status-no-show);
   --color-status-no-show-bg: var(--status-no-show-bg);
+  --color-mode-wave: var(--mode-wave);
+  --color-mode-wave-bg: var(--mode-wave-bg);
+  --color-mode-stream: var(--mode-stream);
+  --color-mode-stream-bg: var(--mode-stream-bg);
 
   /* Charts */
   --color-chart-1: var(--chart-1);
@@ -254,5 +270,26 @@
 @media (prefers-reduced-motion: reduce) {
   .accordion-content {
     animation-duration: 0.01ms !important;
+  }
+}
+
+@supports selector(details::details-content) {
+  details.disclosure::details-content {
+    block-size: 0;
+    opacity: 0;
+    overflow: clip;
+    transition: block-size 180ms ease, opacity 180ms ease;
+    interpolate-size: allow-keywords;
+  }
+
+  details.disclosure[open]::details-content {
+    block-size: auto;
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  details.disclosure::details-content {
+    transition-duration: 0.01ms;
   }
 }

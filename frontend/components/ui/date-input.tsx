@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CalendarDays, ChevronLeft, ChevronRight } from "lucide-react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
 function parseDate(value: string) {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
@@ -120,7 +121,8 @@ export function DateInput({ id, name, value, defaultValue = "", onChange, min, m
   }
 
   return (
-    <div className="relative">
+    <Popover open={open} onOpenChange={setOpen}>
+    <div>
       <input type="hidden" name={name} value={draft === formatDateInput(currentValue) ? currentValue : ""} />
       <div className={`flex items-stretch ${className ?? ""}`}>
       <input ref={inputRef} id={id} type="text" inputMode="text" autoComplete="off" pattern="[0-9]{1,2} [A-Za-z]{3} [0-9]{4}" required={required} disabled={disabled} placeholder={placeholder}
@@ -138,13 +140,12 @@ export function DateInput({ id, name, value, defaultValue = "", onChange, min, m
           }
         }}
         className="h-11 min-w-0 flex-1 rounded-l-lg border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground" />
-      <button type="button" disabled={disabled} aria-label="Open date picker" aria-haspopup="dialog" aria-expanded={open}
-        onClick={() => setOpen((isOpen) => !isOpen)}
+      <PopoverTrigger asChild><button type="button" disabled={disabled} aria-label="Open date picker" aria-haspopup="dialog" aria-expanded={open}
         className="inline-flex h-11 shrink-0 items-center justify-center rounded-r-lg border border-l-0 border-input bg-background px-3 text-muted-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:bg-muted">
         <CalendarDays aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-      </button>
+      </button></PopoverTrigger>
       </div>
-      {open ? <div role="dialog" aria-label="Choose a date" className="absolute z-50 mt-2 w-72 rounded-xl border border-border bg-popover p-3 text-popover-foreground shadow-lg">
+      <PopoverContent role="dialog" aria-label="Choose a date" align="start" side="bottom" className="w-72 p-3">
         <div className="mb-3 flex items-center justify-between gap-2">
           <button type="button" aria-label="Previous month" disabled={Boolean(minMonth && visibleMonth <= `${minMonth}-01`)} onClick={() => setVisibleMonth((current) => shiftMonth(current, -1))} className="inline-flex size-8 items-center justify-center rounded-md hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-40"><ChevronLeft aria-hidden="true" className="size-4" /></button>
           <p className="text-sm font-semibold">{monthLabel}</p>
@@ -152,7 +153,8 @@ export function DateInput({ id, name, value, defaultValue = "", onChange, min, m
         </div>
         <div className="grid grid-cols-7 gap-1 text-center text-xs text-muted-foreground" aria-hidden="true">{["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map((day) => <span key={day} className="py-1">{day}</span>)}</div>
         <div className="grid grid-cols-7 gap-1">{dates.map((date, index) => date ? <button key={date} type="button" aria-label={formatDateInput(date)} aria-pressed={date === currentValue} disabled={disabled || Boolean((min && date < min) || (max && date > max))} onClick={() => selectDate(date)} className={`size-8 rounded-md text-xs hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-30 ${date === currentValue ? "bg-primary font-semibold text-primary-foreground hover:bg-primary" : "text-foreground"}`}>{Number(date.slice(-2))}</button> : <span key={`blank-${index}`} aria-hidden="true" className="size-8" />)}</div>
-      </div> : null}
+      </PopoverContent>
     </div>
+    </Popover>
   );
 }

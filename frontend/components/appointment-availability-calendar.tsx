@@ -6,7 +6,7 @@ import type { AvailabilitySlot } from "@/lib/profile-api";
 
 function monthDays(month: string) {
   const [year, monthNumber] = month.split("-").map(Number);
-  const offset = new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay();
+  const offset = (new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay() + 6) % 7;
   const days = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
   const cells: (string | null)[] = [...Array.from({ length: offset }, () => null), ...Array.from({ length: days }, (_, index) => `${month}-${String(index + 1).padStart(2, "0")}`)];
   while (cells.length % 7) cells.push(null);
@@ -50,7 +50,7 @@ export function AppointmentAvailabilityCalendar({ slots, month, selectedDate, on
         <h4 className="font-semibold text-foreground" aria-live="polite">{formatMonth(month)}</h4>
         <button type="button" aria-label="Next month" onClick={() => onShiftMonth(shiftMonth(month, 1))} className="rounded-lg p-2 hover:bg-muted"><ChevronRight aria-hidden="true" className="size-4" /></button>
       </div>
-      <div className="mt-2 grid grid-cols-7 text-center text-xs text-muted-foreground">{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => <span key={day} className="py-2">{day}</span>)}</div>
+      <div className="mt-2 grid grid-cols-7 text-center text-xs text-muted-foreground">{["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((day) => <span key={day} className="py-2">{day}</span>)}</div>
       <div className="grid grid-cols-7 justify-items-center gap-1">{monthDays(month).map((day, index) => {
         if (!day) return <span key={`blank-${index}`} className="size-10" aria-hidden="true" />;
         const count = counts.get(day) ?? 0;
