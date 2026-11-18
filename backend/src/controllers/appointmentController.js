@@ -53,6 +53,7 @@ const cancelAppointment = handle(async (_request, response) => {
     response.locals.user,
     response.locals.params.id,
   );
+  response.locals.triggerAppointmentOutbox?.();
   const refund = await response.locals.paymentService.refundCancelledAppointment(response.locals.user, appointment);
   return { body: { ...appointment, refund } };
 });
@@ -73,6 +74,7 @@ const rescheduleAppointment = handle(async (_request, response) => {
     response.locals.params.id,
     response.locals.body.availability_id,
     ));
+  response.locals.triggerAppointmentOutbox?.();
   const {
     previous_date: _previousDate,
     previous_start_time: _previousStartTime,

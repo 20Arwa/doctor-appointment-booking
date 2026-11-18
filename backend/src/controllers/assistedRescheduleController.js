@@ -1,10 +1,11 @@
 const service = require("../services/assistedRescheduleService");
 const appointmentService = require("../services/appointmentService");
 
-function patientAction(operation) {
+function patientAction(operation, dispatchOutbox = false) {
   return async (request, response, next) => {
     try {
       const result = await operation(response);
+      if (dispatchOutbox) response.locals.triggerAppointmentOutbox?.();
       return response.json(result);
     } catch (error) {
       if (error instanceof appointmentService.AppointmentError) {
@@ -39,7 +40,7 @@ const confirmPatientRequest = patientAction((response) => appointmentService.con
   response.locals.applicationTimezone,
   response.locals.params.requestId,
   response.locals.body.suggestion_id,
-));
+), true);
 
 const declinePatientRequest = patientAction((response) => appointmentService.declineAssistedReschedule(
   response.locals.database,

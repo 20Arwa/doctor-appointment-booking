@@ -1,19 +1,46 @@
 const { localDateTime, slotStartsInFuture } = require("../utils/schedulingTime");
 const { appointmentEventKey } = require("./notificationDeliveryService");
 
-async function enqueueAppointmentNotification(client, eventType, appointment, actorRole) {
+async function enqueueAppointmentNotification(client, eventType, appointment, actorRole, timeZone = "Asia/Kolkata") {
   const eventKey = appointmentEventKey(eventType, appointment);
   const payload = Object.fromEntries([
     "id", "updated_at", "reschedule_version", "patient_user_id", "doctor_user_id",
     "patient_first_name", "patient_last_name",
     "patient_email", "doctor_email", "doctor_first_name", "doctor_last_name",
-    "date", "start_time", "end_time", "mode", "previous_date", "previous_start_time",
+    "date", "start_time", "end_time", "mode", "previous_date", "previous_start_time", "token_number",
   ].filter((key) => appointment[key] !== undefined).map((key) => [key, appointment[key]]));
   await client.query(
     `INSERT INTO appointment_notification_outbox (event_key, event_type, appointment_id, actor_role, payload)
      VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT (event_key) DO NOTHING`,
     [eventKey, eventType, appointment.id, actorRole, JSON.stringify(payload)],
   );
+  if (eventType === "appointment.booked" || eventType === "appointment.rescheduled") {
+    await enqueueAppointmentReminders(client, appointment, timeZone);
+  }
+}
+
+async function enqueueAppointmentReminders(client, appointment, timeZone) {
+  const payload = Object.fromEntries([
+    "id", "patient_user_id", "patient_email", "patient_first_name", "patient_last_name",
+    "doctor_user_id", "doctor_email", "doctor_first_name", "doctor_last_name", "date",
+    "start_time", "end_time", "mode", "token_number",
+  ].filter((key) => appointment[key] !== undefined).map((key) => [key, appointment[key]]));
+  for (const { eventType, reminderType, leadHours } of [
+    { eventType: "appointment.reminder_24h", reminderType: "24h", leadHours: 24 },
+    { eventType: "appointment.reminder_1h", reminderType: "1h", leadHours: 1 },
+  ]) {
+    const eventKey = `${eventType}:${appointment.id}:${appointment.date}:${String(appointment.start_time).slice(0, 8)}`;
+    await client.query(
+      `INSERT INTO appointment_notification_outbox (event_key, event_type, appointment_id, actor_role, payload, next_attempt_at)
+       SELECT $1, $2, a.id, 'system', $3::jsonb,
+              ((a.scheduled_date + a.scheduled_start_time) AT TIME ZONE $4) - ($5::int * INTERVAL '1 hour')
+         FROM appointments a
+        WHERE a.id = $6
+          AND ((a.scheduled_date + a.scheduled_start_time) AT TIME ZONE $4) - ($5::int * INTERVAL '1 hour') > NOW()
+       ON CONFLICT (event_key) DO NOTHING`,
+      [eventKey, eventType, JSON.stringify({ ...payload, reminder_type: reminderType, scheduled_date: appointment.date, scheduled_start_time: String(appointment.start_time).slice(0, 8) }), timeZone, leadHours, appointment.id],
+    );
+  }
 }
 
 const APPOINTMENT_DETAILS = `
@@ -26,13 +53,15 @@ const APPOINTMENT_DETAILS = `
          pu.last_name AS patient_last_name, pu.email AS patient_email,
          p.date_of_birth::text AS patient_date_of_birth, p.gender AS patient_gender,
          a.consultation_fee::text AS consultation_fee,
-         CASE WHEN a.consultation_fee IS NULL THEN NULL ELSE 'INR' END AS consultation_currency
+         CASE WHEN a.consultation_fee IS NULL THEN NULL ELSE 'INR' END AS consultation_currency,
+         queue.token_number
   FROM appointments a
   JOIN availability av ON av.id = a.availability_id
   JOIN doctors d ON d.id = av.doctor_id
   JOIN users du ON du.id = d.user_id
   JOIN patients p ON p.id = a.patient_id
   JOIN users pu ON pu.id = p.user_id
+  LEFT JOIN appointment_queue_entries queue ON queue.appointment_id = a.id
   `;
 
 class AppointmentError extends Error {
@@ -246,7 +275,8 @@ async function createPaymentAppointment(client, { availabilityId, patientId, rea
     [patientId, availabilityId, allocation.rows[0].id, reason, slot.date, slot.start_time, slot.end_time, consultationFee],
   );
   const appointment = await readDetails(client, created.rows[0].id);
-  await enqueueAppointmentNotification(client, "appointment.booked", appointment, "system");
+  if (!Number.isInteger(appointment.token_number)) fail(500, "QUEUE_ENTRY_MISSING", "The appointment queue token could not be created");
+  await enqueueAppointmentNotification(client, "appointment.booked", appointment, "system", timeZone);
   return appointment;
 }
 
@@ -506,7 +536,7 @@ async function rescheduleAppointment(database, user, timeZone, appointmentId, ne
     await supersedeOpenAssistedRescheduleRequests(client, appointmentId);
     const appointment = await readDetails(client, created.rows[0].id);
     const result = { ...appointment, previous_date: previousAppointment.date, previous_start_time: previousAppointment.start_time };
-    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role);
+    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role, timeZone);
     return result;
   }, transactionClient);
 }
@@ -691,7 +721,7 @@ async function confirmAssistedReschedule(database, user, timeZone, requestId, su
       previous_date: request.current_date,
       previous_start_time: request.current_start_time,
     };
-    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role);
+    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role, timeZone);
     return result;
   });
   if (result?.assistedRequestExpired) fail(409, "ASSISTED_RESCHEDULE_REQUEST_EXPIRED", "This assisted rescheduling request has expired");
@@ -835,7 +865,7 @@ async function doctorRescheduleAppointment(database, user, timeZone, appointment
       previous_start_time: original.start_time,
       reschedule_version: updated.rows[0].reschedule_version,
     };
-    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role === "receptionist" ? "system" : user.role);
+    await enqueueAppointmentNotification(client, "appointment.rescheduled", result, user.role === "receptionist" ? "system" : user.role, timeZone);
     return result;
   });
 }

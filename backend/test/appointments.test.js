@@ -398,6 +398,8 @@ describe("appointment schemas and migration", () => {
       "024_in_app_notifications.sql", "025_assisted_reschedule_requests.sql", "026_assisted_reschedule_notifications.sql",
       "027_assisted_reschedule_expiry.sql",
       "028_appointment_notification_outbox.sql",
+      "032_queue_email_events.sql",
+      "033_scheduled_reminder_outbox_events.sql",
     ]) assert.ok(files.includes(migration), `missing migration ${migration}`);
     const sql = fs.readFileSync(path.join(directory, "003_appointments.sql"), "utf8");
     assert.match(sql, /availability_id UUID NOT NULL REFERENCES availability\(id\) ON DELETE RESTRICT/i);
@@ -714,8 +716,9 @@ describe("appointment workflows", () => {
       assert.equal(database.state.appointments[0].status, "cancelled");
       assert.ok(database.state.appointments[0].cancelled_at);
       assert.equal(database.state.assistedRequests[0].status, "superseded");
-      assert.equal(database.state.outbox.length, 1);
+      assert.equal(database.state.outbox.length, 3);
       assert.equal(database.state.outbox[0].event_type, "appointment.rescheduled");
+      assert.deepEqual(database.state.outbox.slice(1).map(({ event_type }) => event_type), ["appointment.reminder_24h", "appointment.reminder_1h"]);
     });
     const occupiedTarget = createTestApp({ database: createDatabase({ appointments: [
       makeAppointment(),

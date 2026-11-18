@@ -21,6 +21,7 @@ const patient = { id: userId, role: "patient" };
 const slot = { id: availabilityId, doctor_id: doctorId, date: "2099-04-10", start_time: "10:00:00", end_time: "10:30:00", fee: "500.00" };
 const appointment = {
   id: appointmentId, status: "confirmed", availability_id: availabilityId,
+  token_number: 17,
   date: slot.date, start_time: slot.start_time, end_time: slot.end_time,
   doctor_id: doctorId, doctor_first_name: "Dara", doctor_last_name: "Doctor",
   specialty: "General Practice", patient_id: patientId,
@@ -192,6 +193,20 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
   return {
     state,
     async query(sql, values = []) {
+      if (sql.includes("WITH candidates AS") && sql.includes("appointment_notification_outbox")) {
+        const next = state.notificationOutbox.find((event) => event.status === "pending" && event.event_type === "appointment.booked");
+        if (!next) return { rows: [] };
+        next.status = "processing";
+        next.lease_token = `lease-${next.id}`;
+        return { rows: [{ ...next }] };
+      }
+      if (sql.includes("MIN(next_attempt_at) AS next_attempt_at")) return { rows: [{ next_attempt_at: null }] };
+      if (sql.includes("SET status = 'processed'")) {
+        const event = state.notificationOutbox.find((candidate) => candidate.id === values[0] && candidate.lease_token === values[1]);
+        if (event) { event.status = "processed"; event.lease_token = null; }
+        return { rows: [] };
+      }
+      if (sql.includes("SET status = 'pending'")) return { rows: [] };
       if (sql.startsWith("SELECT id, phone, sms_consent FROM users")) return { rows: [] };
       if (sql.startsWith("INSERT INTO notification_deliveries")) {
         const [eventKey, eventType, appointmentRef, recipientUserId, channel, provider, payload, idempotencyKey, leaseToken] = values;
@@ -213,7 +228,7 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
         const item = state.reconciliation.get(values[0]);
         return { rows: item ? [{ id: item.id }] : [] };
       }
-      if (sql.includes("FROM appointments a JOIN availability av") && sql.includes("WHERE a.id = $1")) return { rows: state.appointment ? [{ ...state.appointment }] : [] };
+      if (sql.includes("JOIN availability av") && sql.includes("WHERE a.id = $1")) return { rows: state.appointment ? [{ ...state.appointment }] : [] };
       throw new Error(`Unexpected pool query: ${sql}`);
     },
     async connect() {
@@ -273,7 +288,7 @@ function createPaymentDatabase({ competingBooking = false, slotDeleted = false }
             return { rows: [{ id: appointmentId }] };
           }
           if (sql.startsWith("INSERT INTO appointment_notification_outbox")) {
-            state.notificationOutbox.push({ event_key: values[0], event_type: values[1], appointment_id: values[2], actor_role: values[3], payload: JSON.parse(values[4]) });
+            state.notificationOutbox.push({ id: `outbox-${state.notificationOutbox.length + 1}`, event_key: values[0], event_type: values[1], appointment_id: values[2], actor_role: values[3], payload: JSON.parse(values[4]), status: "pending" });
             return { rows: [] };
           }
           if (sql.includes("FROM appointments a") && sql.includes("WHERE a.id = $1")) return { rows: state.appointment ? [{ ...state.appointment }] : [] };
@@ -664,18 +679,21 @@ describe("Stripe appointment Checkout", () => {
 });
 
 describe("Stripe Checkout webhook and reconciliation", () => {
-  it("writes one booking Outbox event and leaves delivery to recovery", async () => {
+  it("dispatches one paid-booking email immediately after commit and keeps the queue token for both recipients", async () => {
     const database = createPaymentDatabase();
     const stripeService = { constructWebhookEvent(raw, signature) { assert.ok(Buffer.isBuffer(raw)); assert.equal(signature, "stripe-signature"); return JSON.parse(raw.toString("utf8")); } };
+    let releaseDelivery;
+    const providerGate = new Promise((resolve) => { releaseDelivery = resolve; });
     const emailNotificationService = createEmailNotificationService({
       config: { BREVO_API_KEY: "mock-key", BREVO_SENDER_EMAIL: "sender@example.test", BREVO_SENDER_NAME: "Medrella" },
       fetchImpl: async (_url, options) => {
-        database.state.sentEmails.push(JSON.parse(options.body));
+        const payload = JSON.parse(options.body);
+        database.state.sentEmails.push(payload);
+        await providerGate;
         return { ok: true, status: 201, async json() { return { messageId: "mock-booking-id" }; } };
       },
     });
-    let inAppAttempts = 0;
-    const app = createApp({ database, frontendOrigin: "http://localhost:3000", applicationTimezone: "Asia/Kolkata", stripeService, emailNotificationService, inAppNotificationService: { async sendAppointmentNotification() { inAppAttempts += 1; throw new Error("storage unavailable"); } } });
+    const app = createApp({ database, frontendOrigin: "http://localhost:3000", applicationTimezone: "Asia/Kolkata", stripeService, emailNotificationService, inAppNotificationService: { async sendAppointmentNotification() { return { failed: 0 }; } } });
     await withServer(app, async (url) => {
       const postWebhook = (event) => fetch(`${url}/api/v1/payments/webhook`, {
         method: "POST",
@@ -689,22 +707,44 @@ describe("Stripe Checkout webhook and reconciliation", () => {
       assert.deepEqual(await duplicateResponse.json(), { duplicate: true });
       const delayedResponse = await postWebhook(createSessionEvent("checkout.session.async_payment_succeeded", "evt_async_success"));
       assert.equal((await delayedResponse.json()).status, "confirmed");
+      const dispatchDeadline = Date.now() + 1000;
+      while (database.state.sentEmails.length < 1 && Date.now() < dispatchDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(database.state.sentEmails.length, 1, "immediate delivery started while the provider request remains pending");
+      releaseDelivery();
+      const deadline = Date.now() + 1000;
+      while (database.state.sentEmails.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      const failedResponse = await fetch(`${url}/api/v1/payments/webhook`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "stripe-signature": "stripe-signature" },
+        body: "{",
+      });
+      assert.equal(failedResponse.status, 400);
     });
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.payment.provider_payment_id, intentId);
-    assert.equal(database.state.sentEmails.length, 0);
-    assert.equal(inAppAttempts, 0);
-    assert.equal(database.state.notificationDeliveries.size, 0);
-    assert.equal(database.state.notificationOutbox.length, 1);
-    assert.equal(database.state.notificationOutbox[0].event_type, "appointment.booked");
-    assert.equal(database.state.notificationOutbox[0].actor_role, "system");
-    assert.equal(database.state.notificationOutbox[0].payload.id, appointmentId);
+    assert.equal(database.state.sentEmails.length, 2);
+    const patientEmail = database.state.sentEmails.find(({ to }) => to?.[0]?.email === "patient@example.test");
+    const doctorEmail = database.state.sentEmails.find(({ to }) => to?.[0]?.email === "doctor@example.test");
+    assert.match(patientEmail.textContent, /Queue token: 17/);
+    assert.match(doctorEmail.textContent, /Queue token: 17/);
+    assert.match(patientEmail.htmlContent, /Queue token/);
+    assert.match(doctorEmail.htmlContent, /Queue token/);
+    assert.equal(database.state.notificationDeliveries.size, 4);
+    assert.equal(database.state.notificationOutbox.length, 3);
+    const bookingEmail = database.state.notificationOutbox.find(({ event_type }) => event_type === "appointment.booked");
+    assert.equal(bookingEmail.actor_role, "system");
+    assert.equal(bookingEmail.payload.id, appointmentId);
+    assert.equal(bookingEmail.payload.token_number, 17);
+    assert.deepEqual(database.state.notificationOutbox.filter(({ event_type }) => event_type.startsWith("appointment.reminder_")).map(({ event_type }) => event_type), ["appointment.reminder_24h", "appointment.reminder_1h"]);
+    const appointmentInsert = database.state.calls.findIndex((sql) => sql.startsWith("INSERT INTO appointments"));
+    const queueTokenRead = database.state.calls.findIndex((sql) => sql.includes("LEFT JOIN appointment_queue_entries queue"));
     const outboxInsert = database.state.calls.findIndex((sql) => sql.startsWith("INSERT INTO appointment_notification_outbox"));
     const finalCommit = database.state.calls.map((sql) => sql).lastIndexOf("COMMIT");
+    assert.ok(appointmentInsert >= 0 && appointmentInsert < queueTokenRead && queueTokenRead < outboxInsert, "the queue row is read for the email snapshot before the booking event is enqueued");
     assert.ok(outboxInsert >= 0 && outboxInsert < finalCommit, "the Outbox insert is part of the appointment transaction");
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
-    assert.equal(database.state.sentEmails.length, 0);
-    assert.equal(database.state.notificationDeliveries.size, 0);
+    assert.equal(database.state.sentEmails.length, 2, "duplicate webhook events do not send duplicate booking emails");
+    assert.equal(database.state.notificationDeliveries.size, 4);
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
   });
@@ -739,7 +779,7 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     assert.equal(database.state.hold.status, "consumed");
     assert.deepEqual(database.state.sentEmails, []);
     assert.equal(database.state.notificationDeliveries.size, 0);
-    assert.equal(database.state.notificationOutbox.length, 1);
+    assert.equal(database.state.notificationOutbox.length, 3);
     assert.equal(database.state.reconciliation.size, 0);
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO payments")).length, 0);
   });
@@ -750,7 +790,7 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     const service = createPaymentService({ database, stripe, timeZone: "Asia/Kolkata", emailNotificationService: { async sendNotificationPayload(payload) { database.state.sentEmails.push(payload.to); return { sent: true, attempts: 1 }; } } });
     const success = createSessionEvent("checkout.session.async_payment_succeeded", "evt_async_success_first");
     assert.equal((await service.processWebhook(Buffer.from(JSON.stringify(success)), "sig")).status, "confirmed");
-    assert.equal(database.state.notificationOutbox.length, 1);
+    assert.equal(database.state.notificationOutbox.length, 3);
     assert.deepEqual(database.state.sentEmails, []);
     assert.equal(database.state.notificationDeliveries.size, 0);
 
@@ -766,7 +806,7 @@ describe("Stripe Checkout webhook and reconciliation", () => {
 
     await service.processWebhook(Buffer.from(JSON.stringify(success)), "sig");
 
-    assert.equal(database.state.notificationOutbox.length, 1);
+    assert.equal(database.state.notificationOutbox.length, 3);
     assert.equal(database.state.payment.status, "captured");
     assert.equal(database.state.appointment.status, "confirmed");
     assert.equal(database.state.calls.filter((sql) => sql.startsWith("INSERT INTO appointments")).length, 1);
@@ -909,6 +949,32 @@ describe("Stripe Checkout webhook and reconciliation", () => {
     assert.equal(database.state.payment.status, "pending");
     assert.equal(database.state.appointment, null);
     assert.equal(retrieveCount, 2);
+  });
+
+  it("wakes the booking outbox after a paid status lookup commits the appointment", async () => {
+    const database = createPaymentDatabase();
+    const stripe = {
+      async retrieveCheckoutSession() {
+        return createSessionEvent("checkout.session.completed", "not-used").data.object;
+      },
+    };
+    let dispatchWakes = 0;
+    const service = createPaymentService({
+      database,
+      stripe,
+      timeZone: "Asia/Kolkata",
+      onPaidBookingCommitted() {
+        dispatchWakes += 1;
+        assert.ok(database.state.calls.includes("COMMIT"), "dispatch is scheduled only after the booking transaction commits");
+      },
+    });
+
+    const status = await service.getPaymentStatus(patient, paymentId);
+
+    assert.equal(status.status, "captured");
+    assert.equal(database.state.appointment.status, "confirmed");
+    assert.equal(database.state.notificationOutbox.find(({ event_type }) => event_type === "appointment.booked").payload.token_number, 17);
+    assert.equal(dispatchWakes, 1);
   });
 
   it("falls back to retrieval when session expiration fails and leaves an open session pending", async () => {
