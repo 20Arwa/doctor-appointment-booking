@@ -11,6 +11,7 @@ import { notifyError, notifyInAppNotificationsChanged, notifySuccess } from "@/l
 import { useAppointmentHistory } from "@/components/use-appointment-history";
 import { AppointmentAvailabilityCalendar } from "@/components/appointment-availability-calendar";
 import { formatDateOnly } from "@/lib/date-format";
+import { Badge } from "@/components/ui/badge";
 
 function todayInIndia() {
   const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date()).map(({ type, value }) => [type, value]));
@@ -52,11 +53,22 @@ function statusClasses(status: PatientAppointment["status"]) {
   return "bg-status-completed-bg text-status-completed";
 }
 
+function appointmentMonthDates(month: string) {
+  const [year, monthNumber] = month.split("-").map(Number);
+  const offset = (new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay() + 6) % 7;
+  const days = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  const dates: (string | null)[] = [...Array.from({ length: offset }, () => null), ...Array.from({ length: days }, (_, index) => `${month}-${String(index + 1).padStart(2, "0")}`)];
+  while (dates.length % 7) dates.push(null);
+  return dates;
+}
+
 export function DoctorAppointmentsPage() {
   const { getToken } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
   const appointmentFromNotification = searchParams.get("appointment");
+  const linkedAgendaDate = searchParams.get("date");
+  const initialAgendaDate = linkedAgendaDate && /^\d{4}-\d{2}-\d{2}$/.test(linkedAgendaDate) ? linkedAgendaDate : todayInIndia();
   const { appointments, setAppointments, loading, error, history, retry, loadMore } = useAppointmentHistory();
   const requestedNotificationAppointment = useRef<string | null>(null);
   const notificationRequestInFlight = useRef<{ appointmentId: string } | null>(null);
@@ -75,6 +87,8 @@ export function DoctorAppointmentsPage() {
   const [assistedRequests, setAssistedRequests] = useState<AssistedDoctorRequest[]>([]);
   const [assistedLoading, setAssistedLoading] = useState(true);
   const [assistedError, setAssistedError] = useState<string | null>(null);
+  const [agendaDate, setAgendaDate] = useState(initialAgendaDate);
+  const [agendaMonth, setAgendaMonth] = useState(initialAgendaDate.slice(0, 7));
 
   const loadAssistedRequests = useCallback(async () => {
     setAssistedLoading(true);
@@ -170,6 +184,8 @@ export function DoctorAppointmentsPage() {
       (second.cancelled_at ? new Date(second.cancelled_at).getTime() : 0) - (first.cancelled_at ? new Date(first.cancelled_at).getTime() : 0)
       || `${second.date}T${second.start_time}`.localeCompare(`${first.date}T${first.start_time}`)
       || second.id.localeCompare(first.id));
+  const appointmentDates = new Set(appointments.map((appointment) => appointment.date));
+  const selectedDateAppointments = appointments.filter((appointment) => appointment.date === agendaDate);
 
   function refreshAppointments() {
     clearNotificationFocus();
@@ -292,6 +308,11 @@ export function DoctorAppointmentsPage() {
         <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">Review your scheduled and past appointments.</p>
       </header>
 
+      <section className="grid gap-5 rounded-2xl border border-border bg-card p-4 shadow-sm sm:grid-cols-[minmax(16rem,0.8fr)_1.2fr] sm:p-5" aria-label="Appointment calendar and agenda">
+        <div><div className="flex items-center justify-between gap-2"><button type="button" aria-label="Previous month" onClick={() => setAgendaMonth((month) => new Date(Date.UTC(Number(month.slice(0,4)), Number(month.slice(5,7))-2, 1)).toISOString().slice(0,7))} className="rounded-lg p-2 hover:bg-muted">‹</button><h2 className="font-semibold text-foreground">{new Intl.DateTimeFormat("en-IN", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date(`${agendaMonth}-01T00:00:00Z`))}</h2><button type="button" aria-label="Next month" onClick={() => setAgendaMonth((month) => new Date(Date.UTC(Number(month.slice(0,4)), Number(month.slice(5,7)), 1)).toISOString().slice(0,7))} className="rounded-lg p-2 hover:bg-muted">›</button></div><div className="mt-2 grid grid-cols-7 text-center text-xs text-muted-foreground">{["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map((day) => <span key={day} className="py-2">{day}</span>)}</div><div className="grid grid-cols-7 justify-items-center gap-1">{appointmentMonthDates(agendaMonth).map((date,index) => date ? <button type="button" key={date} aria-pressed={agendaDate === date} aria-label={`${formatDate(date)}${appointmentDates.has(date) ? ", appointments scheduled" : ""}`} onClick={() => setAgendaDate(date)} className={`size-9 rounded-lg text-xs ${agendaDate === date ? "bg-primary font-semibold text-primary-foreground" : appointmentDates.has(date) ? "bg-secondary font-medium text-secondary-foreground" : "text-muted-foreground hover:bg-muted"}`}>{Number(date.slice(-2))}</button> : <span key={`blank-${index}`} className="size-9" />)}</div></div>
+        <div className="rounded-xl bg-muted/50 p-4"><h2 className="font-semibold text-foreground">Agenda · {formatDate(agendaDate)}</h2>{selectedDateAppointments.length ? <ul className="mt-3 space-y-2">{selectedDateAppointments.map((appointment) => <li key={appointment.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-card p-3 text-sm"><span className="font-medium text-foreground">{formatTime(appointment.start_time)} · {appointment.patient_first_name} {appointment.patient_last_name}</span><span className="flex items-center gap-3"><Link className="font-medium text-primary underline-offset-4 hover:underline" href={`/doctor/appointments?appointment=${encodeURIComponent(appointment.id)}`}>View appointment</Link><Link className="font-medium text-primary underline-offset-4 hover:underline" href={`/doctor/availability?date=${encodeURIComponent(appointment.date)}&time=${encodeURIComponent(appointment.start_time.slice(0,5))}`}>Open schedule</Link></span></li>)}</ul> : <p className="mt-3 text-sm text-muted-foreground">No appointments on this date.</p>}</div>
+      </section>
+
       <section className="rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-5" aria-labelledby="assisted-rescheduling-heading">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div><h2 id="assisted-rescheduling-heading" className="text-xl font-semibold text-foreground">Assisted rescheduling</h2><p className="mt-1 text-sm text-muted-foreground">Track appointments affected by schedule changes and patient responses.</p></div>
@@ -373,15 +394,16 @@ function AppointmentGroup({ notificationFocusId, title, empty, appointments, now
                     patientAge(appointment.patient_date_of_birth, now) !== null ? `Age ${patientAge(appointment.patient_date_of_birth, now)}` : null,
                     appointment.patient_gender,
                   ].filter(Boolean).join(" · ") || "No patient details provided"}</p>
-                  <div className="mt-4 flex items-start gap-2 text-sm text-foreground">
+                  <div className="mt-4 flex flex-wrap items-center gap-2 text-sm text-foreground">
                     <CalendarClock aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                     <span>{formatDate(appointment.date)} · {formatTime(appointment.start_time)}–{formatTime(appointment.end_time)} IST</span>
+                    <Link href={`/doctor/availability?date=${encodeURIComponent(appointment.date)}&time=${encodeURIComponent(appointment.start_time.slice(0,5))}`} className="font-medium text-primary underline-offset-4 hover:underline">View schedule</Link>
                   </div>
-                  {appointment.mode ? <p className="mt-2 text-sm text-muted-foreground">{appointment.mode === "wave" ? (appointment.appointment_duration_minutes ? `Wave · ${appointment.appointment_duration_minutes}-minute slot` : "Wave") : "Stream · Continuous window"}</p> : null}
+                  {appointment.mode ? <Badge className={`mt-2 ${appointment.mode === "wave" ? "bg-mode-wave-bg text-mode-wave" : "bg-mode-stream-bg text-mode-stream"}`}>{appointment.mode === "wave" ? (appointment.appointment_duration_minutes ? `WAVE · ${appointment.appointment_duration_minutes}-minute slot` : "WAVE") : "STREAM · Continuous window"}</Badge> : null}
                   {appointment.reason ? <p className="mt-3 text-sm leading-6 text-muted-foreground"><span className="font-medium text-foreground">Reason:</span> {appointment.reason}</p> : null}
                   {/* <p className="mt-2 text-xs text-muted-foreground">Appointment ID: {appointment.id}</p> */}
                 </div>
-                <span className={`inline-flex w-fit rounded-full px-3 py-1 text-xs font-semibold ${statusClasses(appointment.status)}`}>{appointment.status === "confirmed" && (appointmentInstant(appointment)?.getTime() ?? Infinity) <= now ? "Awaiting completion" : appointment.status}</span>
+                <Badge className={statusClasses(appointment.status)}>{appointment.status === "confirmed" && (appointmentInstant(appointment)?.getTime() ?? Infinity) <= now ? "Awaiting completion" : appointment.status}</Badge>
               </div>
             {appointment.status === "confirmed" ? (
               <div className="mt-5 border-t border-border pt-4">
@@ -415,11 +437,12 @@ function AppointmentGroup({ notificationFocusId, title, empty, appointments, now
                   <div className="mt-3 rounded-xl border border-border bg-background p-4" aria-label="Choose a replacement appointment time">
                     <div className="flex items-center justify-between gap-3"><h3 className="font-semibold text-foreground">Choose a new time</h3><button type="button" onClick={onCloseReschedule} className="rounded px-2 py-1 text-sm text-muted-foreground hover:bg-muted">Close</button></div>
                     <p className="mt-1 text-xs text-muted-foreground">Choose an available date, then select a time · IST</p>
+                    <div className="mt-3 rounded-lg border border-primary/50 bg-secondary/40 p-3"><Badge className="bg-primary text-primary-foreground">Current Appointment</Badge><p className="mt-2 text-sm font-medium text-foreground">{formatDate(appointment.date)} · {formatTime(appointment.start_time)}–{formatTime(appointment.end_time)} IST</p><p className="mt-1 text-xs text-muted-foreground">This occupied slot is shown for reference and cannot be selected as a replacement.</p></div>
                     {rescheduleSlotsLoading ? <p className="mt-4 text-sm text-muted-foreground" role="status">Loading available times…</p> : null}
                     {!rescheduleSlotsLoading && rescheduleError ? <div className="mt-4 rounded-lg bg-destructive/5 p-3" role="alert"><p className="text-sm text-destructive">{rescheduleError}</p><button type="button" onClick={() => onBeginReschedule(appointment)} className="mt-3 inline-flex min-h-9 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted">Refresh available times</button></div> : null}
                     {!rescheduleSlotsLoading && !rescheduleError && rescheduleSlots.length === 0 ? <p className="mt-4 text-sm text-muted-foreground">No replacement times are available for this doctor.</p> : null}
                     {!rescheduleSlotsLoading && !rescheduleError ? <AppointmentAvailabilityCalendar slots={rescheduleSlots} month={rescheduleMonth} selectedDate={rescheduleDate} onSelectDate={onSelectDate} onShiftMonth={(month) => onShiftMonth(appointment, month)} /> : null}
-                    {!rescheduleSlotsLoading && !rescheduleError && dateSlots.length > 0 ? <fieldset className="mt-4 grid gap-2 sm:grid-cols-2"><legend className="sr-only">Available replacement times</legend>{dateSlots.map((slot) => <label key={slot.id} className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 text-sm ${selectedSlotId === slot.id ? "border-primary bg-secondary/60" : "border-border hover:bg-muted/60"}`}><input type="radio" name={`doctor-reschedule-${appointment.id}`} value={slot.id} checked={selectedSlotId === slot.id} onChange={() => onSelectSlot(slot.id)} className="size-4 accent-primary" /><span><span className="block font-medium text-foreground">{slot.mode === "stream" ? "Stream · Continuous window" : appointment.appointment_duration_minutes ? `Wave · ${appointment.appointment_duration_minutes}-minute slot` : "Wave"}</span><span className="text-muted-foreground">{formatTime(slot.start_time)}–{formatTime(slot.end_time)} IST</span><span className="mt-1 block text-xs text-muted-foreground">{slot.remaining_capacity ?? 0} of {slot.capacity ?? 0} places remaining</span></span></label>)}</fieldset> : null}
+                    {!rescheduleSlotsLoading && !rescheduleError && dateSlots.length > 0 ? <fieldset className="mt-4 grid gap-2 sm:grid-cols-2"><legend className="sr-only">Available replacement times</legend>{dateSlots.map((slot) => <label key={slot.id} className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 text-sm ${selectedSlotId === slot.id ? "border-primary bg-secondary/60" : "border-border hover:bg-muted/60"}`}><input type="radio" name={`doctor-reschedule-${appointment.id}`} value={slot.id} checked={selectedSlotId === slot.id} onChange={() => onSelectSlot(slot.id)} className="size-4 accent-primary" /><span><span className="block font-medium text-foreground">{slot.mode === "stream" ? "Stream · Continuous window" : appointment.appointment_duration_minutes ? `WAVE · ${appointment.appointment_duration_minutes}-minute slot` : "Wave"}</span><span className="text-muted-foreground">{formatTime(slot.start_time)}–{formatTime(slot.end_time)} IST</span><span className="mt-1 block text-xs text-muted-foreground">{slot.capacity != null && slot.remaining_capacity != null ? `${slot.remaining_capacity} of ${slot.capacity} places remaining` : "Capacity information unavailable."}</span></span></label>)}</fieldset> : null}
                     <Button type="button" size="sm" disabled={!selectedSlotId || activeAppointment !== null || rescheduleSlotsLoading} onClick={() => onReschedule(appointment)} className="mt-4">{activeAppointment === appointment.id ? "Updating…" : "Save new time"}</Button>
                   </div>
                 ) : null}

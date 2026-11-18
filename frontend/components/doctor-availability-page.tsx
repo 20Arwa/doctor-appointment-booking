@@ -3,9 +3,9 @@
 import { useAuth } from "@clerk/nextjs";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { CalendarPlus, RefreshCw, Trash2, CalendarRange, Sparkles, ChevronLeft, ChevronRight, Pencil, X, Eye, Save } from "lucide-react";
+import { CalendarPlus, RefreshCw, Trash2, CalendarRange, Sparkles, ChevronLeft, ChevronRight, ChevronDown, Pencil, X, Eye, Save } from "lucide-react";
 import { useDashboardProfile } from "@/components/role-application-shell";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -21,6 +21,7 @@ import { notifySuccess } from "@/lib/notifications";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { dateNavigationTarget, formatDateOnly } from "@/lib/date-format";
 import { DateInput } from "@/components/ui/date-input";
+import { Badge } from "@/components/ui/badge";
 
 const APPLICATION_TIME_ZONE = "Asia/Kolkata";
 
@@ -40,6 +41,15 @@ function formatScheduleDate(date: string | null) {
   return date ? formatDateOnly(date) : "Not set";
 }
 
+function exceptionDateDefault(schedule: DoctorSchedule, selectedDate: string, today: string) {
+  const selectedWithinSchedule = selectedDate >= today
+    && (!schedule.starts_on || selectedDate >= schedule.starts_on)
+    && (!schedule.ends_on || selectedDate <= schedule.ends_on);
+  if (selectedWithinSchedule) return selectedDate;
+  const scheduleStart = schedule.starts_on && schedule.starts_on > today ? schedule.starts_on : today;
+  return !schedule.ends_on || scheduleStart <= schedule.ends_on ? scheduleStart : today;
+}
+
 function groupByDate<T extends { date: string }>(items: T[]) {
   return items.reduce<Record<string, T[]>>((groups, item) => {
     (groups[item.date] ??= []).push(item);
@@ -53,6 +63,14 @@ function formatTime(time: string) {
   return `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
 }
 
+function capacityUsage(slot: AvailabilitySlot) {
+  const { capacity, remaining_capacity: remaining } = slot;
+  if (capacity == null || remaining == null || remaining > capacity) return null;
+  const booked = capacity - remaining;
+  const percent = capacity === 0 ? 0 : Math.min(100, Math.max(0, booked / capacity * 100));
+  return { booked, total: capacity, percent };
+}
+
 function monthRange(month: string) {
   const [year, monthNumber] = month.split("-").map(Number);
   return { from: month, to: new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10) };
@@ -60,7 +78,7 @@ function monthRange(month: string) {
 
 function calendarCells(month: string) {
   const [year, monthNumber] = month.split("-").map(Number);
-  const firstWeekday = new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay();
+  const firstWeekday = (new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay() + 6) % 7;
   const daysInMonth = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
   const cells: (string | null)[] = [...Array.from({ length: firstWeekday }, () => null), ...Array.from({ length: daysInMonth }, (_, index) => `${month.slice(0, 7)}-${String(index + 1).padStart(2, "0")}`)];
   while (cells.length % 7 !== 0) cells.push(null);
@@ -97,6 +115,9 @@ export function DoctorAvailabilityPage() {
   const searchParams = useSearchParams();
   const [slots, setSlots] = useState<AvailabilitySlot[]>([]);
   const [schedules, setSchedules] = useState<DoctorSchedule[]>([]);
+  const [scheduleFilter, setScheduleFilter] = useState<"all" | "wave" | "stream">("all");
+  const [expandedScheduleId, setExpandedScheduleId] = useState<string | null>(null);
+  const [pendingScheduleScrollId, setPendingScheduleScrollId] = useState<string | null>(null);
   const [scheduleLoading, setScheduleLoading] = useState(true);
   const [scheduleLoadError, setScheduleLoadError] = useState<string | null>(null);
   const [schedulesError, setSchedulesError] = useState<string | null>(null);
@@ -123,8 +144,12 @@ export function DoctorAvailabilityPage() {
   const [streamCapacity, setStreamCapacity] = useState("1");
   const [duration, setDuration] = useState(String(profile.profile.appointment_duration_minutes ?? 30));
   const [exceptionTypes, setExceptionTypes] = useState<Record<string, "day_off" | "override" | "additional">>({});
+  const [exceptionDates, setExceptionDates] = useState<Record<string, string>>({});
   const [recentExceptions, setRecentExceptions] = useState<{ scheduleId: string; date: string; type: string }[]>([]);
-  const scheduleRefs = useRef<Record<string, HTMLElement | null>>({});
+  const scheduleRefs = useRef<Record<string, HTMLDetailsElement | null>>({});
+  const settleScheduleBeforeScroll = useRef(false);
+  const availabilityRequest = useRef<{ key: string; promise: Promise<AvailabilitySlot[]> } | null>(null);
+  const skipAvailabilityFetchForMonth = useRef<string | null>(null);
   const scheduleMutationLock = useRef(false);
   const pendingScheduleRequest = useRef<{ id: string; signature: string } | null>(null);
   const [generationErrors, setGenerationErrors] = useState<Record<string, string>>({});
@@ -145,7 +170,6 @@ export function DoctorAvailabilityPage() {
   useEffect(() => {
     const refreshAvailability = () => {
       if (document.visibilityState === "visible") {
-        setLoading(true);
         setRefreshKey((key) => key + 1);
       }
     };
@@ -203,12 +227,27 @@ export function DoctorAvailabilityPage() {
   }, [doctorId, getToken, scheduleRefreshKey]);
 
   useEffect(() => {
+    if (skipAvailabilityFetchForMonth.current === calendarMonth) {
+      skipAvailabilityFetchForMonth.current = null;
+      return;
+    }
     let active = true;
     void getToken()
       .then((token) => {
         if (!token) throw new Error("Your session could not be verified. Please try again.");
         const range = monthRange(calendarMonth);
-        return getDoctorSlots(token, doctorId, range.from, range.to).then((result) => ({ result, range }));
+        const key = `${doctorId}:${range.from}:${range.to}`;
+        let request = availabilityRequest.current;
+        if (!request || request.key !== key) {
+          request = { key, promise: getDoctorSlots(token, doctorId, range.from, range.to) };
+          availabilityRequest.current = request;
+          const currentRequest = request;
+          void request.promise.then(
+            () => { if (availabilityRequest.current === currentRequest) availabilityRequest.current = null; },
+            () => { if (availabilityRequest.current === currentRequest) availabilityRequest.current = null; },
+          );
+        }
+        return request.promise.then((result) => ({ result, range }));
       })
       .then(({ result, range }) => {
         if (!active) return;
@@ -223,6 +262,8 @@ export function DoctorAvailabilityPage() {
   }, [calendarMonth, doctorId, getToken, refreshKey]);
 
   const weekdaysLabels = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const weekdaysOrder = [1, 2, 3, 4, 5, 6, 0];
+  const visibleSchedules = schedules.filter((schedule) => scheduleFilter === "all" || schedule.mode === scheduleFilter);
   async function submitSchedule(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault(); setSchedulesError(null);
     if (scheduleMutationLock.current) return;
@@ -244,6 +285,8 @@ export function DoctorAvailabilityPage() {
       const created = await createDoctorSchedule(token, doctorId, payload);
       pendingScheduleRequest.current = null;
       setScheduleLoadError(null);
+      setScheduleFilter("all");
+      setExpandedScheduleId(created.id);
       setSchedules((current) => current.some((schedule) => schedule.id === created.id) ? current : [created, ...current]);
       try {
         const generated = await generateDoctorAvailability(token, doctorId, created.id, startsOn, endsOn);
@@ -254,16 +297,14 @@ export function DoctorAvailabilityPage() {
         setAvailabilityRecoveryNeeded((current) => ({ ...current, [created.id]: false }));
         setGenerationConflicts((current) => ({ ...current, [created.id]: generated.skipped_conflict_details ?? [] }));
         notifySuccess(`Schedule saved and ${count} availability ${noun}${count === 1 ? " was" : "s were"} generated.${skipped ? ` ${skipped} overlapping existing availability option${skipped === 1 ? " was" : "s were"} preserved and skipped.` : ""}`, `schedule-created-${created.id}`);
-        setCalendarMonth(`${startsOn.slice(0, 7)}-01`); setSelectedDate(startsOn); setLoading(true); setLoadError(null); setRefreshKey((key) => key + 1);
+        availabilityRequest.current = null; setCalendarMonth(`${startsOn.slice(0, 7)}-01`); setSelectedDate(startsOn); setLoading(true); setLoadError(null); setRefreshKey((key) => key + 1);
       } catch (generationError) {
         const message = apiErrorMessage(generationError, "We couldn't generate availability.");
         setGenerationErrors((current) => ({ ...current, [created.id]: message }));
         setAvailabilityRecoveryNeeded((current) => ({ ...current, [created.id]: true }));
         setSchedulesError(`The schedule was saved, but availability generation failed: ${message} You can retry from the saved schedule.`);
       }
-      requestAnimationFrame(() => {
-        scheduleRefs.current[created.id]?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
-      });
+      setPendingScheduleScrollId(created.id);
     } catch (error) { setSchedulesError(apiErrorMessage(error, "We couldn't save this schedule.")); }
     finally { setScheduleBusy(false); scheduleMutationLock.current = false; }
   }
@@ -274,7 +315,7 @@ export function DoctorAvailabilityPage() {
     const from = hasSavedRange ? (schedule.starts_on! < todayInApplicationZone() ? todayInApplicationZone() : schedule.starts_on!) : requestedFrom ?? "";
     const to = hasSavedRange ? schedule.ends_on! : requestedTo ?? "";
     if (!from || !to || from > to) { setSchedulesError("Choose a valid future generation date range within this schedule."); setScheduleBusy(false); return; }
-    try { const token = await getToken(); if (!token) throw new Error("Your session could not be verified. Please sign in again."); const result = await generateDoctorAvailability(token, doctorId, schedule.id, from, to); const count = result.mode === "stream" ? result.generated_windows : result.generated_slots; const noun = result.mode === "stream" ? "window" : "slot"; const skipped = result.skipped_conflicts ?? 0; notifySuccess(`${count} availability ${noun}${count === 1 ? " was" : "s were"} generated.${skipped ? ` ${skipped} overlapping existing availability option${skipped === 1 ? " was" : "s were"} preserved and skipped.` : ""}`, `schedule-recovery-${schedule.id}`); setAvailabilityRecoveryNeeded((current) => ({ ...current, [schedule.id]: false })); setGenerationConflicts((current) => ({ ...current, [schedule.id]: result.skipped_conflict_details ?? [] })); setGenerationErrors((current) => { const next = { ...current }; delete next[schedule.id]; return next; }); setCalendarMonth(`${from.slice(0, 7)}-01`); setSelectedDate(from); setLoading(true); setLoadError(null); setRefreshKey((key) => key + 1); }
+    try { const token = await getToken(); if (!token) throw new Error("Your session could not be verified. Please sign in again."); const result = await generateDoctorAvailability(token, doctorId, schedule.id, from, to); const count = result.mode === "stream" ? result.generated_windows : result.generated_slots; const noun = result.mode === "stream" ? "window" : "slot"; const skipped = result.skipped_conflicts ?? 0; notifySuccess(`${count} availability ${noun}${count === 1 ? " was" : "s were"} generated.${skipped ? ` ${skipped} overlapping existing availability option${skipped === 1 ? " was" : "s were"} preserved and skipped.` : ""}`, `schedule-recovery-${schedule.id}`); setAvailabilityRecoveryNeeded((current) => ({ ...current, [schedule.id]: false })); setGenerationConflicts((current) => ({ ...current, [schedule.id]: result.skipped_conflict_details ?? [] })); setGenerationErrors((current) => { const next = { ...current }; delete next[schedule.id]; return next; }); availabilityRequest.current = null; setCalendarMonth(`${from.slice(0, 7)}-01`); setSelectedDate(from); setLoading(true); setLoadError(null); setRefreshKey((key) => key + 1); }
     catch (error) { const message = apiErrorMessage(error, "We couldn't generate availability."); setAvailabilityRecoveryNeeded((current) => ({ ...current, [schedule.id]: true })); setGenerationErrors((current) => ({ ...current, [schedule.id]: message })); setSchedulesError(message); }
     finally { setScheduleBusy(false); }
   }
@@ -289,7 +330,7 @@ export function DoctorAvailabilityPage() {
     if (!serviceDate) { setSchedulesError("Choose a date for the schedule exception."); return; }
     if (exceptionType !== "day_off" && exceptionStart >= exceptionEnd) { setSchedulesError("Exception end time must be after its start time."); return; }
     setScheduleBusy(true);
-    try { const token = await getToken(); if (!token) throw new Error("Your session could not be verified. Please sign in again."); const result = await createScheduleException(token, doctorId, scheduleId, { service_date: serviceDate, exception_type: exceptionType, periods: exceptionType === "day_off" ? [] : [{ start_time: exceptionStart, end_time: exceptionEnd }] }); setRecentExceptions((current) => [{ scheduleId, date: serviceDate, type: exceptionType }, ...current]); const skipped = result.generation?.skipped_conflicts ?? 0; notifySuccess(`Date exception saved and availability updated.${skipped ? ` ${skipped} overlapping existing availability option${skipped === 1 ? " was" : "s were"} preserved and skipped.` : ""}`, `schedule-exception-${result.id}`); setCalendarMonth(`${serviceDate.slice(0, 7)}-01`); setSelectedDate(serviceDate); setLoading(true); setLoadError(null); setRefreshKey((key) => key + 1); }
+    try { const token = await getToken(); if (!token) throw new Error("Your session could not be verified. Please sign in again."); const result = await createScheduleException(token, doctorId, scheduleId, { service_date: serviceDate, exception_type: exceptionType, periods: exceptionType === "day_off" ? [] : [{ start_time: exceptionStart, end_time: exceptionEnd }] }); setRecentExceptions((current) => [{ scheduleId, date: serviceDate, type: exceptionType }, ...current]); const skipped = result.generation?.skipped_conflicts ?? 0; notifySuccess(`Date exception saved and availability updated.${skipped ? ` ${skipped} overlapping existing availability option${skipped === 1 ? " was" : "s were"} preserved and skipped.` : ""}`, `schedule-exception-${result.id}`); availabilityRequest.current = null; setCalendarMonth(`${serviceDate.slice(0, 7)}-01`); setSelectedDate(serviceDate); setLoading(true); setLoadError(null); setRefreshKey((key) => key + 1); }
     catch (error) { setSchedulesError(apiErrorMessage(error, "We couldn't save this date exception.")); }
     finally { setScheduleBusy(false); }
   }
@@ -363,7 +404,6 @@ export function DoctorAvailabilityPage() {
     try {
       const token = await getToken();
       if (!token) throw new Error("Your session could not be verified. Please sign in again.");
-      const cardTop = scheduleRefs.current[schedule.id]?.getBoundingClientRect().top ?? null;
       const result = await updateDoctorSchedule(token, doctorId, schedule.id, { ...input, expected_updated_at: reviewedInput.expected_updated_at });
       const updateCounts = [
         result.added_count ? `${result.added_count} added` : null,
@@ -372,26 +412,39 @@ export function DoctorAvailabilityPage() {
         result.unchanged_count ? `${result.unchanged_count} unchanged` : null,
         result.blocked_availability.length ? `${result.blocked_availability.length} skipped due to conflicts` : null,
       ].filter((value): value is string => value !== null);
-      notifySuccess(`Schedule updated.${updateCounts.length ? ` ${updateCounts.join(", ")}.` : ""}`, `schedule-update-${schedule.id}`);
       setEditingScheduleId(null);
       setSchedulePreview(null);
       setSchedulePreviewInput(null);
-      setScheduleLoadError(null);
-      setCalendarMonth(`${editStartsOn.slice(0, 7)}-01`);
-      setSelectedDate(editStartsOn);
+      notifySuccess(`Schedule updated.${updateCounts.length ? ` ${updateCounts.join(", ")}.` : ""}`, `schedule-update-${schedule.id}`);
+      const updatedMonth = `${editStartsOn.slice(0, 7)}-01`;
+      const updatedRange = monthRange(updatedMonth);
+      availabilityRequest.current = null;
+      skipAvailabilityFetchForMonth.current = updatedMonth;
       setLoading(true);
       setLoadError(null);
+      setScheduleLoadError(null);
+      if (updatedMonth !== calendarMonth) setSlots([]);
+      setCalendarMonth(updatedMonth);
       setRefreshKey((key) => key + 1);
-      try {
-        setSchedules(await getDoctorSchedules(token, doctorId));
+      setSelectedDate(editStartsOn);
+      setScheduleFilter("all");
+      setExpandedScheduleId(schedule.id);
+      const [refreshedSchedules, refreshedAvailability] = await Promise.allSettled([
+        getDoctorSchedules(token, doctorId),
+        getDoctorSlots(token, doctorId, updatedRange.from, updatedRange.to),
+      ]);
+      if (refreshedSchedules.status === "fulfilled") {
+        setSchedules(refreshedSchedules.value);
         setScheduleLoadError(null);
-        if (cardTop !== null) {
-          await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-          const refreshedTop = scheduleRefs.current[schedule.id]?.getBoundingClientRect().top;
-          if (refreshedTop !== undefined) window.scrollBy({ top: refreshedTop - cardTop, behavior: "instant" as ScrollBehavior });
-        }
-      } catch (refreshError) {
-        setScheduleLoadError(apiErrorMessage(refreshError, "The update succeeded, but saved schedules could not be refreshed."));
+      } else setScheduleLoadError(apiErrorMessage(refreshedSchedules.reason, "The update succeeded, but saved schedules could not be refreshed."));
+      if (refreshedAvailability.status === "fulfilled") {
+        setSlots(refreshedAvailability.value.filter((slot) => slot.mode === "wave" || slot.mode === "stream"));
+        setLoadError(null);
+      } else setLoadError(apiErrorMessage(refreshedAvailability.reason, "The schedule updated, but generated availability could not be refreshed."));
+      setLoading(false);
+      if (refreshedSchedules.status === "fulfilled") {
+        settleScheduleBeforeScroll.current = false;
+        setPendingScheduleScrollId(schedule.id);
       }
     } catch (error) {
       if (error instanceof ProfileApiError && error.status === 409) {
@@ -411,6 +464,7 @@ export function DoctorAvailabilityPage() {
   }
 
   function refreshSlots() {
+    availabilityRequest.current = null;
     setLoading(true);
     setScheduleLoading(true);
     setLoadError(null);
@@ -427,7 +481,75 @@ export function DoctorAvailabilityPage() {
     if (slot.reservation_only) counts[slot.date] = (counts[slot.date] ?? 0) + 1;
     return counts;
   }, {});
-  const selectedDateSlots = slots.filter((slot) => slot.date === selectedDate);
+  const selectedDateSlots = slots.filter((slot) => slot.date === selectedDate).sort((first, second) => first.start_time.localeCompare(second.start_time));
+  function scheduleScrollBehavior(): ScrollBehavior {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  }
+
+  const scrollToSchedule = useCallback((scheduleId: string) => {
+    const target = scheduleRefs.current[scheduleId];
+    if (!target) return;
+    const stickyHeader = document.querySelector<HTMLElement>("header.sticky");
+    const headerBottom = stickyHeader?.getBoundingClientRect().bottom ?? 0;
+    const behavior = scheduleScrollBehavior();
+    let container: HTMLElement | null = target.parentElement;
+    while (container && container !== document.documentElement) {
+      const style = window.getComputedStyle(container);
+      if (/(auto|scroll|overlay)/.test(style.overflowY) && container.scrollHeight > container.clientHeight) break;
+      container = container.parentElement;
+    }
+    if (!container) container = document.scrollingElement as HTMLElement | null;
+    if (container) {
+      const targetTop = target.getBoundingClientRect().top;
+      const containerRect = container.getBoundingClientRect();
+      const visibleTop = Math.max(containerRect.top + container.clientTop, headerBottom);
+      const top = container.scrollTop + targetTop - visibleTop - 16;
+      container.scrollTo({ top, behavior });
+    }
+    setPendingScheduleScrollId(null);
+  }, []);
+
+  function navigateToSchedule(scheduleId: string) {
+    const alreadyExpanded = expandedScheduleId === scheduleId || scheduleRefs.current[scheduleId]?.open === true;
+    settleScheduleBeforeScroll.current = !alreadyExpanded;
+    setScheduleFilter("all");
+    setExpandedScheduleId(scheduleId);
+    setPendingScheduleScrollId(scheduleId);
+  }
+
+  useLayoutEffect(() => {
+    if (!pendingScheduleScrollId || expandedScheduleId !== pendingScheduleScrollId) return;
+    const target = scheduleRefs.current[pendingScheduleScrollId];
+    if (!target || !target.open) return;
+    if (!settleScheduleBeforeScroll.current) {
+      scrollToSchedule(pendingScheduleScrollId);
+      return;
+    }
+
+    let cancelled = false;
+    let frame = 0;
+    let previousTop = Number.NaN;
+    let previousHeight = Number.NaN;
+    let stableFrames = 0;
+    const checkLayout = () => {
+      if (cancelled) return;
+      const rect = target.getBoundingClientRect();
+      const height = rect.height;
+      if (Math.abs(rect.top - previousTop) < 0.5 && Math.abs(height - previousHeight) < 0.5) stableFrames += 1;
+      else stableFrames = 0;
+      previousTop = rect.top;
+      previousHeight = height;
+      if (stableFrames >= 2) {
+        settleScheduleBeforeScroll.current = false;
+        scrollToSchedule(pendingScheduleScrollId);
+      } else frame = window.requestAnimationFrame(checkLayout);
+    };
+    frame = window.requestAnimationFrame(checkLayout);
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frame);
+    };
+  }, [expandedScheduleId, pendingScheduleScrollId, scheduleFilter, schedules, scrollToSchedule, visibleSchedules.length]);
   useEffect(() => {
     if (!linkedTime || !selectedDateSlots.length) return;
     document.getElementById(`schedule-slot-${selectedDate}-${linkedTime.replace(":", "-")}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -461,17 +583,19 @@ export function DoctorAvailabilityPage() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl space-y-8">
+    <div className="mx-auto max-w-6xl space-y-8">
       <header>
         <p className="text-sm font-semibold uppercase tracking-[0.14em] text-primary">Doctor workspace</p>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">Manage availability</h1>
         <p className="mt-3 max-w-2xl text-base leading-7 text-muted-foreground">Set Wave appointment slots or continuous Stream booking windows.</p>
       </header>
 
-      <section className="rounded-3xl border border-border bg-card p-6 shadow-sm sm:p-8" aria-labelledby="weekly-schedule-title">
-        <div className="flex items-center gap-3"><span className="flex size-11 items-center justify-center rounded-xl bg-secondary text-secondary-foreground"><CalendarRange aria-hidden="true" className="size-5" /></span><div><h2 id="weekly-schedule-title" className="text-xl font-semibold text-card-foreground">Weekly schedule</h2><p className="text-sm text-muted-foreground">{mode === "wave" ? "Wave creates duration-sized slots with capacity per slot." : "Stream creates one continuous window with total capacity."}</p></div></div>
-        <details className="mt-5 rounded-xl border border-border p-4">
-          <summary className="cursor-pointer list-none rounded-lg px-3 py-2 font-semibold text-foreground transition-colors hover:bg-muted/70 active:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">Add weekly schedule</summary>
+      <details className="group disclosure rounded-3xl border border-border bg-card shadow-sm" aria-labelledby="weekly-schedule-title">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-4 rounded-3xl p-5 transition-colors hover:bg-muted/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring sm:p-7">
+          <span className="flex items-center gap-3"><span className="flex size-11 items-center justify-center rounded-xl bg-secondary text-secondary-foreground"><CalendarRange aria-hidden="true" className="size-5" /></span><span><span id="weekly-schedule-title" className="block text-xl font-semibold text-card-foreground">Weekly schedule</span><span className="mt-1 block text-sm text-muted-foreground">{mode === "wave" ? "Wave creates duration-sized slots with capacity per slot." : "Stream creates one continuous window with total capacity."}</span></span></span>
+          <span className="flex shrink-0 items-center gap-2 text-sm font-medium text-primary"><span className="hidden sm:inline">Add or edit weekly hours</span><ChevronDown aria-hidden="true" className="size-5 transition-transform group-open:rotate-180" /></span>
+        </summary>
+        <div className="border-t border-border px-5 pb-6 sm:px-7 sm:pb-8">
           <form className="mt-5 grid gap-4 sm:grid-cols-2" onSubmit={submitSchedule}>
           <div><label htmlFor="allocation-mode" className="text-sm font-medium">Allocation mode</label><Select value={mode} onValueChange={(value) => setMode(value as typeof mode)}><SelectTrigger className="mt-2" id="allocation-mode"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="wave">Wave (capacity per slot)</SelectItem><SelectItem value="stream">Stream (capacity per window)</SelectItem></SelectContent></Select></div>
           <label className="text-sm font-medium">{mode === "wave" ? "Capacity per Wave slot" : "Total capacity for this Stream window"}<input type="number" min="1" max="500" required value={mode === "wave" ? waveCapacity : streamCapacity} onChange={(e) => mode === "wave" ? setWaveCapacity(e.target.value) : setStreamCapacity(e.target.value)} className="mt-2 min-h-11 w-full rounded-lg border border-input bg-background px-3" /></label>
@@ -480,22 +604,39 @@ export function DoctorAvailabilityPage() {
             <label className="text-sm font-medium">Starts on<DateInput placeholder="Select start date" required min={todayInApplicationZone()} value={startsOn} onChange={setStartsOn} className="mt-2" /></label>
             <label className="text-sm font-medium">Ends on<DateInput placeholder="Select end date" required min={startsOn} value={endsOn} onChange={setEndsOn} className="mt-2" /></label>
           </div>
-          <fieldset className="sm:col-span-2"><legend className="mb-2 text-sm font-medium">Available weekdays</legend><div className="flex flex-wrap gap-3">{weekdaysLabels.map((label, day) => <label key={label} className="inline-flex items-center gap-2 text-sm"><input type="checkbox" checked={weekdays.includes(day)} onChange={(e) => setWeekdays((current) => e.target.checked ? [...current, day].sort() : current.filter((value) => value !== day))} className="size-4 accent-primary" />{label}</label>)}</div></fieldset>
+          <fieldset className="sm:col-span-2"><legend className="mb-2 text-sm font-medium">Available weekdays</legend><div className="flex flex-wrap gap-3">{weekdaysOrder.map((day) => <label key={day} className="inline-flex items-center gap-2 text-sm"><input type="checkbox" checked={weekdays.includes(day)} onChange={(e) => setWeekdays((current) => e.target.checked ? [...current, day].sort() : current.filter((value) => value !== day))} className="size-4 accent-primary" />{weekdaysLabels[day]}</label>)}</div></fieldset>
           <label className="text-sm font-medium">Start time (IST)<input type="time" required value={scheduleStart} onChange={(e) => setScheduleStart(e.target.value)} className="mt-2 min-h-11 w-full rounded-lg border border-input bg-background px-3" /></label>
           <label className="text-sm font-medium">End time (IST)<input type="time" required value={scheduleEnd} onChange={(e) => setScheduleEnd(e.target.value)} className="mt-2 min-h-11 w-full rounded-lg border border-input bg-background px-3" /></label>
           {schedulesError ? <p className="sm:col-span-2 rounded-lg bg-destructive/5 p-3 text-sm" role="alert">{schedulesError}</p> : null}
           <div className="sm:col-span-2"><button type="submit" disabled={scheduleBusy} className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-primary px-5 font-semibold text-primary-foreground hover:bg-primary/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-60"><CalendarPlus aria-hidden="true" className="size-4" />{scheduleBusy ? "Saving schedule…" : "Save schedule"}</button></div>
           </form>
-        </details>
+        </div>
+      </details>
+
+
+      <section className="space-y-4" aria-labelledby="existing-slots-title">
+        <div className="flex flex-wrap items-end justify-between gap-3"><div><h2 id="existing-slots-title" className="text-xl font-semibold text-foreground">Availability calendar</h2><p className="mt-1 text-sm text-muted-foreground">Select a date to review generated Wave and Stream availability and bookings.</p></div><button type="button" onClick={() => refreshSlots()} disabled={loading} className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-60"><RefreshCw aria-hidden="true" className="size-4" />Refresh</button></div>
+        {loading && slots.length === 0 ? <p className="mt-4 rounded-xl bg-muted p-5 text-sm text-muted-foreground" role="status">Loading generated availability...</p> : null}
+        {loading && slots.length > 0 ? <p className="mt-3 text-sm text-muted-foreground" role="status">Refreshing availability…</p> : null}
+        {!loading && loadError ? <div className="mt-4 rounded-xl border border-destructive/40 bg-destructive/5 p-5" role="alert"><p className="text-sm text-foreground">{loadError}</p><button type="button" onClick={() => refreshSlots()} className="mt-3 inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted"><RefreshCw aria-hidden="true" className="size-4" />Try again</button></div> : null}
+        {(!loading || slots.length > 0) && !loadError ? <div className="mt-4 grid gap-6 rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-6 lg:grid-cols-[minmax(20rem,0.85fr)_minmax(0,1.15fr)]">
+          <div>
+          <div className="flex items-center justify-between gap-3"><button type="button" aria-label="Previous month" disabled={calendarMonth <= currentMonth} onClick={() => { const next = shiftMonth(calendarMonth, -1); setCalendarMonth(next); setLoading(true); setSlots([]); setLoadError(null); }} className="inline-flex size-10 items-center justify-center rounded-lg border border-border hover:bg-muted disabled:opacity-40"><ChevronLeft aria-hidden="true" className="size-4" /></button><h3 className="font-semibold text-foreground" aria-live="polite">{formatMonth(calendarMonth)}</h3><button type="button" aria-label="Next month" onClick={() => { const next = shiftMonth(calendarMonth, 1); setCalendarMonth(next); setLoading(true); setSlots([]); setLoadError(null); }} className="inline-flex size-10 items-center justify-center rounded-lg border border-border hover:bg-muted"><ChevronRight aria-hidden="true" className="size-4" /></button></div>
+          <div className="mt-4 grid grid-cols-7 gap-1 text-center text-xs font-medium text-muted-foreground">{["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((day) => <span key={day} className="py-2">{day}</span>)}</div>
+          <div className="grid grid-cols-7 justify-items-center gap-1">{calendarDates.map((day, index) => { if (!day) return <span key={"blank-" + index} aria-hidden="true" className="size-10" />; const count = availabilityCounts[day] ?? 0; const reservations = reservationCounts[day] ?? 0; const selected = day === selectedDate; const today = day === todayInApplicationZone(); const label = `${formatDate(day)}, ${count ? `${count} bookable availability option${count === 1 ? "" : "s"}` : "no bookable availability"}${reservations ? `, ${reservations} reservation-only row${reservations === 1 ? "" : "s"}` : ""}`; return <button key={day} type="button" aria-label={label} aria-pressed={selected} onClick={() => setSelectedDate(day)} className={`flex size-12 flex-col items-center justify-center rounded-lg text-xs transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring ${today ? "ring-2 ring-inset ring-ring" : ""} ${selected ? "bg-primary font-semibold text-primary-foreground" : count ? "bg-secondary/60 font-medium text-secondary-foreground hover:bg-secondary" : "text-muted-foreground hover:bg-muted"}`}><span>{Number(day.slice(-2))}</span><span className="flex min-h-2 items-center gap-0.5 text-[9px] leading-none" aria-hidden="true">{count ? count : ""}{reservations ? <span className="rounded-sm bg-muted px-0.5 text-[8px]">R{reservations > 1 ? reservations : ""}</span> : null}</span></button>; })}</div>
+          </div>
+          <div className="min-w-0 border-t border-border pt-4 lg:border-l lg:border-t-0 lg:pl-6 lg:pt-0"><div className="flex flex-wrap items-baseline justify-between gap-2"><div><h3 className="font-semibold text-card-foreground">{formatDate(selectedDate)}</h3><p className="mt-1 text-sm text-muted-foreground">Generated availability and reservations</p></div><Link href={`/doctor/appointments?date=${encodeURIComponent(selectedDate)}`} className="text-sm font-medium text-primary underline-offset-4 hover:underline">Open appointments</Link></div>{selectedDateSlots.length === 0 ? <p className="mt-4 rounded-xl bg-muted/60 p-5 text-sm text-muted-foreground">No generated availability or reservations on this date.</p> : <ul className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">{selectedDateSlots.map((slot) => { const booking = capacityUsage(slot); const modeClass = slot.mode === "wave" ? "bg-mode-wave-bg text-mode-wave" : "bg-mode-stream-bg text-mode-stream"; return <li id={`schedule-slot-${slot.date}-${slot.start_time.slice(0, 5).replace(":", "-")}`} key={slot.id} className={`flex min-w-0 items-start justify-between gap-3 rounded-xl border border-border p-4 ${linkedTime && slot.start_time.slice(0, 5) === linkedTime ? "bg-secondary/40 ring-2 ring-ring" : "bg-background"}`}><div className="min-w-0"><Badge className={slot.reservation_only ? "bg-muted text-muted-foreground" : modeClass}>{slot.reservation_only ? "Reservation" : slot.mode === "wave" ? "WAVE" : "STREAM"}</Badge><p className="mt-2 font-medium text-foreground">{formatTime(slot.start_time)}–{formatTime(slot.end_time)} IST</p>{slot.reservation_only ? <p className="mt-1 text-xs text-muted-foreground">{slot.preserved_reservation_count != null ? `${slot.preserved_reservation_count} existing booking${slot.preserved_reservation_count === 1 ? "" : "s"} preserved` : "Existing reservation count unavailable"} · unavailable for new bookings</p> : booking ? <><p className="mt-1 text-xs text-muted-foreground">{booking.booked} booked / {booking.total} total</p><div className="mt-1 h-2 w-48 max-w-full overflow-hidden rounded-full bg-muted" role="progressbar" aria-label={`${booking.booked} of ${booking.total} places booked`} aria-valuemin={0} aria-valuemax={booking.total} aria-valuenow={booking.booked}><div className={`h-full rounded-full ${slot.mode === "wave" ? "bg-mode-wave" : "bg-mode-stream"}`} style={{ width: `${booking.percent}%` }} /></div></> : <p className="mt-1 text-xs text-muted-foreground">Booked/total data is unavailable because capacity values are missing or inconsistent.</p>}{slot.schedule_id ? <button type="button" onClick={() => navigateToSchedule(slot.schedule_id!)} className="mt-3 block text-xs font-medium text-primary underline-offset-4 hover:underline">View saved schedule</button> : null}</div>{!slot.reservation_only ? <button type="button" aria-label={`Remove availability on ${formatDate(slot.date)} at ${formatTime(slot.start_time)}`} onClick={() => { setDeleteError(null); setDeleteTarget(slot); }} disabled={activeSlotId !== null} className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50">{activeSlotId === slot.id ? <RefreshCw aria-hidden="true" className="size-4 animate-spin" /> : <Trash2 aria-hidden="true" className="size-4" />}</button> : null}</li>; })}</ul>}</div>
+        </div> : null}
       </section>
 
-
-      <section className="space-y-4" aria-labelledby="saved-schedules-title"><div><h2 id="saved-schedules-title" className="text-xl font-semibold text-foreground">Saved schedules</h2><p className="mt-1 text-sm text-muted-foreground">Schedules automatically open Wave slots or Stream windows for their date range. Add optional date exceptions as needed.</p></div>
+      <section className="space-y-4" aria-labelledby="saved-schedules-title"><div className="flex flex-wrap items-end justify-between gap-3"><div><h2 id="saved-schedules-title" className="text-xl font-semibold text-foreground">Saved schedules</h2><p className="mt-1 text-sm text-muted-foreground">Expand a schedule to view its recurring hours, date exceptions, and editing actions.</p></div><label className="flex items-center gap-2 text-sm font-medium text-foreground">Filter schedules <Select value={scheduleFilter} onValueChange={(value) => setScheduleFilter(value as typeof scheduleFilter)}><SelectTrigger className="w-40"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="all">All modes</SelectItem><SelectItem value="wave">Wave</SelectItem><SelectItem value="stream">Stream</SelectItem></SelectContent></Select></label></div>
         {scheduleLoading ? <p className="rounded-xl bg-muted p-4 text-sm text-muted-foreground" role="status">Loading saved schedules…</p> : null}
         {!scheduleLoading && scheduleLoadError ? <div className="rounded-xl border border-destructive/40 bg-destructive/5 p-4" role="alert"><p className="text-sm text-foreground">Saved schedules could not be loaded: {scheduleLoadError}</p><button type="button" onClick={() => refreshSlots()} className="mt-3 inline-flex min-h-9 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium hover:bg-muted"><RefreshCw aria-hidden="true" className="size-4" />Retry</button></div> : null}
         {!scheduleLoading && !scheduleLoadError && schedules.length === 0 ? <p className="rounded-xl bg-muted p-4 text-sm text-muted-foreground">No schedules have been saved for this doctor yet.</p> : null}
-        {schedules.map((schedule) => { const exceptionType = exceptionTypes[schedule.id] ?? "day_off"; const workingPeriods = schedule.periods.filter((period) => period.weekday != null).sort((a, b) => (a.weekday ?? 0) - (b.weekday ?? 0)); const periodDates = schedule.periods.map((period) => period.service_date).filter((date): date is string => Boolean(date)).sort(); const rangeStart = schedule.starts_on ?? periodDates[0] ?? null; const rangeEnd = schedule.ends_on ?? periodDates[periodDates.length - 1] ?? null; return <article ref={(element) => { scheduleRefs.current[schedule.id] = element; }} key={schedule.id} className="scroll-mt-6 rounded-2xl border border-border bg-card p-5 shadow-sm"><div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="font-semibold text-card-foreground">{schedule.recurrence_type === "weekly" ? "Weekly schedule" : "Date-specific schedule"}</h3><p className="mt-1 text-sm font-medium text-primary">{schedule.mode === "wave" ? `Wave · ${schedule.wave_capacity_per_slot} places per slot` : `Stream · ${schedule.stream_capacity_per_window} total places per window`}</p></div><span className="rounded-full bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">{generationErrors[schedule.id] ? "Generation failed" : availabilityRecoveryNeeded[schedule.id] ? "Needs recovery" : schedule.active ? "Active" : "Inactive"}</span></div>
+        {!scheduleLoading && !scheduleLoadError && schedules.length > 0 && visibleSchedules.length === 0 ? <p className="rounded-xl bg-muted p-4 text-sm text-muted-foreground">No saved schedules match this mode. Choose another filter to see more schedules.</p> : null}
+        {visibleSchedules.map((schedule) => { const exceptionType = exceptionTypes[schedule.id] ?? "day_off"; const workingPeriods = schedule.periods.filter((period) => period.weekday != null).sort((a, b) => (a.weekday ?? 0) - (b.weekday ?? 0)); const periodDates = schedule.periods.map((period) => period.service_date).filter((date): date is string => Boolean(date)).sort(); const rangeStart = schedule.starts_on ?? periodDates[0] ?? null; const rangeEnd = schedule.ends_on ?? periodDates[periodDates.length - 1] ?? null; return <details open={expandedScheduleId === schedule.id} onToggle={(event) => { if (event.currentTarget.open) setExpandedScheduleId(schedule.id); else setExpandedScheduleId((current) => current === schedule.id ? null : current); }} ref={(element) => { scheduleRefs.current[schedule.id] = element; }} key={schedule.id} className={`disclosure scroll-mt-24 rounded-2xl border bg-card shadow-sm ${schedule.mode === "wave" ? "border-mode-wave/40" : "border-mode-stream/40"}`}><summary className="flex cursor-pointer list-none items-center justify-between gap-4 rounded-2xl p-4 hover:bg-muted/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring sm:px-5"><span className="min-w-0"><span className="block truncate font-semibold text-card-foreground">{schedule.recurrence_type === "weekly" ? "Weekly schedule" : "Date-specific schedule"}</span><span className="mt-1 flex flex-wrap items-center gap-2"><Badge className={schedule.mode === "wave" ? "bg-mode-wave-bg text-mode-wave" : "bg-mode-stream-bg text-mode-stream"}>{schedule.mode === "wave" ? "WAVE" : "STREAM"}</Badge><Badge className="bg-muted text-muted-foreground">{schedule.active ? "Active" : "Inactive"}</Badge>{generationErrors[schedule.id] ? <Badge className="bg-destructive/10 text-destructive">Generation failed</Badge> : availabilityRecoveryNeeded[schedule.id] ? <Badge className="bg-secondary text-secondary-foreground">Needs recovery</Badge> : null}<span className="text-xs text-muted-foreground">{rangeStart ? `${formatScheduleDate(rangeStart)} – ${formatScheduleDate(rangeEnd)}` : "Dates not set"}</span></span></span><ChevronDown aria-hidden="true" className={`size-5 shrink-0 text-muted-foreground transition-transform ${expandedScheduleId === schedule.id ? "rotate-180" : ""}`} /></summary><div className="border-t border-border p-4 sm:p-5">
           <dl className="mt-4 grid gap-3 rounded-xl bg-muted/50 p-4 text-sm sm:grid-cols-2"><div><dt className="font-medium text-muted-foreground">Start Date</dt><dd className="mt-1 font-semibold text-foreground">{formatScheduleDate(rangeStart)}</dd></div><div><dt className="font-medium text-muted-foreground">End Date</dt><dd className="mt-1 font-semibold text-foreground">{formatScheduleDate(rangeEnd)}</dd></div></dl>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm"><span className="text-muted-foreground">{rangeStart ? `Dates: ${formatScheduleDate(rangeStart)} – ${formatScheduleDate(rangeEnd)}` : "Date range not set"}</span>{rangeStart ? <button type="button" onClick={() => { setCalendarMonth(`${rangeStart.slice(0, 7)}-01`); setSelectedDate(rangeStart); document.getElementById("existing-slots-title")?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" }); }} className="inline-flex min-h-9 items-center gap-2 rounded-lg border border-border bg-background px-3 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"><CalendarRange aria-hidden="true" className="size-4" />Open calendar date</button> : null}</div>
           <div className="mt-4 divide-y divide-border rounded-xl border border-border">{workingPeriods.map((period) => <div key={`${period.weekday}-${period.start_time}`} className="flex items-center justify-between gap-3 px-4 py-3 text-sm"><span className="font-medium text-foreground">{period.weekday == null ? period.service_date : weekdaysLabels[period.weekday]}</span><span className="text-muted-foreground">{period.start_time.slice(0,5)}–{period.end_time.slice(0,5)} IST</span></div>)}{workingPeriods.length === 0 ? schedule.periods.map((period) => <div key={`${period.service_date}-${period.start_time}`} className="flex items-center justify-between gap-3 px-4 py-3 text-sm"><span className="font-medium text-foreground">{period.service_date}</span><span className="text-muted-foreground">{period.start_time.slice(0,5)}–{period.end_time.slice(0,5)} IST</span></div>) : null}</div>
           {schedule.recurrence_type === "weekly" && schedule.active ? <div className="mt-4">
             {editingScheduleId !== schedule.id ? <button type="button" onClick={() => beginScheduleEdit(schedule)} disabled={scheduleBusy || previewBusy} className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-sm font-semibold text-foreground hover:bg-muted disabled:opacity-60"><Pencil aria-hidden="true" className="size-4" />Edit schedule</button> : <div className="rounded-xl border border-border p-4">
@@ -503,7 +644,7 @@ export function DoctorAvailabilityPage() {
               <div className="mt-4 grid gap-4 sm:grid-cols-2">
                 <label className="text-sm font-medium">Starts on<DateInput placeholder="Select start date" required disabled={previewBusy || scheduleBusy} value={editStartsOn} onChange={(date) => { setEditStartsOn(date); setSchedulePreview(null); setSchedulePreviewInput(null); }} className="mt-1" /></label>
                 <label className="text-sm font-medium">Ends on<DateInput placeholder="Select end date" required min={editStartsOn} disabled={previewBusy || scheduleBusy} value={editEndsOn} onChange={(date) => { setEditEndsOn(date); setSchedulePreview(null); setSchedulePreviewInput(null); }} className="mt-1" /></label>
-                <fieldset className="sm:col-span-2"><legend className="mb-2 text-sm font-medium">Available weekdays</legend><div className="flex flex-wrap gap-3">{weekdaysLabels.map((label, day) => <label key={label} className="inline-flex items-center gap-2 text-sm"><input type="checkbox" disabled={previewBusy || scheduleBusy} checked={editWeekdays.includes(day)} onChange={(event) => { setEditWeekdays((current) => event.target.checked ? [...current, day].sort() : current.filter((value) => value !== day)); setSchedulePreview(null); setSchedulePreviewInput(null); }} className="size-4 accent-primary" />{label}</label>)}</div></fieldset>
+                <fieldset className="sm:col-span-2"><legend className="mb-2 text-sm font-medium">Available weekdays</legend><div className="flex flex-wrap gap-3">{weekdaysOrder.map((day) => <label key={day} className="inline-flex items-center gap-2 text-sm"><input type="checkbox" disabled={previewBusy || scheduleBusy} checked={editWeekdays.includes(day)} onChange={(event) => { setEditWeekdays((current) => event.target.checked ? [...current, day].sort() : current.filter((value) => value !== day)); setSchedulePreview(null); setSchedulePreviewInput(null); }} className="size-4 accent-primary" />{weekdaysLabels[day]}</label>)}</div></fieldset>
                 <label className="text-sm font-medium">Start time (IST)<input type="time" required disabled={previewBusy || scheduleBusy} value={editStart} onChange={(event) => { setEditStart(event.target.value); setSchedulePreview(null); setSchedulePreviewInput(null); }} className="mt-1 min-h-11 w-full rounded-lg border border-input bg-background px-3" /></label>
                 <label className="text-sm font-medium">End time (IST)<input type="time" required disabled={previewBusy || scheduleBusy} value={editEnd} onChange={(event) => { setEditEnd(event.target.value); setSchedulePreview(null); setSchedulePreviewInput(null); }} className="mt-1 min-h-11 w-full rounded-lg border border-input bg-background px-3" /></label>
               </div>
@@ -514,9 +655,9 @@ export function DoctorAvailabilityPage() {
                 <section className="rounded-lg border border-border p-3" aria-labelledby={`attention-${schedule.id}`}><h5 id={`attention-${schedule.id}`} className="text-sm font-semibold text-foreground">Appointments requiring attention ({schedulePreview.affected_appointments.length})</h5>{schedulePreview.affected_appointments.length ? <ul className="mt-2 space-y-2 text-sm text-muted-foreground">{schedulePreview.affected_appointments.map((appointment) => <li key={appointment.id} className="flex flex-wrap items-center justify-between gap-2"><span>{formatDate(appointment.date)} · {formatTime(appointment.start_time)}–{formatTime(appointment.end_time)} IST · Confirmed</span><Link href={`/doctor/appointments?appointment=${encodeURIComponent(appointment.id)}`} className="font-semibold text-primary underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">Open appointment</Link></li>)}</ul> : <p className="mt-1 text-xs text-muted-foreground">No confirmed appointments fall outside the proposed weekly hours.</p>}</section>
                 {schedulePreview.active_payment_holds.length ? <section className="rounded-lg border border-border p-3" aria-label="Active payment holds"><h5 className="text-sm font-semibold text-foreground">Active payment holds ({schedulePreview.active_payment_holds.length})</h5><ul className="mt-2 space-y-1 text-sm text-muted-foreground">{schedulePreview.active_payment_holds.map((hold) => <li key={hold.id}>{formatDate(hold.date)} · {formatTime(hold.start_time)}–{formatTime(hold.end_time)} IST · Expires {formatHoldExpiry(hold.expires_at) ?? "soon"}</li>)}</ul></section> : null}
                 {schedulePreview.active_allocations.length ? <section className="rounded-lg border border-border p-3" aria-label="Active availability allocations"><h5 className="text-sm font-semibold text-foreground">Active allocations ({schedulePreview.active_allocations.length})</h5><ul className="mt-2 space-y-1 text-sm text-muted-foreground">{schedulePreview.active_allocations.map((allocation) => <li key={allocation.id}>{formatDate(allocation.date)} · {formatTime(allocation.start_time)}–{formatTime(allocation.end_time)} IST · {allocation.status}</li>)}</ul></section> : null}
-                <details className="rounded-lg border border-border p-3"><summary className="cursor-pointer text-sm font-medium text-foreground">View slot-level details</summary>
+                <details className="disclosure group rounded-lg border border-border p-3"><summary className="flex cursor-pointer list-none items-center justify-between text-sm font-medium text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"><span>View slot-level details</span><ChevronDown aria-hidden="true" className="size-4 transition-transform group-open:rotate-180" /></summary>
                 {schedulePreview.added_availability.length ? <div className="mt-3"><p className="text-sm font-medium text-foreground">Added availability</p><div className="mt-1 space-y-2 text-sm text-muted-foreground">{Object.entries(groupByDate(schedulePreview.added_availability)).map(([date, items]) => <p key={date}><span className="font-medium text-foreground">{formatDate(date)}:</span> {items.map((item) => `${formatTime(item.start_time)}–${formatTime(item.end_time)}`).join(", ")} IST</p>)}</div></div> : <p className="mt-3 text-sm text-muted-foreground">No availability additions.</p>}
-                {schedulePreview.resized_availability.length ? <div className="mt-3"><p className="text-sm font-medium text-foreground">Expanded Stream windows</p><div className="mt-1 space-y-2 text-sm text-muted-foreground">{schedulePreview.resized_availability.map((item) => <p key={item.availability_id}><span className="font-medium text-foreground">{formatDate(item.date)}:</span> {formatTime(item.previous_start_time)}?{formatTime(item.previous_end_time)} expanded to {formatTime(item.start_time)}?{formatTime(item.end_time)} IST. Existing allocation capacity is retained.</p>)}</div></div> : null}{schedulePreview.removed_availability.length ? <div className="mt-3"><p className="text-sm font-medium text-foreground">Removed availability; existing reservations remain</p><div className="mt-1 space-y-2 text-sm text-muted-foreground">{Object.entries(groupByDate(schedulePreview.removed_availability)).map(([date, items]) => <p key={date}><span className="font-medium text-foreground">{formatDate(date)}:</span> {items.map((item) => `${formatTime(item.start_time)}–${formatTime(item.end_time)}${item.has_confirmed_appointment ? " (confirmed appointment preserved)" : ""}${item.has_active_payment_hold ? " (payment hold preserved)" : ""}${item.has_active_allocation ? " (allocation preserved)" : ""}`).join(", ")} IST</p>)}</div></div> : null}
+                {schedulePreview.resized_availability.length ? <div className="mt-3"><p className="text-sm font-medium text-foreground">Expanded Stream windows</p><div className="mt-1 space-y-2 text-sm text-muted-foreground">{schedulePreview.resized_availability.map((item) => <p key={item.availability_id}><span className="font-medium text-foreground">{formatDate(item.date)}:</span> {formatTime(item.previous_start_time)}–{formatTime(item.previous_end_time)} expanded to {formatTime(item.start_time)}–{formatTime(item.end_time)} IST. Existing allocation capacity is retained.</p>)}</div></div> : null}{schedulePreview.removed_availability.length ? <div className="mt-3"><p className="text-sm font-medium text-foreground">Removed availability; existing reservations remain</p><div className="mt-1 space-y-2 text-sm text-muted-foreground">{Object.entries(groupByDate(schedulePreview.removed_availability)).map(([date, items]) => <p key={date}><span className="font-medium text-foreground">{formatDate(date)}:</span> {items.map((item) => `${formatTime(item.start_time)}–${formatTime(item.end_time)}${item.has_confirmed_appointment ? " (confirmed appointment preserved)" : ""}${item.has_active_payment_hold ? " (payment hold preserved)" : ""}${item.has_active_allocation ? " (allocation preserved)" : ""}`).join(", ")} IST</p>)}</div></div> : null}
                 {schedulePreview.blocked_availability.length ? <div className="mt-3"><p className="text-sm font-medium text-foreground">New availability skipped because of conflicts or active reservations</p><div className="mt-1 space-y-2 text-sm text-muted-foreground">{Object.entries(groupByDate(schedulePreview.blocked_availability)).map(([date, items]) => <p key={date}><span className="font-medium text-foreground">{formatDate(date)}:</span> {items.map((item) => `${formatTime(item.start_time)}–${formatTime(item.end_time)} (${item.reasons.map((reason) => reason.replaceAll("_", " ")).join(", ")})`).join("; ")} IST</p>)}</div></div> : null}
                 </details>
               </div> : null}
@@ -531,22 +672,12 @@ export function DoctorAvailabilityPage() {
           </form> : null}
           {generationErrors[schedule.id] ? <p className="mt-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm" role="alert">Availability generation failed: {generationErrors[schedule.id]}</p> : null}
           {generationConflicts[schedule.id]?.map((conflict, index) => <p key={`${conflict.date}-${conflict.start_time}-${index}`} className="mt-3 rounded-lg border border-border bg-muted/50 p-3 text-sm text-muted-foreground">Availability on {formatDate(conflict.date)} at {formatTime(conflict.start_time)}–{formatTime(conflict.end_time)} IST was preserved and skipped because it overlaps {conflict.reason}. No retry is offered because changing that row could affect existing booking history.</p>)}
-          <details className="mt-4 border-t border-border pt-4"><summary className="cursor-pointer text-sm font-semibold text-foreground">Date exceptions</summary><form className="mt-4 grid gap-4 sm:grid-cols-2" onSubmit={(e) => void submitException(e, schedule.id)}><div className="sm:col-span-2"><p className="text-sm text-muted-foreground">Adjust this schedule for one date.</p></div><label className="text-sm font-medium">Exception date<DateInput name="exception_date" required min={todayInApplicationZone()} className="mt-1" /></label><div><label htmlFor={`exception-type-${schedule.id}`} className="text-sm font-medium">Change hours</label><Select value={exceptionType} onValueChange={(value) => setExceptionTypes((current) => ({ ...current, [schedule.id]: value as typeof exceptionType }))}><SelectTrigger className="mt-1" id={`exception-type-${schedule.id}`}><SelectValue /></SelectTrigger><SelectContent><SelectItem value="day_off">Day off</SelectItem><SelectItem value="override">Override hours</SelectItem><SelectItem value="additional">Add hours</SelectItem></SelectContent></Select></div>{exceptionType !== "day_off" ? <><label className="text-sm font-medium">Start time<input name="exception_start" type="time" required defaultValue="09:00" className="mt-1 min-h-11 w-full rounded-lg border border-input bg-background px-3" /></label><label className="text-sm font-medium">End time<input name="exception_end" type="time" required defaultValue="17:00" className="mt-1 min-h-11 w-full rounded-lg border border-input bg-background px-3" /></label></> : null}<div className="sm:col-span-2"><button type="submit" disabled={scheduleBusy || !schedule.active} className="inline-flex min-h-11 items-center justify-center rounded-lg border border-primary bg-background px-4 font-semibold text-primary transition-colors hover:bg-primary hover:text-primary-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-60">{scheduleBusy ? "Saving…" : "Save date exception"}</button></div></form></details>
+          <details className="disclosure group mt-4 border-t border-border pt-4"><summary className="flex cursor-pointer list-none items-center justify-between text-sm font-semibold text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"><span>Date exceptions</span><ChevronDown aria-hidden="true" className="size-4 transition-transform group-open:rotate-180" /></summary><div><form className="mt-4 grid gap-4 sm:grid-cols-2" onSubmit={(e) => void submitException(e, schedule.id)}><div className="sm:col-span-2"><p className="text-sm text-muted-foreground">Adjust this schedule for one date.</p></div><label className="text-sm font-medium">Exception date<DateInput name="exception_date" required min={todayInApplicationZone()} value={exceptionDates[schedule.id] ?? exceptionDateDefault(schedule, selectedDate, todayInApplicationZone())} onChange={(date) => setExceptionDates((current) => ({ ...current, [schedule.id]: date }))} className="mt-1" /></label><div><label htmlFor={`exception-type-${schedule.id}`} className="text-sm font-medium">Change hours</label><Select value={exceptionType} onValueChange={(value) => setExceptionTypes((current) => ({ ...current, [schedule.id]: value as typeof exceptionType }))}><SelectTrigger className="mt-1" id={`exception-type-${schedule.id}`}><SelectValue /></SelectTrigger><SelectContent><SelectItem value="day_off">Day off</SelectItem><SelectItem value="override">Override hours</SelectItem><SelectItem value="additional">Add hours</SelectItem></SelectContent></Select></div>{exceptionType !== "day_off" ? <><label className="text-sm font-medium">Start time<input name="exception_start" type="time" required defaultValue="09:00" className="mt-1 min-h-11 w-full rounded-lg border border-input bg-background px-3" /></label><label className="text-sm font-medium">End time<input name="exception_end" type="time" required defaultValue="17:00" className="mt-1 min-h-11 w-full rounded-lg border border-input bg-background px-3" /></label></> : null}<div className="sm:col-span-2"><button type="submit" disabled={scheduleBusy || !schedule.active} className="inline-flex min-h-11 items-center justify-center rounded-lg border border-primary bg-background px-4 font-semibold text-primary transition-colors hover:bg-primary hover:text-primary-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-60">{scheduleBusy ? "Saving…" : "Save date exception"}</button></div></form></div></details>
           {recentExceptions.filter((entry) => entry.scheduleId === schedule.id).map((entry) => <p key={`${entry.date}-${entry.type}`} className="mt-2 text-sm text-muted-foreground">{entry.date}: {entry.type.replace("_", " ")}</p>)}
-        </article>; })}
+        </div></details>; })}
       </section>
 
-      <section aria-labelledby="existing-slots-title">
-        <div className="flex flex-wrap items-end justify-between gap-3"><div><h2 id="existing-slots-title" className="text-xl font-semibold text-foreground">Generated availability</h2><p className="mt-1 text-sm text-muted-foreground">Choose a date to review its Wave slots or Stream windows.</p></div><button type="button" onClick={() => refreshSlots()} disabled={loading} className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-60"><RefreshCw aria-hidden="true" className="size-4" />Refresh</button></div>
-        {loading ? <p className="mt-4 rounded-xl bg-muted p-5 text-sm text-muted-foreground" role="status">Loading generated availability...</p> : null}
-        {!loading && loadError ? <div className="mt-4 rounded-xl border border-destructive/40 bg-destructive/5 p-5" role="alert"><p className="text-sm text-foreground">{loadError}</p><button type="button" onClick={() => refreshSlots()} className="mt-3 inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium text-foreground hover:bg-muted"><RefreshCw aria-hidden="true" className="size-4" />Try again</button></div> : null}
-        {!loading && !loadError ? <div className="mt-4 rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-6">
-          <div className="flex items-center justify-between gap-3"><button type="button" aria-label="Previous month" disabled={calendarMonth <= currentMonth} onClick={() => { const next = shiftMonth(calendarMonth, -1); setCalendarMonth(next); setLoading(true); setSlots([]); setLoadError(null); }} className="inline-flex size-10 items-center justify-center rounded-lg border border-border hover:bg-muted disabled:opacity-40"><ChevronLeft aria-hidden="true" className="size-4" /></button><h3 className="font-semibold text-foreground" aria-live="polite">{formatMonth(calendarMonth)}</h3><button type="button" aria-label="Next month" onClick={() => { const next = shiftMonth(calendarMonth, 1); setCalendarMonth(next); setLoading(true); setSlots([]); setLoadError(null); }} className="inline-flex size-10 items-center justify-center rounded-lg border border-border hover:bg-muted"><ChevronRight aria-hidden="true" className="size-4" /></button></div>
-          <div className="mt-4 grid grid-cols-7 gap-1 text-center text-xs font-medium text-muted-foreground">{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => <span key={day} className="py-2">{day}</span>)}</div>
-          <div className="grid grid-cols-7 justify-items-center gap-1">{calendarDates.map((day, index) => { if (!day) return <span key={"blank-" + index} aria-hidden="true" className="size-10" />; const count = availabilityCounts[day] ?? 0; const reservations = reservationCounts[day] ?? 0; const selected = day === selectedDate; const today = day === todayInApplicationZone(); const label = `${formatDate(day)}, ${count ? `${count} bookable availability option${count === 1 ? "" : "s"}` : "no bookable availability"}${reservations ? `, ${reservations} reservation-only row${reservations === 1 ? "" : "s"}` : ""}`; return <button key={day} type="button" aria-label={label} aria-pressed={selected} onClick={() => setSelectedDate(day)} className={`flex size-10 flex-col items-center justify-center rounded-lg text-xs transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring ${today ? "ring-2 ring-inset ring-ring" : ""} ${selected ? "bg-primary font-semibold text-primary-foreground" : count ? "bg-secondary/60 font-medium text-secondary-foreground hover:bg-secondary" : "text-muted-foreground hover:bg-muted"}`}><span>{Number(day.slice(-2))}</span><span className="flex min-h-2 items-center gap-0.5 text-[9px] leading-none" aria-hidden="true">{count ? count : ""}{reservations ? <span className="rounded-sm bg-muted px-0.5 text-[8px]">R{reservations > 1 ? reservations : ""}</span> : null}</span></button>; })}</div>
-          <div className="mt-5 border-t border-border pt-4"><h3 className="font-semibold text-card-foreground">{formatDate(selectedDate)}</h3>{selectedDateSlots.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">No availability or reservations on this date.</p> : <ul className="mt-3 divide-y divide-border">{selectedDateSlots.map((slot) => <li id={`schedule-slot-${slot.date}-${slot.start_time.slice(0, 5).replace(":", "-")}`} key={slot.id} className={`flex items-center justify-between gap-4 py-3 ${linkedTime && slot.start_time.slice(0, 5) === linkedTime ? "rounded-lg bg-secondary/40 px-3 ring-2 ring-ring" : ""}`}><div><span className="inline-flex rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">{slot.reservation_only ? "Reservation" : slot.mode === "wave" ? "Wave" : "Stream"}</span><p className="mt-1 text-sm text-muted-foreground">{slot.mode === "stream" ? "Continuous window · " : ""}{formatTime(slot.start_time)}–{formatTime(slot.end_time)} IST</p>{slot.reservation_only ? <p className="mt-1 text-xs text-muted-foreground">{slot.preserved_reservation_count ?? 1} existing booking{(slot.preserved_reservation_count ?? 1) === 1 ? "" : "s"} preserved. Not available for new bookings.</p> : slot.capacity != null && slot.remaining_capacity != null ? <p className="mt-1 text-xs text-muted-foreground">{slot.remaining_capacity} / {slot.capacity} places available</p> : null}</div>{!slot.reservation_only ? <button type="button" aria-label={`Remove availability on ${formatDate(slot.date)} at ${formatTime(slot.start_time)}`} onClick={() => { setDeleteError(null); setDeleteTarget(slot); }} disabled={activeSlotId !== null} className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:opacity-50">{activeSlotId === slot.id ? <RefreshCw aria-hidden="true" className="size-4 animate-spin" /> : <Trash2 aria-hidden="true" className="size-4" />}</button> : null}</li>)}</ul>}</div>
-        </div> : null}
-      </section>      <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => {
+      <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => {
         if (!open && activeSlotId === null) {
           setDeleteTarget(null);
           setDeleteError(null);
