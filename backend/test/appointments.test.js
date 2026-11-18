@@ -26,6 +26,7 @@ const secondAppointmentId = "44444444-4444-4444-8444-444444444444";
 const patientUser = { id: patientUserId, role: "patient", is_active: true, first_name: "Pia", last_name: "Patient" };
 const doctorUser = { id: doctorUserId, role: "doctor", is_active: true, first_name: "Dara", last_name: "Doctor" };
 const otherUser = { id: otherUserId, role: "patient", is_active: true, first_name: "Other", last_name: "Patient" };
+const receptionistUser = { id: "ffffffff-ffff-4fff-8fff-ffffffffffff", role: "receptionist", is_active: true, first_name: "Rae", last_name: "Reception" };
 const registeredPatientEmail = "pia@example.test";
 
 function makeSlot(id, start_time = "10:00", date = "2099-04-10", deleted_at = null) {
@@ -44,6 +45,7 @@ function createDatabase({
   appointmentRefs = [],
   assistedRequests = [],
   failOutboxInsert = false,
+  queueStatus = "in_progress",
 } = {}) {
   const state = { slots: slots.map((slot) => ({ ...slot })), appointments: appointments.map((appointment) => ({ ...appointment })), allocations: allocations.map((allocation) => ({ ...allocation })), assistedRequests: assistedRequests.map((request) => ({ ...request })), outbox: [] };
   const lockTails = new Map();
@@ -70,6 +72,7 @@ function createDatabase({
     state,
     async query(sql, values = []) {
       if (sql.includes("FROM users WHERE clerk_user_id")) return { rows: [currentUser] };
+      if (sql.includes("SELECT d.id FROM appointments a JOIN availability av")) return { rows: [{ id: doctorId }] };
       if (sql === "SELECT id FROM patients WHERE user_id = $1") return { rows: currentUser.id === patientUserId ? [{ id: patientId }] : [] };
       if (sql === "SELECT id FROM doctors WHERE user_id = $1") return { rows: currentUser.id === doctorUserId ? [{ id: doctorId }] : [] };
       if (sql === "SELECT status FROM appointment_queue_entries WHERE appointment_id = $1 FOR UPDATE") return { rows: [{ status: "in_progress" }] };
@@ -139,6 +142,10 @@ function createDatabase({
           }
           if (sql.includes("SELECT a.availability_id FROM appointments a JOIN patients p")) {
             const appointment = txAppointments.find((row) => row.id === values[0] && values[1] === patientUserId && row.patient_id === patientId);
+            return { rows: appointment ? [{ availability_id: appointment.availability_id }] : [] };
+          }
+          if (sql.includes("SELECT a.availability_id FROM appointments a JOIN availability av")) {
+            const appointment = txAppointments.find((row) => row.id === values[0] && state.slots.find((slot) => slot.id === row.availability_id)?.doctor_id === values[1]);
             return { rows: appointment ? [{ availability_id: appointment.availability_id }] : [] };
           }
           if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
@@ -282,7 +289,7 @@ function createDatabase({
             if (appointment) Object.assign(appointment, { status: "completed", updated_at: "2099-02-01T00:00:00.000Z" });
             return { rows: [] };
           }
-          if (sql === "SELECT status FROM appointment_queue_entries WHERE appointment_id = $1 FOR UPDATE") return { rows: [{ status: "in_progress" }] };
+          if (sql === "SELECT status FROM appointment_queue_entries WHERE appointment_id = $1 FOR UPDATE") return { rows: [{ status: queueStatus }] };
           if (sql.includes("FROM appointments a") && sql.includes("WHERE a.id = $1")) {
             const appointment = txAppointments.find((row) => row.id === values[0]);
             return { rows: appointment ? [details(appointment)] : [] };
@@ -401,6 +408,20 @@ describe("appointment schemas and migration", () => {
     const feeSnapshot = fs.readFileSync(path.join(directory, "012_appointment_consultation_fee_snapshot.sql"), "utf8");
     assert.match(feeSnapshot, /ADD COLUMN consultation_fee NUMERIC\(10, 2\)/i);
     assert.match(feeSnapshot, /payment\.appointment_id = appointment\.id/i);
+  });
+
+  it("continues counting completed appointments in capacity calculations", async () => {
+    const statements = [];
+    const client = { async query(sql) { statements.push(sql); return { rows: [{ occupied: 1, availability_id: "slot" }] }; } };
+    assert.equal(await appointmentService.countOccupiedPlaces(client, "slot"), 1);
+    assert.equal((await appointmentService.countOccupiedPlacesForSlots(client, ["slot"])).get("slot"), 1);
+    for (const sql of statements) {
+      assert.match(sql, /appointment\.status IN \('confirmed', 'completed'\)/);
+      assert.match(sql, /linked\.status IN \('confirmed', 'completed'\)/);
+    }
+    const availabilitySql = fs.readFileSync(path.join(__dirname, "../src/controllers/availabilityController.js"), "utf8");
+    assert.match(availabilitySql, /appointment\.status IN \('confirmed', 'completed'\)/);
+    assert.match(availabilitySql, /linked\.status IN \('confirmed', 'completed'\)/);
   });
 });
 
@@ -708,6 +729,27 @@ describe("appointment workflows", () => {
       assert.equal(occupiedTarget.database.state.appointments[0].status, "confirmed");
       assert.equal(occupiedTarget.database.state.appointments.length, 2);
     });
+  });
+
+  it("rejects receptionist rescheduling after check-in or any terminal queue transition", async () => {
+    for (const queueStatus of ["waiting", "in_progress", "completed", "cancelled", "no_show"]) {
+      const database = createDatabase({ currentUser: receptionistUser, appointments: [makeAppointment()], queueStatus });
+      await assert.rejects(
+        appointmentService.doctorRescheduleAppointment(database, receptionistUser, "Asia/Kolkata", appointmentId, { availability_id: secondSlotId }),
+        (error) => error.code === "QUEUE_STATE_CONFLICT",
+        `queue status ${queueStatus} should not be reschedulable`,
+      );
+      assert.equal(database.state.appointments[0].availability_id, firstSlotId);
+    }
+  });
+
+  it("keeps receptionist rescheduling available before check-in", async () => {
+    const database = createDatabase({ currentUser: receptionistUser, appointments: [makeAppointment()], queueStatus: "not_checked_in" });
+    const result = await appointmentService.doctorRescheduleAppointment(database, receptionistUser, "Asia/Kolkata", appointmentId, { availability_id: secondSlotId });
+    assert.equal(result.status, "confirmed");
+    assert.equal(result.availability_id, secondSlotId);
+    assert.equal(database.state.appointments[0].availability_id, secondSlotId);
+    assert.equal(database.state.appointments[0].status, "confirmed");
   });
 
   it("lets the owning doctor move the same appointment without changing availability", async () => {

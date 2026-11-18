@@ -6,12 +6,13 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { CalendarClock, CheckCircle2, RefreshCw, CalendarPlus, ChevronDown, ChevronUp } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { completeDoctorAppointment, doctorRescheduleAppointment, getAppointment, getCurrentProfile, getDoctorAssistedRequests, getDoctorSlots, ProfileApiError, type AssistedDoctorRequest, type AvailabilitySlot, type PatientAppointment } from "@/lib/profile-api";
+import { completeDoctorAppointment, doctorRescheduleAppointment, getAppointment, getAppointmentsForDate, getCurrentProfile, getDoctorAssistedRequests, getDoctorQueue, getDoctorSlots, ProfileApiError, type AssistedDoctorRequest, type AvailabilitySlot, type DoctorQueue, type PatientAppointment } from "@/lib/profile-api";
 import { notifyError, notifyInAppNotificationsChanged, notifySuccess } from "@/lib/notifications";
 import { useAppointmentHistory } from "@/components/use-appointment-history";
 import { AppointmentAvailabilityCalendar } from "@/components/appointment-availability-calendar";
 import { formatDateOnly } from "@/lib/date-format";
 import { Badge } from "@/components/ui/badge";
+import { QueueStatusBadge } from "@/components/queue-status-badge";
 
 function todayInIndia() {
   const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date()).map(({ type, value }) => [type, value]));
@@ -47,12 +48,6 @@ function formatTime(time: string) {
   return `${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
 }
 
-function statusClasses(status: PatientAppointment["status"]) {
-  if (status === "confirmed") return "bg-status-confirmed-bg text-status-confirmed";
-  if (status === "cancelled") return "bg-status-cancelled-bg text-status-cancelled";
-  return "bg-status-completed-bg text-status-completed";
-}
-
 function appointmentMonthDates(month: string) {
   const [year, monthNumber] = month.split("-").map(Number);
   const offset = (new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay() + 6) % 7;
@@ -75,6 +70,7 @@ export function DoctorAppointmentsPage() {
   const pendingNotificationScroll = useRef<string | null>(null);
   const [notificationFocusId, setNotificationFocusId] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState<number | null>(null);
+  const [queueEntries, setQueueEntries] = useState<Record<string, DoctorQueue["entries"][number]>>({});
   const [activeAppointment, setActiveAppointment] = useState<string | null>(null);
   const mutationLock = useRef(false);
   const [rescheduleId, setRescheduleId] = useState<string | null>(null);
@@ -89,6 +85,10 @@ export function DoctorAppointmentsPage() {
   const [assistedError, setAssistedError] = useState<string | null>(null);
   const [agendaDate, setAgendaDate] = useState(initialAgendaDate);
   const [agendaMonth, setAgendaMonth] = useState(initialAgendaDate.slice(0, 7));
+  const [agendaAppointments, setAgendaAppointments] = useState<PatientAppointment[]>([]);
+  const [agendaQueueEntries, setAgendaQueueEntries] = useState<Record<string, DoctorQueue["entries"][number]>>({});
+  const [agendaLoading, setAgendaLoading] = useState(true);
+  const [agendaError, setAgendaError] = useState<string | null>(null);
 
   const loadAssistedRequests = useCallback(async () => {
     setAssistedLoading(true);
@@ -185,7 +185,42 @@ export function DoctorAppointmentsPage() {
       || `${second.date}T${second.start_time}`.localeCompare(`${first.date}T${first.start_time}`)
       || second.id.localeCompare(first.id));
   const appointmentDates = new Set(appointments.map((appointment) => appointment.date));
-  const selectedDateAppointments = appointments.filter((appointment) => appointment.date === agendaDate);
+  useEffect(() => {
+    if (!appointments.length) { setQueueEntries({}); return; }
+    let active = true;
+    void getToken().then(async (token) => {
+      if (!token) return {};
+      const dates = [...new Set(appointments.map((appointment) => appointment.date))];
+      const queues = await Promise.all(dates.map(async (date) => {
+        try { return await getDoctorQueue(token, date); } catch { return null; }
+      }));
+      return Object.fromEntries(queues.flatMap((queue) => queue ? [...(queue.current ? [queue.current] : []), ...queue.entries].map((entry) => [entry.appointment_id, entry] as const) : []));
+    }).then((result) => { if (active) setQueueEntries(result); }).catch(() => {});
+    return () => { active = false; };
+  }, [appointments, getToken]);
+
+  useEffect(() => {
+    let active = true;
+    setAgendaLoading(true);
+    setAgendaError(null);
+    void getToken().then(async (token) => {
+      if (!token) throw new Error("Your session could not be verified. Please sign in again.");
+      const [datedAppointments, queue] = await Promise.all([
+        getAppointmentsForDate(token, agendaDate),
+        getDoctorQueue(token, agendaDate),
+      ]);
+      if (!active) return;
+      setAgendaAppointments(datedAppointments);
+      setAgendaQueueEntries(Object.fromEntries(queue.entries.map((entry) => [entry.appointment_id, entry])));
+    }).catch((cause) => {
+      if (active) {
+        setAgendaAppointments([]);
+        setAgendaQueueEntries({});
+        setAgendaError(cause instanceof Error ? cause.message : "We couldn't load this day's appointments.");
+      }
+    }).finally(() => { if (active) setAgendaLoading(false); });
+    return () => { active = false; };
+  }, [agendaDate, getToken]);
 
   function refreshAppointments() {
     clearNotificationFocus();
@@ -310,7 +345,28 @@ export function DoctorAppointmentsPage() {
 
       <section className="grid gap-5 rounded-2xl border border-border bg-card p-4 shadow-sm sm:grid-cols-[minmax(16rem,0.8fr)_1.2fr] sm:p-5" aria-label="Appointment calendar and agenda">
         <div><div className="flex items-center justify-between gap-2"><button type="button" aria-label="Previous month" onClick={() => setAgendaMonth((month) => new Date(Date.UTC(Number(month.slice(0,4)), Number(month.slice(5,7))-2, 1)).toISOString().slice(0,7))} className="rounded-lg p-2 hover:bg-muted">‹</button><h2 className="font-semibold text-foreground">{new Intl.DateTimeFormat("en-IN", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date(`${agendaMonth}-01T00:00:00Z`))}</h2><button type="button" aria-label="Next month" onClick={() => setAgendaMonth((month) => new Date(Date.UTC(Number(month.slice(0,4)), Number(month.slice(5,7)), 1)).toISOString().slice(0,7))} className="rounded-lg p-2 hover:bg-muted">›</button></div><div className="mt-2 grid grid-cols-7 text-center text-xs text-muted-foreground">{["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map((day) => <span key={day} className="py-2">{day}</span>)}</div><div className="grid grid-cols-7 justify-items-center gap-1">{appointmentMonthDates(agendaMonth).map((date,index) => date ? <button type="button" key={date} aria-pressed={agendaDate === date} aria-label={`${formatDate(date)}${appointmentDates.has(date) ? ", appointments scheduled" : ""}`} onClick={() => setAgendaDate(date)} className={`size-9 rounded-lg text-xs ${agendaDate === date ? "bg-primary font-semibold text-primary-foreground" : appointmentDates.has(date) ? "bg-secondary font-medium text-secondary-foreground" : "text-muted-foreground hover:bg-muted"}`}>{Number(date.slice(-2))}</button> : <span key={`blank-${index}`} className="size-9" />)}</div></div>
-        <div className="rounded-xl bg-muted/50 p-4"><h2 className="font-semibold text-foreground">Agenda · {formatDate(agendaDate)}</h2>{selectedDateAppointments.length ? <ul className="mt-3 space-y-2">{selectedDateAppointments.map((appointment) => <li key={appointment.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-card p-3 text-sm"><span className="font-medium text-foreground">{formatTime(appointment.start_time)} · {appointment.patient_first_name} {appointment.patient_last_name}</span><span className="flex items-center gap-3"><Link className="font-medium text-primary underline-offset-4 hover:underline" href={`/doctor/appointments?appointment=${encodeURIComponent(appointment.id)}`}>View appointment</Link><Link className="font-medium text-primary underline-offset-4 hover:underline" href={`/doctor/availability?date=${encodeURIComponent(appointment.date)}&time=${encodeURIComponent(appointment.start_time.slice(0,5))}`}>Open schedule</Link></span></li>)}</ul> : <p className="mt-3 text-sm text-muted-foreground">No appointments on this date.</p>}</div>
+        <div className="rounded-xl bg-muted/50 p-4">
+          <h2 className="font-semibold text-foreground">Agenda · {formatDate(agendaDate)}</h2>
+          {agendaError ? <p role="alert" className="mt-3 text-sm text-destructive">{agendaError}</p> : null}
+          {agendaLoading ? <p role="status" className="mt-3 text-sm text-muted-foreground">Loading appointments…</p> : null}
+          {!agendaLoading && !agendaError && agendaAppointments.length === 0 ? <p className="mt-3 text-sm text-muted-foreground">No appointments on this date.</p> : null}
+          {!agendaLoading && !agendaError && agendaAppointments.length ? <ul className="mt-3 space-y-2">{[...agendaAppointments].sort((a, b) => a.start_time.localeCompare(b.start_time) || a.id.localeCompare(b.id)).map((appointment) => {
+            const queueEntry = agendaQueueEntries[appointment.id];
+            const status = queueEntry?.status ?? appointment.status;
+            const finished = ["completed", "no_show", "cancelled"].includes(status);
+            return <li key={appointment.id} className={`flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3 text-sm ${finished ? "border-border bg-muted/70" : "border-border bg-card"}`}>
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <span className="font-medium text-foreground">{formatTime(appointment.start_time)} · {appointment.patient_first_name} {appointment.patient_last_name}</span>
+                {queueEntry ? <span className="rounded-full bg-secondary px-2.5 py-1 text-xs font-semibold text-secondary-foreground">Token {queueEntry.token_number}</span> : null}
+                <QueueStatusBadge status={status} />
+              </div>
+              <span className="flex items-center gap-3">
+                <Link className="font-medium text-primary underline-offset-4 hover:underline" href={`/doctor/appointments?appointment=${encodeURIComponent(appointment.id)}`}>View appointment</Link>
+                <Link className="font-medium text-primary underline-offset-4 hover:underline" href={`/doctor/availability?date=${encodeURIComponent(appointment.date)}&time=${encodeURIComponent(appointment.start_time.slice(0,5))}`}>Open schedule</Link>
+              </span>
+            </li>;
+          })}</ul> : null}
+        </div>
       </section>
 
       <section className="rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-5" aria-labelledby="assisted-rescheduling-heading">
@@ -342,20 +398,21 @@ export function DoctorAppointmentsPage() {
 
       {!loading && (!error || (notificationFocusId !== null && appointments.some((appointment) => appointment.id === notificationFocusId))) ? (
         <>
-          <AppointmentGroup notificationFocusId={notificationFocusId} title="Scheduled appointments" empty="You have no scheduled appointments." appointments={scheduled} now={now} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} rescheduleSlots={rescheduleSlots} rescheduleSlotsLoading={rescheduleSlotsLoading} rescheduleMonth={rescheduleMonth} rescheduleDate={rescheduleDate} selectedSlotId={selectedSlotId} rescheduleError={rescheduleError} onBeginReschedule={beginReschedule} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={changeRescheduleMonth} onSelectSlot={setSelectedSlotId} onCloseReschedule={() => { setRescheduleId(null); setRescheduleError(null); }} onReschedule={reschedule} />
-          <AppointmentGroup notificationFocusId={notificationFocusId} title="Past appointments" empty="Your past appointments will appear here." appointments={past} now={now} hasMore={history.past.hasMore} loadingMore={history.past.loading} moreError={history.past.error} onShowMore={() => void loadMore("past")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} rescheduleSlots={rescheduleSlots} rescheduleSlotsLoading={rescheduleSlotsLoading} rescheduleMonth={rescheduleMonth} rescheduleDate={rescheduleDate} selectedSlotId={selectedSlotId} rescheduleError={rescheduleError} onBeginReschedule={beginReschedule} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={changeRescheduleMonth} onSelectSlot={setSelectedSlotId} onCloseReschedule={() => { setRescheduleId(null); setRescheduleError(null); }} onReschedule={reschedule} />
-          <AppointmentGroup notificationFocusId={notificationFocusId} title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} now={now} hasMore={history.cancelled.hasMore} loadingMore={history.cancelled.loading} moreError={history.cancelled.error} onShowMore={() => void loadMore("cancelled")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} rescheduleSlots={rescheduleSlots} rescheduleSlotsLoading={rescheduleSlotsLoading} rescheduleMonth={rescheduleMonth} rescheduleDate={rescheduleDate} selectedSlotId={selectedSlotId} rescheduleError={rescheduleError} onBeginReschedule={beginReschedule} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={changeRescheduleMonth} onSelectSlot={setSelectedSlotId} onCloseReschedule={() => { setRescheduleId(null); setRescheduleError(null); }} onReschedule={reschedule} />
+          <AppointmentGroup notificationFocusId={notificationFocusId} title="Scheduled appointments" empty="You have no scheduled appointments." appointments={scheduled} queueEntries={queueEntries} now={now} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} rescheduleSlots={rescheduleSlots} rescheduleSlotsLoading={rescheduleSlotsLoading} rescheduleMonth={rescheduleMonth} rescheduleDate={rescheduleDate} selectedSlotId={selectedSlotId} rescheduleError={rescheduleError} onBeginReschedule={beginReschedule} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={changeRescheduleMonth} onSelectSlot={setSelectedSlotId} onCloseReschedule={() => { setRescheduleId(null); setRescheduleError(null); }} onReschedule={reschedule} />
+          <AppointmentGroup notificationFocusId={notificationFocusId} title="Past appointments" empty="Your past appointments will appear here." appointments={past} queueEntries={queueEntries} now={now} hasMore={history.past.hasMore} loadingMore={history.past.loading} moreError={history.past.error} onShowMore={() => void loadMore("past")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} rescheduleSlots={rescheduleSlots} rescheduleSlotsLoading={rescheduleSlotsLoading} rescheduleMonth={rescheduleMonth} rescheduleDate={rescheduleDate} selectedSlotId={selectedSlotId} rescheduleError={rescheduleError} onBeginReschedule={beginReschedule} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={changeRescheduleMonth} onSelectSlot={setSelectedSlotId} onCloseReschedule={() => { setRescheduleId(null); setRescheduleError(null); }} onReschedule={reschedule} />
+          <AppointmentGroup notificationFocusId={notificationFocusId} title="Cancelled appointments" empty="You have no cancelled appointments." appointments={cancelled} queueEntries={queueEntries} now={now} hasMore={history.cancelled.hasMore} loadingMore={history.cancelled.loading} moreError={history.cancelled.error} onShowMore={() => void loadMore("cancelled")} onComplete={markComplete} activeAppointment={activeAppointment} rescheduleId={rescheduleId} rescheduleSlots={rescheduleSlots} rescheduleSlotsLoading={rescheduleSlotsLoading} rescheduleMonth={rescheduleMonth} rescheduleDate={rescheduleDate} selectedSlotId={selectedSlotId} rescheduleError={rescheduleError} onBeginReschedule={beginReschedule} onSelectDate={(date) => { setRescheduleDate(date); setSelectedSlotId(""); }} onShiftMonth={changeRescheduleMonth} onSelectSlot={setSelectedSlotId} onCloseReschedule={() => { setRescheduleId(null); setRescheduleError(null); }} onReschedule={reschedule} />
         </>
       ) : null}
     </div>
   );
 }
 
-function AppointmentGroup({ notificationFocusId, title, empty, appointments, now, hasMore = false, loadingMore = false, moreError = null, onShowMore, onComplete, activeAppointment, rescheduleId, rescheduleSlots, rescheduleSlotsLoading, rescheduleMonth, rescheduleDate, selectedSlotId, rescheduleError, onBeginReschedule, onSelectDate, onShiftMonth, onSelectSlot, onCloseReschedule, onReschedule }: {
+function AppointmentGroup({ notificationFocusId, title, empty, appointments, queueEntries, now, hasMore = false, loadingMore = false, moreError = null, onShowMore, onComplete, activeAppointment, rescheduleId, rescheduleSlots, rescheduleSlotsLoading, rescheduleMonth, rescheduleDate, selectedSlotId, rescheduleError, onBeginReschedule, onSelectDate, onShiftMonth, onSelectSlot, onCloseReschedule, onReschedule }: {
   notificationFocusId: string | null;
   title: string;
   empty: string;
   appointments: PatientAppointment[];
+  queueEntries: Record<string, DoctorQueue["entries"][number]>;
   now: number;
   hasMore?: boolean;
   loadingMore?: boolean;
@@ -399,11 +456,12 @@ function AppointmentGroup({ notificationFocusId, title, empty, appointments, now
                     <span>{formatDate(appointment.date)} · {formatTime(appointment.start_time)}–{formatTime(appointment.end_time)} IST</span>
                     <Link href={`/doctor/availability?date=${encodeURIComponent(appointment.date)}&time=${encodeURIComponent(appointment.start_time.slice(0,5))}`} className="font-medium text-primary underline-offset-4 hover:underline">View schedule</Link>
                   </div>
-                  {appointment.mode ? <Badge className={`mt-2 ${appointment.mode === "wave" ? "bg-mode-wave-bg text-mode-wave" : "bg-mode-stream-bg text-mode-stream"}`}>{appointment.mode === "wave" ? (appointment.appointment_duration_minutes ? `WAVE · ${appointment.appointment_duration_minutes}-minute slot` : "WAVE") : "STREAM · Continuous window"}</Badge> : null}
+                  {queueEntries[appointment.id] ? <Badge className="mt-2 bg-secondary text-secondary-foreground">Token {queueEntries[appointment.id].token_number}</Badge> : null}
+                  {appointment.mode ? <Badge className={`mt-2 ml-2 ${appointment.mode === "wave" ? "bg-mode-wave-bg text-mode-wave" : "bg-mode-stream-bg text-mode-stream"}`}>{appointment.mode === "wave" ? (appointment.appointment_duration_minutes ? `WAVE · ${appointment.appointment_duration_minutes}-minute slot` : "WAVE") : "STREAM · Continuous window"}</Badge> : null}
                   {appointment.reason ? <p className="mt-3 text-sm leading-6 text-muted-foreground"><span className="font-medium text-foreground">Reason:</span> {appointment.reason}</p> : null}
                   {/* <p className="mt-2 text-xs text-muted-foreground">Appointment ID: {appointment.id}</p> */}
                 </div>
-                <Badge className={statusClasses(appointment.status)}>{appointment.status === "confirmed" && (appointmentInstant(appointment)?.getTime() ?? Infinity) <= now ? "Awaiting completion" : appointment.status}</Badge>
+                <QueueStatusBadge status={queueEntries[appointment.id]?.status ?? appointment.status} />
               </div>
             {appointment.status === "confirmed" ? (
               <div className="mt-5 border-t border-border pt-4">

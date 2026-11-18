@@ -27,7 +27,7 @@ async function doctorIdForUser(database, user) {
   return result.rows[0].id;
 }
 
-async function appointmentQueue(database, user, doctorId, date) {
+async function appointmentQueue(database, user, doctorId, date, timeZone = "Asia/Kolkata") {
   if (user.role === "doctor") {
     const ownDoctorId = await doctorIdForUser(database, user);
     if (doctorId && doctorId !== ownDoctorId) fail(403, "FORBIDDEN", "Doctors may access only their own queue");
@@ -35,13 +35,15 @@ async function appointmentQueue(database, user, doctorId, date) {
   } else if (user.role !== "receptionist") {
     fail(403, "FORBIDDEN", "This account cannot access appointment queues");
   }
-  const values = [date];
+  const values = [date, timeZone];
   const filters = ["q.service_date = $1"];
   if (doctorId) { values.push(doctorId); filters.push(`q.doctor_id = $${values.length}`); }
   const result = await database.query(
     `SELECT q.appointment_id, q.doctor_id, q.service_date::text AS date, q.token_number,
             q.status, q.checked_in_at, q.called_at, q.completed_at,
             a.scheduled_start_time::text AS start_time, a.scheduled_end_time::text AS end_time,
+            (a.status = 'confirmed' AND q.status = 'not_checked_in' AND
+             ((a.scheduled_date + a.scheduled_start_time) AT TIME ZONE $2) <= NOW()) AS no_show_eligible,
             p.id AS patient_id, pu.first_name AS patient_first_name, pu.last_name AS patient_last_name,
             duser.first_name AS doctor_first_name, duser.last_name AS doctor_last_name
        FROM appointment_queue_entries q
@@ -51,14 +53,12 @@ async function appointmentQueue(database, user, doctorId, date) {
        JOIN doctors d ON d.id = q.doctor_id
        JOIN users duser ON duser.id = d.user_id
       WHERE ${filters.join(" AND ")}
-      ORDER BY CASE WHEN q.status = 'waiting' THEN 0 ELSE 1 END,
-               q.checked_in_at ASC NULLS LAST, q.token_number ASC`, values,
+      ORDER BY a.scheduled_date ASC, a.scheduled_start_time ASC, a.id ASC`, values,
   );
   const entries = result.rows;
   const current = entries.find((entry) => entry.status === "in_progress") || null;
   const waiting = entries.filter((entry) => entry.status === "waiting").sort(compareCheckedInOrder);
-  const otherEntries = entries.filter((entry) => entry.status !== "waiting" && entry.status !== "in_progress");
-  return { date, current_token: current?.token_number ?? null, current, entries: [...waiting, ...otherEntries] };
+  return { date, current_token: current?.token_number ?? null, current, waiting, entries };
 }
 
 async function patientAppointmentQueue(database, user, appointmentId) {
@@ -101,19 +101,18 @@ async function checkIn(database, user, appointmentId, timeZone = "Asia/Kolkata")
   });
 }
 
-async function markNoShow(database, user, appointmentId, graceMinutes = 0, timeZone = "Asia/Kolkata") {
+async function markNoShow(database, user, appointmentId, timeZone = "Asia/Kolkata") {
   if (user.role !== "receptionist") fail(403, "FORBIDDEN", "Only receptionists may mark no-shows");
   return withTransaction(database, async (client) => {
     const result = await client.query(
       `UPDATE appointment_queue_entries q SET status = 'no_show', no_show_at = NOW(), no_show_by_user_id = $2, updated_at = NOW()
         FROM appointments a WHERE q.appointment_id = $1 AND a.id = q.appointment_id
           AND a.status = 'confirmed' AND q.status = 'not_checked_in'
-          AND ((a.scheduled_date + a.scheduled_start_time) AT TIME ZONE $3)
-              + ($4::int * INTERVAL '1 minute') <= NOW()
+          AND ((a.scheduled_date + a.scheduled_start_time) AT TIME ZONE $3) <= NOW()
       RETURNING q.appointment_id, q.doctor_id, q.service_date::text AS date, q.token_number, q.status`,
-      [appointmentId, user.id, timeZone, graceMinutes],
+      [appointmentId, user.id, timeZone],
     );
-    if (!result.rows[0]) fail(409, "QUEUE_STATE_CONFLICT", "No-show can be recorded only after the appointment start time and before consultation begins");
+    if (!result.rows[0]) fail(409, "QUEUE_STATE_CONFLICT", "No-show can be recorded only after the appointment start time and before check-in");
     return result.rows[0];
   });
 }
