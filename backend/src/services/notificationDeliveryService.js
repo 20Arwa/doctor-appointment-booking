@@ -7,20 +7,23 @@ const MAX_BACKOFF_MS = 30 * 60_000;
 const BREVO_IDEMPOTENCY_TTL_MS = 30 * 60_000;
 const PROCESSING_LEASE_MS = 2 * 60_000;
 const BATCH_SIZE = 25;
+const QUEUE_EMAIL_EVENTS = new Set(["appointment.queue_checked_in", "appointment.doctor_ready"]);
 
 function appointmentPayload(eventType, appointment, recipientType) {
   const action = eventType.slice("appointment.".length);
   const doctor = `Dr. ${[appointment.doctor_first_name, appointment.doctor_last_name].filter(Boolean).join(" ")}`;
+  const patient = [appointment.patient_first_name, appointment.patient_last_name].filter(Boolean).join(" ") || "Patient";
   const start = String(appointment.start_time || "").slice(0, 5);
   const end = String(appointment.end_time || "").slice(0, 5);
   const current = `${appointment.date} at ${end ? `${start}–${end}` : start}`;
   const mode = appointment.mode === "wave" ? "Wave" : appointment.mode === "stream" ? "Stream" : "appointment";
+  const token = Number.isInteger(appointment.token_number) && appointment.token_number > 0
+    ? ` ${eventType === "appointment.cancelled" ? "Previous queue token (cancelled)" : "Queue token"}: ${appointment.token_number}.`
+    : "";
   const subject = { booked: "Appointment confirmed", cancelled: "Appointment cancelled", rescheduled: "Appointment rescheduled" }[action];
   const textContent = recipientType === "doctor"
-    ? `${action === "booked" ? "A patient booked" : action === "cancelled" ? "A patient cancelled" : "A patient's appointment was rescheduled"} with you. Doctor: ${doctor}. Date: ${appointment.date}. Time: ${current}. Booking mode: ${mode}.`
-    : action === "booked" ? `Your ${mode} appointment with ${doctor} is confirmed for ${current}.`
-      : action === "cancelled" ? `Your ${mode} appointment with ${doctor} on ${current} has been cancelled.`
-        : `Your ${mode} appointment with ${doctor} has been rescheduled from ${appointment.previous_date} at ${String(appointment.previous_start_time || "").slice(0, 5)} to ${current}.`;
+    ? `${action === "booked" ? "A patient booked" : action === "cancelled" ? "A patient cancelled" : "A patient's appointment was rescheduled"} with you.\n\nAppointment details:\nPatient: ${patient}\nDate: ${appointment.date}\nTime: ${current}\nBooking mode: ${mode}.${token}`
+    : `${action === "booked" ? `Your ${mode} appointment with ${doctor} is confirmed for ${current}.` : action === "cancelled" ? `Your ${mode} appointment with ${doctor} on ${current} has been cancelled.` : `Your ${mode} appointment with ${doctor} has been rescheduled from ${appointment.previous_date} at ${String(appointment.previous_start_time || "").slice(0, 5)} to ${current}.`}\n\nAppointment details:\nDoctor: ${doctor}\nDate: ${appointment.date}\nTime: ${current}\nBooking mode: ${mode}.${token}`;
   const recipient = recipientType === "doctor" ? appointment.doctor_email : appointment.patient_email;
   return { to: recipient || null, subject, textContent, sender: { email: null, name: null } };
 }
@@ -49,7 +52,7 @@ function validSmsPhone(phone) {
   return normalizeSmsPhone(phone) !== null;
 }
 
-function createNotificationDeliveryService({ database, emailNotificationService, smsNotificationService, logger = console }) {
+function createNotificationDeliveryService({ database, emailNotificationService, smsNotificationService, timeZone = "Asia/Kolkata", logger = console }) {
   function logTrackingFailure(operation) {
     logger.error("Notification delivery tracking failed", { operation, reason: "database_error" });
   }
@@ -190,7 +193,25 @@ function createNotificationDeliveryService({ database, emailNotificationService,
           }
         }
       } else {
-        if (row.event_type === "appointment.assisted_reschedule_requested") {
+        if (row.event_type === "appointment.reminder_24h" || row.event_type === "appointment.reminder_1h") {
+          let eligibility;
+          try {
+            eligibility = await database.query(
+              `SELECT 1 FROM appointments a JOIN patients p ON p.id = a.patient_id
+               WHERE a.id = $1 AND p.user_id = $2 AND a.status = 'confirmed'
+                 AND a.scheduled_date = $3::date AND a.scheduled_start_time = $4::time
+                 AND ((a.scheduled_date + a.scheduled_start_time) AT TIME ZONE $5)
+                   - (CASE WHEN $6 = 'appointment.reminder_24h' THEN INTERVAL '24 hours' ELSE INTERVAL '1 hour' END) <= NOW()
+               LIMIT 1`,
+              [row.appointment_id, row.recipient_user_id, row.payload.scheduled_date, row.payload.scheduled_start_time, timeZone, row.event_type],
+            );
+          } catch (_error) {
+            outcome = { sent: false, reason: "unexpected_error", attempts: 1 };
+          }
+          if (!outcome && !eligibility.rows[0]) {
+            outcome = { sent: false, skipped: true, reason: "appointment_not_eligible", attempts: 0 };
+          }
+        } else if (row.event_type === "appointment.assisted_reschedule_requested") {
           let eligibility;
           try {
             eligibility = await database.query(
@@ -271,6 +292,61 @@ function createNotificationDeliveryService({ database, emailNotificationService,
     }
     const sent = outcomes.some((outcome) => outcome.sent);
     return { sent, duplicate: !sent && outcomes.some((outcome) => outcome.duplicate), outcomes };
+  }
+
+  async function sendQueueEventEmail({ eventKey, eventType, appointment }) {
+    if (!QUEUE_EMAIL_EVENTS.has(eventType)) throw new TypeError("Unsupported queue notification event");
+    const recipient = { type: "patient", userId: appointment.patient_user_id, email: appointment.patient_email };
+    if (!recipient.userId || !recipient.email) return { sent: false, skipped: true, reason: "missing_recipient", retryable: false };
+    const payload = typeof emailNotificationService.createQueueNotificationPayload === "function"
+      ? emailNotificationService.createQueueNotificationPayload(eventType, appointment)
+      : {
+        to: recipient.email,
+        subject: eventType === "appointment.doctor_ready" ? "Your doctor is ready" : "Check-in confirmed",
+        textContent: `Token number ${appointment.token_number} for your appointment with Dr. ${appointment.doctor_first_name} ${appointment.doctor_last_name} on ${appointment.date} at ${String(appointment.start_time).slice(0, 5)}.`,
+        sender: { email: null, name: null },
+      };
+    let delivery;
+    try { delivery = await createDelivery({ eventKey: `${eventKey}:patient:${recipient.userId}`, eventType, appointment, recipient, payload }); }
+    catch (_error) { logTrackingFailure("create"); return { sent: false, skipped: true, reason: "tracking_unavailable", retryable: true }; }
+    if (!delivery) return { sent: false, skipped: true, reason: "tracking_unavailable", retryable: true };
+    if (!delivery.created) {
+      if (delivery.lookupFailed) logTrackingFailure("duplicate_check");
+      return { sent: false, duplicate: true, retryable: Boolean(delivery.lookupFailed) };
+    }
+    let outcome;
+    try { outcome = await dispatch({ ...delivery, event_type: eventType, appointment }, delivery.lease_token); }
+    catch (_error) { logTrackingFailure("update"); outcome = { sent: false, ambiguous: true, reason: "unexpected_error" }; }
+    return { ...outcome, retryable: false };
+  }
+
+  async function sendReminderEmail({ eventKey, eventType, appointment }) {
+    if (eventType !== "appointment.reminder_24h" && eventType !== "appointment.reminder_1h") {
+      throw new TypeError("Unsupported appointment reminder event");
+    }
+    const recipient = { type: "patient", userId: appointment.patient_user_id, email: appointment.patient_email };
+    if (!recipient.userId || !recipient.email) return { sent: false, skipped: true, reason: "missing_recipient", retryable: false };
+    const reminderType = eventType === "appointment.reminder_24h" ? "24h" : "1h";
+    const payload = typeof emailNotificationService.createReminderPayload === "function"
+      ? emailNotificationService.createReminderPayload(reminderType, appointment)
+      : {
+        to: recipient.email,
+        subject: "Appointment reminder",
+        textContent: `Reminder: your appointment with Dr. ${appointment.doctor_first_name} ${appointment.doctor_last_name} is on ${appointment.date} at ${String(appointment.start_time).slice(0, 5)}.`,
+        sender: { email: null, name: null },
+      };
+    let delivery;
+    try { delivery = await createDelivery({ eventKey: `${eventKey}:patient:${recipient.userId}`, eventType, appointment, recipient, payload }); }
+    catch (_error) { logTrackingFailure("create"); return { sent: false, skipped: true, reason: "tracking_unavailable", retryable: true }; }
+    if (!delivery) return { sent: false, skipped: true, reason: "tracking_unavailable", retryable: true };
+    if (!delivery.created) {
+      if (delivery.lookupFailed) logTrackingFailure("duplicate_check");
+      return { sent: false, duplicate: true, retryable: Boolean(delivery.lookupFailed) };
+    }
+    let outcome;
+    try { outcome = await dispatch({ ...delivery, event_type: eventType, appointment }, delivery.lease_token); }
+    catch (_error) { logTrackingFailure("update"); outcome = { sent: false, ambiguous: true, reason: "unexpected_error" }; }
+    return { ...outcome, retryable: false };
   }
 
   async function sendAssistedRescheduleEmail({ eventKey, appointment, recipientUserId, appointmentUrl }) {
@@ -409,7 +485,7 @@ function createNotificationDeliveryService({ database, emailNotificationService,
     return { claimed: claim.rows.length, retried, markedAmbiguous: (stale.rowCount || stale.rows.length) + (expired.rowCount || expired.rows.length) };
   }
 
-  return { sendAppointmentNotification, sendAssistedRescheduleEmail, sendSmsDelivery, runRecovery };
+  return { sendAppointmentNotification, sendQueueEventEmail, sendReminderEmail, sendAssistedRescheduleEmail, sendSmsDelivery, runRecovery };
 }
 
 function appointmentEventKey(eventType, appointment) {

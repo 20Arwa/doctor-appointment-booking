@@ -100,6 +100,25 @@ function createHarness({ outcome = { sent: true, attempts: 1, providerMessageId:
 }
 
 describe("notification delivery persistence", () => {
+  it("tracks each queue email once under a stable event key", async () => {
+    const harness = createHarness();
+    const input = {
+      eventKey: "appointment.queue_checked_in:appointment-id",
+      eventType: "appointment.queue_checked_in",
+      appointment: { ...appointmentWithDoctor, token_number: 8 },
+    };
+    const first = await harness.service.sendQueueEventEmail(input);
+    const second = await harness.service.sendQueueEventEmail(input);
+    assert.equal(first.sent, true);
+    assert.equal(second.duplicate, true);
+    assert.equal(harness.database.records.size, 1);
+    const [record] = harness.database.records.values();
+    assert.equal(record.event_type, "appointment.queue_checked_in");
+    assert.equal(record.payload.to, appointment.patient_email);
+    assert.match(record.payload.textContent, /Token number 8/);
+    assert.equal(harness.sent.length, 1);
+  });
+
   it("uses the same Wave/Stream range and mode in its plain-text fallback payload", () => {
     const stream = appointmentPayload("appointment.booked", {
       ...appointment, end_time: "14:00:00", mode: "stream",

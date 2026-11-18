@@ -33,6 +33,23 @@ it("dispatches an event into existing Email delivery and In-App paths and marks 
   assert.deepEqual(calls, [["email", event.event_key, event.event_type, "Pia", "Patient"], ["in-app", event.event_key, event.event_type], "processed"]);
 });
 
+it("dispatches queue email events through tracked email delivery without sending in-app notifications", async () => {
+  const queueEvent = { ...event, event_key: "appointment.queue_checked_in:appointment-1", event_type: "appointment.queue_checked_in" };
+  const calls = [];
+  const database = { async query(sql) {
+    if (sql.includes("WITH candidates AS")) return { rows: [queueEvent] };
+    if (sql.includes("SET status = 'processed'")) { calls.push("processed"); return { rows: [] }; }
+    throw new Error(`Unexpected query: ${sql}`);
+  } };
+  const service = createAppointmentNotificationOutboxService({
+    database,
+    notificationDeliveryService: { async sendQueueEventEmail(input) { calls.push(["email", input.eventKey, input.eventType]); return { sent: true }; } },
+    inAppNotificationService: { async sendAppointmentNotification() { throw new Error("queue emails must not create in-app notifications"); } },
+  });
+  assert.deepEqual(await service.runRecovery(), { claimed: 1, processed: 1, pending: 0 });
+  assert.deepEqual(calls, [["email", queueEvent.event_key, queueEvent.event_type], "processed"]);
+});
+
 it("retries safely after records are created but marking the Outbox row processed fails", async () => {
   let claims = 0;
   let markProcessedFails = true;
@@ -72,5 +89,69 @@ it("leaves an event pending when existing notification records cannot be created
     inAppNotificationService: { async sendAppointmentNotification() { return { failed: 1 }; } },
   });
   assert.deepEqual(await service.runRecovery(), { claimed: 1, processed: 0, pending: 1 });
+  assert.deepEqual(updates, ["pending"]);
+});
+
+it("dispatches newly committed events on the immediate path without waiting for recovery cron", async () => {
+  let claimed = false;
+  let delivered = 0;
+  const database = { async query(sql) {
+    if (sql.includes("WITH candidates AS")) {
+      if (claimed) return { rows: [] };
+      claimed = true;
+      return { rows: [event] };
+    }
+    if (sql.includes("SET status = 'processed'")) return { rows: [] };
+    if (sql.includes("MIN(next_attempt_at)")) return { rows: [{ next_attempt_at: null }] };
+    throw new Error(`Unexpected query: ${sql}`);
+  } };
+  const service = createAppointmentNotificationOutboxService({
+    database,
+    notificationDeliveryService: { async sendAppointmentNotification() { delivered += 1; return { outcomes: [{ sent: true }] }; } },
+    inAppNotificationService: { async sendAppointmentNotification() { return { failed: 0 }; } },
+  });
+  await service.trigger();
+  assert.equal(delivered, 1);
+  assert.equal(claimed, true);
+});
+
+it("coalesces concurrent immediate triggers so a committed event is dispatched once", async () => {
+  let claims = 0;
+  let releaseDelivery;
+  const deliveryGate = new Promise((resolve) => { releaseDelivery = resolve; });
+  const database = { async query(sql) {
+    if (sql.includes("WITH candidates AS")) { claims += 1; return claims === 1 ? { rows: [event] } : { rows: [] }; }
+    if (sql.includes("SET status = 'processed'")) return { rows: [] };
+    if (sql.includes("MIN(next_attempt_at)")) return { rows: [{ next_attempt_at: null }] };
+    throw new Error(`Unexpected query: ${sql}`);
+  } };
+  let delivered = 0;
+  const service = createAppointmentNotificationOutboxService({
+    database,
+    notificationDeliveryService: { async sendAppointmentNotification() { delivered += 1; await deliveryGate; return { outcomes: [{ sent: true }] }; } },
+    inAppNotificationService: { async sendAppointmentNotification() { return { failed: 0 }; } },
+  });
+  const first = service.trigger();
+  const second = service.trigger();
+  releaseDelivery();
+  await Promise.all([first, second]);
+  assert.equal(delivered, 1);
+});
+
+it("leaves immediate provider failures pending for the existing retry worker", async () => {
+  const updates = [];
+  const database = { async query(sql) {
+    if (sql.includes("WITH candidates AS")) return { rows: [event] };
+    if (sql.includes("SET status = 'pending'")) { updates.push("pending"); return { rows: [] }; }
+    if (sql.includes("MIN(next_attempt_at)")) return { rows: [{ next_attempt_at: null }] };
+    throw new Error(`Unexpected query: ${sql}`);
+  } };
+  const service = createAppointmentNotificationOutboxService({
+    database,
+    notificationDeliveryService: { async sendAppointmentNotification() { return { retryable: true, outcomes: [{ sent: false, reason: "provider_unavailable" }] }; } },
+    inAppNotificationService: { async sendAppointmentNotification() { return { failed: 0 }; } },
+    logger: { error() {} },
+  });
+  await service.trigger();
   assert.deepEqual(updates, ["pending"]);
 });

@@ -6,31 +6,13 @@ const { createApp } = require("../src/app");
 const appointment = { id: "33333333-3333-4333-8333-333333333333", date: "2099-04-10", start_time: "10:00:00", patient_email: "patient@example.test", patient_user_id: "44444444-4444-4444-8444-444444444444", patient_phone: "+15551234567", patient_sms_consent: true, doctor_first_name: "Dara", doctor_last_name: "Doctor" };
 
 function mockDatabase(initial = [appointment]) {
-  const state = { appointments: initial.map((item) => ({ ...item, status: item.status || "confirmed" })), deliveries: new Map(), nextId: 1 };
+  const state = { appointments: initial.map((item) => ({ ...item, status: item.status || "confirmed" })), calls: [] };
   return {
     state,
     async query(sql, values = []) {
+      state.calls.push({ sql, values });
       if (sql.trimStart().startsWith("SELECT a.id") && sql.includes("FROM appointments a")) {
         return { rows: state.appointments.filter((item) => item.status === "confirmed").map((item) => ({ ...item })) };
-      }
-      if (sql.startsWith("INSERT INTO appointment_reminder_deliveries")) {
-        const [id, type, date, start] = values;
-        const current = state.appointments.find((item) => item.id === id && item.status === "confirmed" && item.date === date && item.start_time === start);
-        if (!current) return { rows: [] };
-        const key = `${id}:${type}:${date}:${start}`;
-        if (state.deliveries.has(key)) return { rows: [] };
-        const claimId = state.nextId++;
-        state.deliveries.set(key, { id: claimId, status: "processing" });
-        return { rows: [{ id: claimId }] };
-      }
-      if (sql.startsWith("UPDATE appointment_reminder_deliveries")) {
-        const record = [...state.deliveries.values()].find((item) => item.id === values[0]);
-        if (record) record.status = "sent";
-        return { rows: [] };
-      }
-      if (sql.startsWith("DELETE FROM appointment_reminder_deliveries")) {
-        for (const [key, item] of state.deliveries) if (item.id === values[0]) state.deliveries.delete(key);
-        return { rows: [] };
       }
       throw new Error(`Unexpected query: ${sql}`);
     },
@@ -38,128 +20,87 @@ function mockDatabase(initial = [appointment]) {
 }
 
 describe("appointment reminders", () => {
-  it("checks and sends both the 24 hour and 1 hour reminders", async () => {
+  it("keeps the scheduler focused on in-app and SMS; email delivery belongs to the notification outbox", async () => {
     const database = mockDatabase();
-    const sent = [];
-    const service = createAppointmentReminderService({ database, timeZone: "Asia/Kolkata", emailNotificationService: { sendAppointmentReminder: async (type, item) => { sent.push([type, item.id]); return { sent: true }; } } });
-    const result = await service.run();
-    assert.deepEqual(sent.map(([type]) => type), ["24h", "1h"]);
-    assert.equal(result.sent, 2);
-    assert.deepEqual([...database.state.deliveries.values()].map(({ status }) => status), ["sent", "sent"]);
-  });
-
-  it("waits for independent In-App reminder persistence and continues Email after persistence failure", async () => {
-    const database = mockDatabase();
-    const steps = [];
+    const inAppCalls = [];
+    const smsCalls = [];
     const service = createAppointmentReminderService({
       database,
       timeZone: "Asia/Kolkata",
-      logger: { error() {} },
-      inAppNotificationService: { async sendReminder(type) { steps.push(`in-app:${type}`); await new Promise((resolve) => setTimeout(resolve, 5)); throw new Error("storage unavailable"); } },
-      emailNotificationService: { async sendAppointmentReminder(type) { steps.push(`email:${type}`); return { sent: true }; } },
+      inAppNotificationService: { async sendReminder(type, item) { inAppCalls.push([type, item.id]); } },
+      notificationDeliveryService: { async sendSmsDelivery(input) { smsCalls.push(input); } },
     });
     const result = await service.run();
-    assert.deepEqual(steps, ["in-app:24h", "email:24h", "in-app:1h", "email:1h"]);
-    assert.equal(result.sent, 2);
+    assert.deepEqual(inAppCalls, [["24h", appointment.id], ["1h", appointment.id]]);
+    assert.deepEqual(smsCalls.map(({ eventType }) => eventType), ["appointment.reminder_24h", "appointment.reminder_1h"]);
+    assert.equal(result.considered, 2);
+    assert.equal(result.smsAttempted, 2);
+    assert.equal(database.state.calls.length, 2);
+    assert.ok(database.state.calls.every(({ values }) => values[0] === "Asia/Kolkata"));
   });
 
-  it("sends patient SMS reminders for both intervals using the current schedule and configured timezone", async () => {
-    const database = mockDatabase();
+  it("continues SMS reminder dispatch when in-app persistence fails", async () => {
     const smsCalls = [];
-    const deliveryService = { async sendSmsDelivery(input) { smsCalls.push(input); return { status: "simulated", sent: false }; } };
-    const service = createAppointmentReminderService({ database, timeZone: "Asia/Kolkata", notificationDeliveryService: deliveryService, emailNotificationService: { sendAppointmentReminder: async () => ({ sent: true }) } });
+    const service = createAppointmentReminderService({
+      database: mockDatabase(),
+      timeZone: "Asia/Kolkata",
+      logger: { error() {} },
+      inAppNotificationService: { async sendReminder() { throw new Error("storage unavailable"); } },
+      notificationDeliveryService: { async sendSmsDelivery(input) { smsCalls.push(input); } },
+    });
     await service.run();
+    assert.equal(smsCalls.length, 2);
+  });
 
-    assert.deepEqual(smsCalls.map(({ eventType }) => eventType), ["appointment.reminder_24h", "appointment.reminder_1h"]);
-    assert.deepEqual(smsCalls.map(({ recipient }) => recipient.userId), [appointment.patient_user_id, appointment.patient_user_id]);
+  it("builds reminder SMS content from the current scheduled time", async () => {
+    const smsCalls = [];
+    const service = createAppointmentReminderService({
+      database: mockDatabase(),
+      timeZone: "Asia/Kolkata",
+      notificationDeliveryService: { async sendSmsDelivery(input) { smsCalls.push(input); } },
+    });
+    await service.run();
+    assert.ok(smsCalls.every(({ recipient }) => recipient.userId === appointment.patient_user_id));
     assert.ok(smsCalls.every(({ to, consent }) => to === undefined && consent === undefined));
     assert.ok(smsCalls.every(({ eventKey }) => eventKey.includes("2099-04-10:10:00:00")));
     assert.match(smsCalls[0].message, /24-hour appointment with Dr\. Dara Doctor/);
     assert.match(smsCalls[1].message, /1-hour appointment with Dr\. Dara Doctor/);
   });
 
-  it("does not let SMS failures affect email reminders or appointment operations", async () => {
-    const database = mockDatabase();
-    let emailCalls = 0;
-    let smsCalls = 0;
-    const service = createAppointmentReminderService({
-      database,
-      timeZone: "Asia/Kolkata",
-      logger: { error() {} },
-      notificationDeliveryService: { async sendSmsDelivery() { smsCalls += 1; throw new Error("SMS unavailable"); } },
-      emailNotificationService: { async sendAppointmentReminder() { emailCalls += 1; return { sent: true }; } },
-    });
-    const result = await service.run();
-    assert.equal(emailCalls, 2);
-    assert.equal(smsCalls, 2);
-    assert.equal(result.sent, 2);
-  });
-
-  it("uses the Asia/Kolkata scheduler window and current snapshot when asking the database for candidates", async () => {
-    const calls = [];
-    const database = mockDatabase();
-    const query = database.query.bind(database);
-    database.query = async (sql, values = []) => {
-      if (sql.trimStart().startsWith("SELECT a.id") && sql.includes("AT TIME ZONE")) calls.push(values);
-      return query(sql, values);
-    };
-    const service = createAppointmentReminderService({ database, timeZone: "Asia/Kolkata", emailNotificationService: { sendAppointmentReminder: async () => ({ sent: true }) } });
-    await service.run();
-    assert.deepEqual(calls, [["Asia/Kolkata", "24 hours", "5 minutes"], ["Asia/Kolkata", "1 hour", "5 minutes"]]);
-  });
-
-  it("excludes cancelled and completed appointments", async () => {
+  it("excludes cancelled and completed appointments from reminder support channels", async () => {
     const database = mockDatabase([
       { ...appointment, id: "cancelled", status: "cancelled" },
       { ...appointment, id: "completed", status: "completed" },
     ]);
-    const sent = [];
+    let inAppCalls = 0;
     let smsCalls = 0;
-    const service = createAppointmentReminderService({ database, timeZone: "Asia/Kolkata", notificationDeliveryService: { async sendSmsDelivery() { smsCalls += 1; } }, emailNotificationService: { sendAppointmentReminder: async () => { sent.push(true); return { sent: true }; } } });
+    const service = createAppointmentReminderService({
+      database,
+      timeZone: "Asia/Kolkata",
+      inAppNotificationService: { async sendReminder() { inAppCalls += 1; } },
+      notificationDeliveryService: { async sendSmsDelivery() { smsCalls += 1; } },
+    });
     await service.run();
-    assert.equal(sent.length, 0);
+    assert.equal(inAppCalls, 0);
     assert.equal(smsCalls, 0);
   });
 
-  it("does not send stale reminders after a reschedule and creates reminders for the new schedule", async () => {
+  it("uses the configured timezone and five-minute window to retain existing SMS reminder timing", async () => {
     const database = mockDatabase();
-    database.state.appointments[0].date = "2099-04-11";
-    database.state.appointments[0].start_time = "11:00:00";
-    const sent = [];
-    const smsSent = [];
-    const service = createAppointmentReminderService({ database, timeZone: "Asia/Kolkata", notificationDeliveryService: { async sendSmsDelivery(input) { smsSent.push(input); } }, emailNotificationService: { sendAppointmentReminder: async (_type, item) => { sent.push(`${item.date} ${item.start_time}`); return { sent: true }; } } });
-    await service.run();
-    assert.ok(sent.every((schedule) => schedule === "2099-04-11 11:00:00"));
-    assert.equal([...database.state.deliveries.keys()].some((key) => key.includes("2099-04-10")), false);
-    assert.ok(smsSent.every(({ eventKey }) => eventKey.includes("2099-04-11:11:00:00")));
+    const query = database.query.bind(database);
+    database.query = async (sql, values = []) => {
+      if (sql.trimStart().startsWith("SELECT a.id") && sql.includes("AT TIME ZONE")) database.state.windowValues ||= [];
+      if (database.state.windowValues) database.state.windowValues.push(values);
+      return query(sql, values);
+    };
+    await createAppointmentReminderService({ database, timeZone: "Asia/Kolkata" }).run();
+    assert.deepEqual(database.state.windowValues, [["Asia/Kolkata", "24 hours", "5 minutes"], ["Asia/Kolkata", "1 hour", "5 minutes"]]);
   });
 
-  it("deduplicates retries and concurrent scheduler runs by persistent schedule key", async () => {
-    const database = mockDatabase();
-    let calls = 0;
-    let smsCalls = 0;
-    const service = createAppointmentReminderService({ database, timeZone: "Asia/Kolkata", notificationDeliveryService: { async sendSmsDelivery() { smsCalls += 1; } }, emailNotificationService: { sendAppointmentReminder: async () => { calls += 1; return { sent: true }; } } });
-    await service.run();
-    await service.run();
-    assert.equal(calls, 2);
-    assert.equal(smsCalls, 2);
-  });
-
-  it("releases failed claims so the next scheduler run can retry", async () => {
-    const database = mockDatabase();
-    let calls = 0;
-    const service = createAppointmentReminderService({ database, timeZone: "Asia/Kolkata", logger: { error() {} }, emailNotificationService: { sendAppointmentReminder: async () => { calls += 1; if (calls === 1) throw new Error("provider failure"); return { sent: true }; } } });
-    const first = await service.run();
-    const second = await service.run();
-    assert.equal(first.failed, 1);
-    assert.equal(second.sent, 1);
-    assert.equal(calls, 3);
-  });
-
-  it("protects the external scheduler endpoint with a bearer secret", async () => {
+  it("protects the external reminder scheduler endpoint with a bearer secret", async () => {
     const database = mockDatabase();
     let shouldFail = false;
-    const app = createApp({ database, frontendOrigin: "http://localhost:3000", applicationTimezone: "Asia/Kolkata", reminderSecret: "test-secret-that-is-long-enough-to-meet-32", reminderService: { run: async () => { if (shouldFail) throw new Error("database unavailable"); return { sent: 0 }; } }, clerkAuthMiddleware: (_request, _response, next) => next() });
+    const app = createApp({ database, frontendOrigin: "http://localhost:3000", applicationTimezone: "Asia/Kolkata", reminderSecret: "test-secret-that-is-long-enough-to-meet-32", reminderService: { run: async () => { if (shouldFail) throw new Error("database unavailable"); return { considered: 0 }; } }, clerkAuthMiddleware: (_request, _response, next) => next() });
     const server = app.listen(0);
     await new Promise((resolve) => server.once("listening", resolve));
     try {
