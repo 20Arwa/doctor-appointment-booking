@@ -5,8 +5,9 @@ export default clerkMiddleware(
     const path = request.nextUrl.pathname;
     const isPatientRoute = path === "/patient" || path.startsWith("/patient/");
     const isDoctorRoute = path === "/doctor" || path.startsWith("/doctor/");
+    const isReceptionistRoute = path === "/receptionist" || path.startsWith("/receptionist/");
 
-    if (isPatientRoute || isDoctorRoute) await auth.protect();
+    if (isPatientRoute || isDoctorRoute || isReceptionistRoute) await auth.protect();
   },
   { signInUrl: "/sign-in" },
 );

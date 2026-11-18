@@ -1,24 +1,30 @@
 import { z } from "zod";
 
-const localProfileSchema = z.object({
+const localProfileBaseSchema = z.object({
   id: z.string().uuid(),
   first_name: z.string(),
   last_name: z.string(),
   email: z.string().email(),
   phone: z.string().nullable(),
   sms_consent: z.boolean(),
-  role: z.enum(["patient", "doctor"]),
   is_active: z.boolean(),
-  profile: z.object({
-    id: z.string().uuid(),
-    specialty: z.string().optional(),
-    bio: z.string().nullable().optional(),
-    consultation_fee: z.number().optional(),
-    appointment_duration_minutes: z.number().int().optional(),
-    date_of_birth: z.iso.date().nullable().optional(),
-    gender: z.string().nullable().optional(),
-  }),
 });
+const patientProfileSchema = z.object({ id: z.string().uuid(), date_of_birth: z.iso.date().nullable().optional(), gender: z.string().nullable().optional() });
+const doctorProfileSchema = z.object({ id: z.string().uuid(), specialty: z.string().optional(), bio: z.string().nullable().optional(), consultation_fee: z.number().optional(), appointment_duration_minutes: z.number().int().optional() });
+const localProfileSchema = z.discriminatedUnion("role", [
+  localProfileBaseSchema.extend({ role: z.literal("patient"), profile: patientProfileSchema }),
+  localProfileBaseSchema.extend({ role: z.literal("doctor"), profile: doctorProfileSchema }),
+  localProfileBaseSchema.extend({ role: z.literal("receptionist"), profile: z.null() }),
+]);
+
+const receptionistQueueEntrySchema = z.object({
+  appointment_id: z.string().uuid(), doctor_id: z.string().uuid(), date: z.string(), token_number: z.number().int(),
+  status: z.enum(["not_checked_in", "waiting", "in_progress", "completed", "no_show", "cancelled"]),
+  checked_in_at: z.string().nullable(), called_at: z.string().nullable(), completed_at: z.string().nullable(),
+  start_time: z.string(), end_time: z.string(), patient_id: z.string().uuid(), patient_first_name: z.string(),
+  patient_last_name: z.string(), doctor_first_name: z.string(), doctor_last_name: z.string(),
+});
+export type ReceptionQueueEntry = z.infer<typeof receptionistQueueEntrySchema>;
 
 const doctorSchema = z.object({
   id: z.string().uuid(),
@@ -344,6 +350,35 @@ export async function getDoctors(token?: string): Promise<DirectoryDoctor[]> {
   return parsed.data;
 }
 
+export async function getReceptionQueue(token: string, date: string, doctorId?: string): Promise<ReceptionQueueEntry[]> {
+  const query = new URLSearchParams({ date });
+  if (doctorId) query.set("doctor_id", doctorId);
+  const payload = await request<unknown>(token, `/queue/reception?${query.toString()}`);
+  const parsed = z.object({
+    date: z.string(), current_token: z.number().int().nullable(),
+    current: receptionistQueueEntrySchema.nullable(), entries: z.array(receptionistQueueEntrySchema),
+  }).safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete reception queue.");
+  return parsed.data.entries;
+}
+
+export async function checkInReceptionAppointment(token: string, appointmentId: string) {
+  return request<unknown>(token, `/queue/appointments/${encodeURIComponent(appointmentId)}/check-in`, { method: "POST" });
+}
+
+export async function markReceptionNoShow(token: string, appointmentId: string) {
+  return request<unknown>(token, `/queue/appointments/${encodeURIComponent(appointmentId)}/no-show`, { method: "POST" });
+}
+
+export async function rescheduleReceptionAppointment(token: string, appointmentId: string, availabilityId: string): Promise<PatientAppointment> {
+  const payload = await request<unknown>(token, `/queue/appointments/${encodeURIComponent(appointmentId)}/reschedule`, {
+    method: "PUT", body: JSON.stringify({ availability_id: availabilityId }),
+  });
+  const parsed = appointmentSchema.safeParse(payload);
+  if (!parsed.success) throw new ProfileApiError(502, "The server returned an incomplete rescheduling response.");
+  return parsed.data;
+}
+
 export async function getDoctorPatient(token: string, patientId: string): Promise<DoctorPatient> {
   const payload = await request<unknown>(token, `/doctors/patients/${encodeURIComponent(patientId)}`);
   const parsed = doctorPatientSchema.safeParse(payload);
@@ -646,6 +681,7 @@ export async function updateUserPhone(token: string, phone: string) {
 }
 
 export async function updateRoleProfile(token: string, profile: LocalProfile, body: Record<string, string | null>) {
+  if (profile.role === "receptionist") throw new Error("Receptionist accounts do not have patient or doctor profile records.");
   const collection = profile.role === "doctor" ? "doctors" : "patients";
   await request<unknown>(token, `/${collection}/${profile.profile.id}`, {
     method: "PUT",

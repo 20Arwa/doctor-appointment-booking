@@ -49,6 +49,10 @@ const doctorNavigation: AppNavigationItem[] = [
   { label: "Profile", href: "/doctor/profile", icon: UserRound },
 ];
 
+const receptionistNavigation: AppNavigationItem[] = [
+  { label: "Reception Dashboard", href: "/receptionist/dashboard", icon: LayoutDashboard },
+];
+
 const ProfileContext = createContext<LocalProfile | null>(null);
 const UpdateProfileContext = createContext<((profile: LocalProfile) => void) | null>(null);
 
@@ -68,7 +72,7 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
   const { getToken, isLoaded, isSignedIn } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
-  const assistantPage = pathname === (requiredRole === "patient" ? "/patient/assistant" : "/doctor/assistant");
+  const assistantPage = requiredRole !== "receptionist" && pathname === (requiredRole === "patient" ? "/patient/assistant" : "/doctor/assistant");
   const hasChecked = useRef(false);
   const mobileNavigation = useRef<HTMLDetailsElement>(null);
   const [status, setStatus] = useState<"checking" | "ready" | "error">("checking");
@@ -129,9 +133,9 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
 
   if (!profile) return <AppShellLoading />;
 
-  const navigation = requiredRole === "patient" ? patientNavigation : doctorNavigation;
+  const navigation = requiredRole === "patient" ? patientNavigation : requiredRole === "doctor" ? doctorNavigation : receptionistNavigation;
   const displayName = `${profile.first_name} ${profile.last_name}`.trim();
-  const roleLabel = requiredRole === "patient" ? "Patient workspace" : "Doctor workspace";
+  const roleLabel = requiredRole === "patient" ? "Patient workspace" : requiredRole === "doctor" ? "Doctor workspace" : "Reception workspace";
 
   return (
     <ProfileContext.Provider value={profile}>
@@ -148,7 +152,7 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
           <NavigationLinks items={navigation} pathname={pathname} />
           <div className="mt-auto border-t border-sidebar-border pt-5">
             <p className="truncate px-3 text-sm font-semibold">{displayName}</p>
-            <p className="mt-1 truncate px-3 text-xs text-sidebar-foreground/65">{requiredRole === "patient" ? "Patient account" : "Doctor account"}</p>
+            <p className="mt-1 truncate px-3 text-xs text-sidebar-foreground/65">{requiredRole === "patient" ? "Patient account" : requiredRole === "doctor" ? "Doctor account" : "Receptionist account"}</p>
             <SignOutButton redirectUrl="/">
               <button type="button" className="mt-4 min-h-11 w-full rounded-lg px-3 text-left text-sm font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sidebar-ring">Sign out</button>
             </SignOutButton>
@@ -159,9 +163,9 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
           <header className={`sticky top-0 z-20 flex min-h-16 items-center justify-between gap-4 border-b border-border bg-background/95 px-4 backdrop-blur sm:px-6 md:px-8 ${assistantPage ? "shrink-0" : ""}`}>
             <Link href={dashboardPath(requiredRole)} aria-label="Medrella dashboard" className="text-lg font-semibold tracking-tight text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring md:hidden">Medrella<span className="text-primary">.</span></Link>
             <p className="hidden text-sm font-medium text-muted-foreground md:block">{roleLabel}</p>
-          <HomepageSectionNavigation role={requiredRole} />
+          <HomepageSectionNavigation role={requiredRole === "receptionist" ? "unknown" : requiredRole} />
             <div className="ml-auto flex items-center gap-3">
-              <NotificationBell role={requiredRole} />
+              {requiredRole !== "receptionist" ? <NotificationBell role={requiredRole} /> : null}
               <span className="hidden max-w-64 truncate text-sm font-medium text-foreground sm:block">{displayName}</span>
               <details className="group relative md:hidden" ref={mobileNavigation}>
                 <summary aria-label="Toggle application navigation" className="flex size-11 cursor-pointer list-none items-center justify-center rounded-lg border border-border text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
@@ -182,7 +186,7 @@ export function RoleApplicationShell({ requiredRole, children }: { requiredRole:
           </header>
           <main className={assistantPage ? "mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col overflow-hidden px-5 pt-7 pb-0 sm:px-7 sm:pt-9 sm:pb-0 lg:px-10 lg:pt-11 lg:pb-0" : "mx-auto w-full max-w-7xl px-5 py-7 sm:px-7 sm:py-9 lg:px-10 lg:py-11"}>{children}</main>
         </div>
-        <PatientAssistantLauncher audience={requiredRole} />
+        {requiredRole !== "receptionist" ? <PatientAssistantLauncher audience={requiredRole} /> : null}
       </div>
       </UpdateProfileContext.Provider>
     </ProfileContext.Provider>

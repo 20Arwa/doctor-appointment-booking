@@ -124,7 +124,7 @@ export function ProfilePage() {
           date_of_birth: parsed.data.date_of_birth || null,
           gender: parsed.data.gender.trim() || null,
         });
-      } else {
+      } else if (profile.role === "doctor") {
         await updateRoleProfile(token, profile, {
           specialty: parsed.data.specialty.trim(),
           bio: parsed.data.bio.trim() || null,
@@ -218,7 +218,7 @@ export function ProfilePage() {
               </div>
             </div>
           </section>
-        ) : (
+        ) : profile.role === "doctor" ? (
           <section className="rounded-3xl border border-border bg-card p-6 shadow-sm sm:p-8" aria-labelledby="doctor-details-title">
             <div className="mb-6">
               <h2 id="doctor-details-title" className="text-xl font-semibold text-card-foreground">Professional details</h2>
@@ -243,7 +243,7 @@ export function ProfilePage() {
               {textArea("bio", "About you", "Share a short professional introduction. This may appear in the doctor directory.")}
             </div>
           </section>
-        )}
+        ) : null}
 
         <div className="flex justify-end">
           <Button type="submit" size="lg" disabled={saving}>
