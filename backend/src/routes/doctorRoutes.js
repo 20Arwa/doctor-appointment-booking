@@ -1,6 +1,6 @@
 const express = require("express");
 const { getDoctor, getDoctorPatient, listDoctorPatientAppointments, listDoctors, updateDoctor } = require("../controllers/doctorController");
-const { requireClerkIdentity, requireLocalUser } = require("../middleware/auth");
+const { requireClerkIdentity, requireLocalUser, requireRole } = require("../middleware/auth");
 const { validate } = require("../middleware/validate");
 const { doctorUpdateSchema, idParamsSchema } = require("../validators/profileSchemas");
 const { createDoctorSlots, deleteDoctorSlot, getDoctorSlots } = require("../controllers/availabilityController");
@@ -13,20 +13,20 @@ const assistedRescheduleController = require("../controllers/assistedRescheduleC
 const { doctorAssistedRequestsQuerySchema } = require("../validators/assistedRescheduleSchemas");
 
 const router = express.Router();
-router.get("/patients/:patientId/appointments", requireClerkIdentity, requireLocalUser, validate(doctorPatientParamsSchema, "params"), validate(doctorPatientAppointmentsQuerySchema, "query"), listDoctorPatientAppointments);
-router.get("/patients/:patientId", requireClerkIdentity, requireLocalUser, validate(doctorPatientParamsSchema, "params"), getDoctorPatient);
+router.get("/patients/:patientId/appointments", requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(doctorPatientParamsSchema, "params"), validate(doctorPatientAppointmentsQuerySchema, "query"), listDoctorPatientAppointments);
+router.get("/patients/:patientId", requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(doctorPatientParamsSchema, "params"), getDoctorPatient);
 router.get("/:id/slots", validate(doctorIdParamsSchema, "params"), validate(slotQuerySchema, "query"), requireClerkIdentity, requireLocalUser, getDoctorSlots);
-router.get("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, scheduleController.listSchedules);
-router.get("/:id/assisted-reschedule-requests", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(doctorAssistedRequestsQuerySchema, "query"), assistedRescheduleController.listDoctorRequests);
-router.post("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(createScheduleSchema, "body"), scheduleController.createSchedule);
-router.post("/:id/schedules/:scheduleId/preview", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(elasticScheduleSchema, "body"), elasticScheduleController.previewScheduleUpdate);
-router.put("/:id/schedules/:scheduleId", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(elasticScheduleSchema, "body"), elasticScheduleController.updateSchedule);
-router.post("/:id/schedules/:scheduleId/generate", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(generateSchema, "body"), scheduleController.generateAvailability);
-router.post("/:id/schedules/:scheduleId/exceptions", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(exceptionSchema, "body"), scheduleController.createException);
-router.post("/:id/slots", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, validate(slotsBodySchema, "body"), createDoctorSlots);
-router.delete("/:id/slots/:slotId", validate(slotParamsSchema, "params"), requireClerkIdentity, requireLocalUser, deleteDoctorSlot);
+router.get("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, requireRole("doctor"), scheduleController.listSchedules);
+router.get("/:id/assisted-reschedule-requests", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(doctorAssistedRequestsQuerySchema, "query"), assistedRescheduleController.listDoctorRequests);
+router.post("/:id/schedules", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(createScheduleSchema, "body"), scheduleController.createSchedule);
+router.post("/:id/schedules/:scheduleId/preview", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(elasticScheduleSchema, "body"), elasticScheduleController.previewScheduleUpdate);
+router.put("/:id/schedules/:scheduleId", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(elasticScheduleSchema, "body"), elasticScheduleController.updateSchedule);
+router.post("/:id/schedules/:scheduleId/generate", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(generateSchema, "body"), scheduleController.generateAvailability);
+router.post("/:id/schedules/:scheduleId/exceptions", validate(scheduleParamsSchema, "params"), requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(exceptionSchema, "body"), scheduleController.createException);
+router.post("/:id/slots", validate(doctorIdParamsSchema, "params"), requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(slotsBodySchema, "body"), createDoctorSlots);
+router.delete("/:id/slots/:slotId", validate(slotParamsSchema, "params"), requireClerkIdentity, requireLocalUser, requireRole("doctor"), deleteDoctorSlot);
 router.get("/", listDoctors);
 router.get("/:id", validate(idParamsSchema, "params"), getDoctor);
-router.put("/:id", requireClerkIdentity, requireLocalUser, validate(idParamsSchema, "params"), validate(doctorUpdateSchema, "body"), updateDoctor);
+router.put("/:id", requireClerkIdentity, requireLocalUser, requireRole("doctor"), validate(idParamsSchema, "params"), validate(doctorUpdateSchema, "body"), updateDoctor);
 
 module.exports = router;

@@ -47,4 +47,13 @@ async function requireLocalUser(request, response, next) {
   }
 }
 
-module.exports = { getClerkProfile, requireClerkIdentity, requireLocalUser };
+function requireRole(...roles) {
+  return (_request, response, next) => {
+    if (!roles.includes(response.locals.user?.role)) {
+      return response.status(403).json({ error: { code: "FORBIDDEN", message: "This account cannot access this operation" } });
+    }
+    return next();
+  };
+}
+
+module.exports = { getClerkProfile, requireClerkIdentity, requireLocalUser, requireRole };

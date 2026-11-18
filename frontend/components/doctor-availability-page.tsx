@@ -110,6 +110,7 @@ function apiErrorMessage(error: unknown, fallback: string) {
 
 export function DoctorAvailabilityPage() {
   const profile = useDashboardProfile();
+  if (profile.role !== "doctor") throw new Error("Doctor account details are unavailable.");
   const doctorId = profile.profile.id;
   const { getToken } = useAuth();
   const searchParams = useSearchParams();

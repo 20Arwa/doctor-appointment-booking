@@ -34,8 +34,8 @@ export function SiteHeader() {
           </span>
         </Link>
         <div className="ml-auto flex items-center gap-2 md:ml-0 md:gap-5">
-          <HomepageSectionNavigation role={role} />
-          {isLoaded && isSignedIn && role !== "unknown" && <NotificationBell role={notificationRole} />}
+          <HomepageSectionNavigation role={role === "receptionist" ? "unknown" : role} />
+          {isLoaded && isSignedIn && (role === "patient" || role === "doctor") && <NotificationBell role={notificationRole} />}
           <SiteAuthActions />
         </div>
       </div>
